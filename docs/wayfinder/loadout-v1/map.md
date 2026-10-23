@@ -26,6 +26,7 @@ An implementation-ready v1 spec for the loadout CLI, written in Rust. Given only
 
 ## Decisions so far
 
+- [Agent config surfaces per OS](./tickets/01-agent-config-surfaces.md): every candidate agent reads skills, global instructions, and MCP definitions from its own user paths, and most read `~/.agents/skills`. Claude Code and Codex mix agent state into their MCP definition files. Auth stays in keychains or separate files, and Windows symlinks need admin or Developer Mode.
 - [Program installation per OS](./tickets/02-program-installation.md): per-user installs are possible only through Homebrew formulae, Scoop, Flatpak `--user`, and language-tool globals. Most Linux managers and winget browser installs need admin, output formats and already-installed behaviour vary by manager, package names differ per OS, and no Rust library wraps them together.
 
 ## Not yet specified
