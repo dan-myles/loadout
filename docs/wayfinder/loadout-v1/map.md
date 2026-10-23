@@ -26,6 +26,8 @@ An implementation-ready v1 spec for the loadout CLI, written in Rust. Given only
 
 ## Decisions so far
 
+- [Program installation per OS](./tickets/02-program-installation.md): per-user installs are possible only through Homebrew formulae, Scoop, Flatpak `--user`, and language-tool globals. Most Linux managers and winget browser installs need admin, output formats and already-installed behaviour vary by manager, package names differ per OS, and no Rust library wraps them together.
+
 ## Not yet specified
 
 - The CLI's command surface and output: commands, flags, what a run prints.
