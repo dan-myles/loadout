@@ -1,7 +1,7 @@
 # Override model
 
 Type: grilling
-Status: open
+Status: claimed
 Blocked by: none
 
 ## Question
