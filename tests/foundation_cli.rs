@@ -351,6 +351,76 @@ fn symlinked_source_cannot_escape_the_loadout() {
     assert!(stdout(&output).contains("link resolves outside the loadout"));
 }
 
+#[cfg(unix)]
+fn skill_case(build: impl FnOnce(&Path, &Path)) -> (i32, String) {
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside");
+    let root = scratch.path().join("loadout");
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    fs::write(outside.join("key"), "synthetic outside file").unwrap();
+    fs::create_dir_all(root.join("skill")).unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[skills.x]\nsource = \"skill\"\n",
+    )
+    .unwrap();
+    build(&root, &outside);
+    let output = Sandbox::new().run(&["validate", root.to_str().unwrap(), "--json"]);
+    (output.status.code().unwrap(), stdout(&output))
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_contents_cannot_escape_through_links() {
+    use std::os::unix::fs::symlink;
+
+    let (code, text) = skill_case(|root, outside| {
+        symlink(outside.join("key"), root.join("skill/SKILL.md")).unwrap();
+    });
+    assert_eq!(code, 3, "escaping SKILL.md: {text}");
+    assert!(
+        text.contains("skill/SKILL.md links outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = skill_case(|root, outside| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        fs::create_dir(root.join("skill/scripts")).unwrap();
+        symlink(outside.join("key"), root.join("skill/scripts/leak")).unwrap();
+    });
+    assert_eq!(code, 3, "nested escaping file: {text}");
+    assert!(
+        text.contains("skill/scripts/leak links outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = skill_case(|root, outside| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(outside.join("dir"), root.join("skill/dir")).unwrap();
+    });
+    assert_eq!(code, 3, "escaping folder: {text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(root.join("skill"), root.join("skill/loop")).unwrap();
+    });
+    assert_eq!(code, 3, "self loop: {text}");
+    assert!(text.contains("skill/loop links to a folder"), "{text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(root.join("missing"), root.join("skill/broken")).unwrap();
+    });
+    assert_eq!(code, 3, "broken link: {text}");
+    assert!(text.contains("skill/broken is a broken link"), "{text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("shared.md"), "x").unwrap();
+        symlink(root.join("shared.md"), root.join("skill/SKILL.md")).unwrap();
+    });
+    assert_eq!(code, 0, "in-loadout file link stays valid: {text}");
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

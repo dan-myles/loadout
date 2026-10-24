@@ -250,6 +250,10 @@ What validate enforces today, before any machine is known:
 - A server is stdio (`command`, `args`, `env`) or remote (`url`, `headers`), never both.
 - Ids are lowercase `[a-z0-9][a-z0-9_-]*`.
 - Sources exist inside the loadout, with symlinks resolved.
+- A skill folder is walked in full. A link inside it may point only to a file inside the loadout.
+  A link to a folder, a broken link, a link leaving the loadout, and any special file are errors.
+  Folder links are never followed, so a link loop can't make the walk loop. An unreadable entry
+  is an error.
 - Targets are clean `~/` or `{config}/` paths, and two file items in one layer may not share a target.
 - Every agent named anywhere is built in or declared.
 
@@ -440,8 +444,10 @@ or corrects them.
   `Capability<T> = Supported(PerOs<T>) | Unsupported(reason) | Unknown(reason)` per agent and kind.
   An item an agent can't take is an `unsupported` plan action, never a silent skip. There is no
   plugin framework.
-- **Skills** are copied into each target agent's skills dir. A skills dir loadout doesn't own is
-  never deleted.
+- **Skills** are copied into each target agent's skills dir as `Content::Tree`. Validate has already
+  confined the folder (section 3), and U5 re-checks it when copying. It copies regular files,
+  dereferences file links (the copy gets the file's bytes, not a link), and keeps each file's
+  executable bit (`FileContent.executable`). A skills dir loadout doesn't own is never deleted.
 - **Instructions**: at most one `instructions` item may reach each agent; U1 makes a second one a
   resolve error. The file is owned whole.
 - **MCP is a key merge, never a file write** (U6). Parse the file, change only the server names

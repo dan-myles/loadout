@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use super::schema::{
@@ -342,10 +343,71 @@ impl Checker {
             Source::Skill if !real.is_dir() => {
                 self.error(key, format!("{source} is not a skill folder"));
             }
-            Source::Skill if !real.join(SKILL_FILE).is_file() => {
-                self.error(key, format!("{source} has no {SKILL_FILE}"));
+            Source::Skill => {
+                self.skill_tree(key, &real);
+                if !real.join(SKILL_FILE).is_file() {
+                    self.error(key, format!("{source} has no {SKILL_FILE}"));
+                }
             }
-            Source::File | Source::Skill => {}
+            Source::File => {}
+        }
+    }
+
+    fn skill_tree(&mut self, key: &str, dir: &Path) {
+        let root = self.root.clone();
+        let shown = |path: &Path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.error(key, format!("cannot read {}: {error}", shown(dir)));
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.error(key, format!("cannot read {}: {error}", shown(dir)));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let kind = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata.file_type(),
+                Err(error) => {
+                    self.error(key, format!("cannot read {}: {error}", shown(&path)));
+                    continue;
+                }
+            };
+            if kind.is_dir() {
+                self.skill_tree(key, &path);
+            } else if kind.is_symlink() {
+                match path.canonicalize() {
+                    Err(_) => self.error(key, format!("{} is a broken link", shown(&path))),
+                    Ok(real) if !real.starts_with(&self.root) => self.error(
+                        key,
+                        format!("{} links outside the loadout", shown(&path)),
+                    ),
+                    Ok(real) if !real.is_file() => self.error(
+                        key,
+                        format!(
+                            "{} links to a folder; skills may link only to files inside the loadout",
+                            shown(&path)
+                        ),
+                    ),
+                    Ok(_) => {}
+                }
+            } else if !kind.is_file() {
+                self.error(
+                    key,
+                    format!("{} is not a regular file or folder", shown(&path)),
+                );
+            }
         }
     }
 
@@ -605,7 +667,6 @@ fn looks_secret(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn pointers_need_a_leading_slash_and_no_empty_parts() {
