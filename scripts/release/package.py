@@ -153,7 +153,7 @@ def write_archive(out_dir, prefix, entries, target, epoch):
         write_tar_gz(path, prefix, entries, epoch)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     checksum = path.with_name(path.name + ".sha256")
-    checksum.write_text(f"{digest}  {path.name}\n", encoding="utf-8", newline="\n")
+    checksum.write_bytes(f"{digest}  {path.name}\n".encode("ascii"))
     return path, checksum
 
 
@@ -187,7 +187,7 @@ def main(argv=None):
     prefix, entries = members(root, binary, args.target)
     out_dir = (args.out_dir or target_dir / "dist").resolve()
     archive, checksum = write_archive(out_dir, prefix, entries, args.target, epoch)
-    print(checksum.read_text(encoding="utf-8"), end="")
+    print(checksum.read_text(encoding="ascii"), end="")
     print(archive)
 
 
