@@ -639,6 +639,9 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     tail, so future descendants are probed. It follows a dangling link through `read_link`, up to 40
     links, and rejects non-absolute or `.`/`..` paths. It only stats and reads links; it never opens
     file contents.
+  - **Path forms.** Comparison is per component and ASCII case-insensitive. Windows prefixes are
+    folded, so `std::fs::canonicalize`'s `\\?\C:` equals `C:`, and `\\?\UNC\srv\share` equals
+    `\\srv\share`. A junction or link on Windows therefore resolves to the same entry.
   - **Failing closed.** Any metadata error other than not-found, on either side, returns
     `Conflict::Unverifiable`, which callers treat like a conflict.
   - **Results.** A conflict is an `unsupported` action, never a write, and the reserved file is

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use serde::Serialize;
 
@@ -413,8 +413,27 @@ fn parts(path: &str) -> Vec<String> {
 
 fn path_parts(path: &Path) -> Vec<String> {
     path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .map(|component| match component {
+            Component::Prefix(prefix) => prefix_name(prefix.kind()),
+            other => other.as_os_str().to_string_lossy().to_ascii_lowercase(),
+        })
         .collect()
+}
+
+fn prefix_name(prefix: Prefix<'_>) -> String {
+    match prefix {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+            format!("{}:", char::from(drive).to_ascii_lowercase())
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+            "//{}/{}",
+            server.to_string_lossy().to_ascii_lowercase(),
+            share.to_string_lossy().to_ascii_lowercase()
+        ),
+        Prefix::Verbatim(name) | Prefix::DeviceNS(name) => {
+            format!("//?/{}", name.to_string_lossy().to_ascii_lowercase())
+        }
+    }
 }
 
 fn join(base: &Path, relative: &str) -> PathBuf {
@@ -668,6 +687,27 @@ mod tests {
         assert!(
             check_path(&context, Path::new("relative/x"), Use::Write).is_some(),
             "unclean paths fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_and_plain_drive_prefixes_compare_equal() {
+        assert_eq!(
+            path_parts(Path::new(r"\\?\C:\Users\a\.codex\auth.json")),
+            path_parts(Path::new(r"c:\Users\a\.codex\auth.json"))
+        );
+    }
+
+    #[test]
+    fn prefix_names_fold_verbatim_forms() {
+        assert_eq!(
+            prefix_name(Prefix::VerbatimDisk(b'C')),
+            prefix_name(Prefix::Disk(b'c'))
+        );
+        assert_eq!(
+            prefix_name(Prefix::VerbatimUNC("Srv".as_ref(), "Share".as_ref())),
+            prefix_name(Prefix::UNC("srv".as_ref(), "share".as_ref()))
         );
     }
 }
