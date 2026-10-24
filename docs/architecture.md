@@ -160,6 +160,19 @@ sources, and validate ignores them. An unknown key anywhere is an error.
   discovery failure is an error with its path, so a layer is never silently dropped: a permission
   error, a file where the folder should be, or an unreadable entry.
 - `Loadout.root` holds the canonical root.
+- **Two entry points** share this loader and the one Git metadata detector:
+  - `Loadout::load_guarded(root, context)` is the only entry point a command on a real host uses
+    (`validate`, and `plan`/`apply`/`update` once U4 and U8 land). Every manifest (`loadout.toml`
+    and layer files) and every Git pointer (`.git` as a gitfile, `commondir`) passes
+    `reserved::check_source_file` with the active `Context`, as reached and as its canonical
+    file, **before it is opened**. A checkout file that aliases an auth store, private settings,
+    or state is refused with a path-only diagnostic, never parsed. `context` decides only what may
+    be read: layers, resolution, and `check_all`'s synthetic machines are unchanged.
+  - `Loadout::load(root)` is context-free: the same confinement, but no host reservation policy,
+    so it would open such an alias. It exists for synthetic and test use; no host command calls it.
+  - `resolve::check_all` and `resolve` read no files, so a later validation pass can't reopen
+    anything. A future pass that reads checkout content (U2's template check) must take the same
+    guard.
 [`tests/foundation/complete/`](../tests/foundation/complete) is a full example that passes
 validation, and [`tests/foundation/invalid/`](../tests/foundation/invalid) collects the mistakes
 validate catches.
@@ -342,7 +355,11 @@ U1 (built) adds the checks that need a machine. `resolve` runs them for one mach
   when one sits inside the other. Writes are the final file targets, plus what an enabled custom
   agent receives on that OS: `<skills>/<skill id>` for each skill that reaches it, its
   instructions file when an instructions item reaches it, and its MCP file when a server reaches
-  it. Paths that built-in agents receive are U5's (section 6).
+  it. Paths that built-in agents receive are U5's (section 6). An MCP file is a key merge, not a
+  whole-file write: several custom agents may merge into one literal path when they all declare
+  the same `format`, and declaring two formats for one path is an error. Their maps and keys,
+  and every alias of the file, are compared by U5 at materialize. An MCP file against any other
+  write still collides as before.
 - At most one instructions item reaches each agent.
 - `windows_problem` runs on every final Windows write, so a target with no valid Windows path is
   an error there.
@@ -635,7 +652,12 @@ or corrects them.
     check, otherwise `opencode.json`.
   - Sources are read again from the checkout and copied verbatim (never rendered). Each source,
     and each file a skill walk reaches, must canonicalize inside the checkout and outside its Git
-    metadata (`manifest::git_metadata`, the same identification validate uses). A skill may hold
+    metadata (`manifest::git_metadata_guarded`, validate's own detector with a guard). Each Git
+    pointer file the detector would open (`.git` as a gitfile, `commondir`) first passes
+    `reserved::check_source`, as reached and as its canonical file, so a pointer aliasing an auth
+    store, private settings, or state inside the checkout is refused before any read and never
+    as a parse error afterwards. Ordinary pointers, their confinement, and Git's relative bases
+    are unchanged. A skill may hold
     only regular files, folders, and links to files inside the loadout; a link to a folder, a
     special file, or a `.git` entry is refused. A skill needs `SKILL.md`. Every source file then
     passes `reserved::check_source` (below), both as reached and as the file it lands on, before
@@ -644,8 +666,11 @@ or corrects them.
     against user file target, and agent against agent, built-in or custom. Two writes collide when
     their paths are equal or one is inside the other, compared as written and with links resolved
     (`reserved::normalize`), with case folded by the OS default as in section 3. Two MCP entries in
-    one file collide when one key address (map pointer plus key) equals or contains the other; Pi
-    folds `-` and `_`. User file against user file stays with U1 and U4.
+    one file (as written or through an alias) collide when they declare different formats for it,
+    JSON and JSONC included, since those differ in what an edit must preserve and the file's
+    bytes never decide; or when one key address (map pointer plus key) equals or contains the
+    other, with Pi folding `-` and `_`. Equal formats with disjoint maps or keys merge. User file
+    against user file stays with U1 and U4.
   - Problems with sources or collisions return `agents::Error::Invalid(Diagnostics)`: exit 3, and
     nothing is planned or written. Materialize never writes; it reads loadout sources and stats.
 - **Skills** are copied into each target agent's skills dir as `Content::Tree`. Validate has already
@@ -827,7 +852,9 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     a reserved file inside a larger checkout (`~/.t3/settings.json`, `.claude.json`, or the
     state dir from a checkout at `~`) is still refused. The checkout itself is not a reservation
     here. A path or anchor that can't be resolved refuses (`Unverifiable`). Destination checks are
-    unchanged: they still use `check_path`.
+    unchanged: they still use `check_path`. `check_source_file(context, loadout, reached, real)`
+    runs it on both identities of one file, and is what the guarded load (section 3) and agents
+    sources both call.
   - **U6 applies the same rule.** Every MCP write calls `check_path` with
     `Use::KeyMerge(Merge { map, format, shape })`, for built-in adapters and custom agents alike, on
     expanded, canonical, and override-alias paths. A shared config reached through an alias still
@@ -919,7 +946,7 @@ Automatic updates are required, so they are on by default.
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
-| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes; exit 3 when invalid | foundation; resolution built (U1) | U2 adds template syntax |
+| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes; exit 3 when invalid. Loads with `Loadout::load_guarded` and the active `Context` | foundation; resolution built (U1); guarded load (U5) | U2 adds template syntax |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
 | `loadout status [--json]` | frozen | U3 |
@@ -970,6 +997,7 @@ pub enum Use<'a> { Write, WriteInto, KeyMerge(Merge<'a>) }   // Merge { map, for
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
 pub fn check_path(context: &Context, loadout: &Path, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; `loadout` = active checkout root; normalizes both sides itself
 pub fn check_source(context: &Context, loadout: &Path, path: &Path) -> Option<Conflict>; // U5 sources: auth always; other kinds unless the same entry holds the checkout
+pub fn check_source_file(context: &Context, loadout: &Path, reached: &Path, real: &Path) -> Option<Conflict>; // both identities of one file
 pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only
 pub enum Conflict { Reserved { entry: Entry, reserved: String }, Unverifiable { path: PathBuf, error: String } }
 
@@ -981,8 +1009,11 @@ pub struct Diagnostics(..);              // push, extend, has_errors, count, ite
 pub struct Check { pub name: String, pub status: CheckStatus, pub detail: String }   // Pass | Info | Warn | Fail
 
 // manifest (foundation)
-impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warnings */), Diagnostics>; }
-pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String>;   // canonical root; validate's Git metadata identification, reused by agents
+impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warnings */), Diagnostics>; }   // context-free: synthetic/test use only
+impl Loadout { pub fn load_guarded(root: &Path, context: &Context) -> Result<(Loadout, Diagnostics), Diagnostics>; } // every host command; source policy before each manifest/pointer open
+pub type Guard<'a> = dyn Fn(&Path, &Path) -> Result<(), String> + 'a;   // (reached, canonical) -> refusal
+pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String>;   // canonical root; validate's Git metadata identification (unguarded)
+pub fn git_metadata_guarded(root: &Path, guard: &dyn Fn(&Path, &Path) -> Result<(), String>) -> Result<Vec<PathBuf>, String>; // guard(reached, canonical) runs before each pointer open; agents passes check_source
 // Loadout { root, machines: BTreeMap<String, MachineEntry>, layers: Vec<LayerFile { scope: Scope, file, layer: Layer }> }
 // Scope::{Global, Os(Os), Tag(String), Machine(String)}; layers come global, os, tags, machines, each sorted by name
 
@@ -1027,6 +1058,8 @@ pub fn rollback(context: &Context, run: Option<&str>) -> Result<Vec<Target>, sta
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
 // Target::{Path, Entry { .., shape }, Program, None}; Action::unsupported(item, target, reason) builds prior Absent, no content
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
+// U4 contract: the checkout is loaded with Loadout::load_guarded(loadout, context), never Loadout::load, then resolve,
+// check_targets, and agents::materialize(resolved, context, loadout), which re-runs the guarded pointer detection itself.
 // `loadout` = the active checkout root (default clone or --loadout DIR); passed to every reserved::check_path call
 // apply (U4)
 pub fn run(plan: &Plan, context: &Context, loadout: &Path, options: Options) -> Result<Report, apply::Error>; // re-checks reserved paths before each backup and write
