@@ -423,6 +423,7 @@ fn skill_contents_cannot_escape_through_links() {
 }
 
 const MINIMAL: &str = "[loadout]\nversion = 1\n";
+#[cfg(unix)]
 const BAD_LAYER: &str = "[nonsense]\nx = 1\n";
 
 #[test]
@@ -1076,6 +1077,7 @@ fn doctor_reads_a_saved_machine_name() {
     assert!(text.contains("work-laptop (saved in"), "{text}");
 }
 
+#[cfg(unix)]
 fn run_with_deadline(mut command: Command) -> Output {
     use std::time::{Duration, Instant};
 
