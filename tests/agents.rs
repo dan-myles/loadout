@@ -13,7 +13,8 @@ use loadout::platform::{Arch, Os};
 use loadout::resolve;
 use serde_json::{Value as Json, json};
 
-const ALL: &str = r#"["claude", "codex", "cursor", "grok", "muse", "pi", "opencode", "antigravity"]"#;
+const ALL: &str =
+    r#"["claude", "codex", "cursor", "grok", "muse", "pi", "opencode", "antigravity"]"#;
 
 struct Sandbox {
     _dir: tempfile::TempDir,
@@ -32,7 +33,10 @@ fn sandbox() -> Sandbox {
         home,
         loadout,
     };
-    sandbox.source("skills/review/SKILL.md", "---\nname: review\n---\nReview {{ code }}.\n");
+    sandbox.source(
+        "skills/review/SKILL.md",
+        "---\nname: review\n---\nReview {{ code }}.\n",
+    );
     sandbox.source("skills/review/notes/checklist.md", "- read it\n");
     sandbox.source("instructions/AGENTS.md", "Be brief. {{ not_rendered }}\n");
     sandbox
@@ -201,7 +205,13 @@ fn entry_of(desired: &Desired) -> (&Path, McpFormat, &str, &str, McpShape) {
             pointer,
             key,
             shape,
-        } => (file.as_path(), *format, pointer.as_str(), key.as_str(), *shape),
+        } => (
+            file.as_path(),
+            *format,
+            pointer.as_str(),
+            key.as_str(),
+            *shape,
+        ),
         other => panic!("expected an entry target, got {other:?}"),
     }
 }
@@ -224,14 +234,78 @@ fn every_builtin_agent_takes_each_kind_at_its_documented_linux_path() {
     let (desired, unsupported) = sandbox.ok(&manifest(&agents_line(ALL)), &context);
 
     let expected = [
-        ("claude", ".claude/skills/review", Some(".claude/CLAUDE.md"), ".claude.json", "/mcpServers", McpShape::ClaudeJson, McpFormat::Json),
-        ("codex", ".agents/skills/review", Some(".codex/AGENTS.md"), ".codex/config.toml", "/mcp_servers", McpShape::CodexToml, McpFormat::Toml),
-        ("cursor", ".cursor/skills/review", None, ".cursor/mcp.json", "/mcpServers", McpShape::CursorJson, McpFormat::Json),
-        ("grok", ".grok/skills/review", Some(".grok/AGENTS.md"), ".grok/config.toml", "/mcp_servers", McpShape::GrokToml, McpFormat::Toml),
-        ("muse", ".config/muse/skills/review", None, ".config/muse/settings.json", "/mcp_servers", McpShape::MuseJson, McpFormat::Json),
-        ("pi", ".pi/agent/skills/review", Some(".pi/agent/AGENTS.md"), ".pi/agent/mcp.json", "/mcpServers", McpShape::PiJson, McpFormat::Json),
-        ("opencode", ".config/opencode/skills/review", Some(".config/opencode/AGENTS.md"), ".config/opencode/opencode.json", "/mcp", McpShape::OpencodeJson, McpFormat::Json),
-        ("antigravity", ".gemini/antigravity-cli/skills/review", Some(".gemini/AGENTS.md"), ".gemini/config/mcp_config.json", "/mcpServers", McpShape::AntigravityJson, McpFormat::Json),
+        (
+            "claude",
+            ".claude/skills/review",
+            Some(".claude/CLAUDE.md"),
+            ".claude.json",
+            "/mcpServers",
+            McpShape::ClaudeJson,
+            McpFormat::Json,
+        ),
+        (
+            "codex",
+            ".agents/skills/review",
+            Some(".codex/AGENTS.md"),
+            ".codex/config.toml",
+            "/mcp_servers",
+            McpShape::CodexToml,
+            McpFormat::Toml,
+        ),
+        (
+            "cursor",
+            ".cursor/skills/review",
+            None,
+            ".cursor/mcp.json",
+            "/mcpServers",
+            McpShape::CursorJson,
+            McpFormat::Json,
+        ),
+        (
+            "grok",
+            ".grok/skills/review",
+            Some(".grok/AGENTS.md"),
+            ".grok/config.toml",
+            "/mcp_servers",
+            McpShape::GrokToml,
+            McpFormat::Toml,
+        ),
+        (
+            "muse",
+            ".config/muse/skills/review",
+            None,
+            ".config/muse/settings.json",
+            "/mcp_servers",
+            McpShape::MuseJson,
+            McpFormat::Json,
+        ),
+        (
+            "pi",
+            ".pi/agent/skills/review",
+            Some(".pi/agent/AGENTS.md"),
+            ".pi/agent/mcp.json",
+            "/mcpServers",
+            McpShape::PiJson,
+            McpFormat::Json,
+        ),
+        (
+            "opencode",
+            ".config/opencode/skills/review",
+            Some(".config/opencode/AGENTS.md"),
+            ".config/opencode/opencode.json",
+            "/mcp",
+            McpShape::OpencodeJson,
+            McpFormat::Json,
+        ),
+        (
+            "antigravity",
+            ".gemini/antigravity-cli/skills/review",
+            Some(".gemini/AGENTS.md"),
+            ".gemini/config/mcp_config.json",
+            "/mcpServers",
+            McpShape::AntigravityJson,
+            McpFormat::Json,
+        ),
     ];
     for (agent, skill, instructions, mcp, map, shape, format) in expected {
         let one = find(&desired, ItemKind::Skill, "review", agent);
@@ -243,7 +317,11 @@ fn every_builtin_agent_takes_each_kind_at_its_documented_linux_path() {
             }
             None => {
                 let action = refused(&unsupported, ItemKind::Instructions, "global", agent);
-                assert_eq!(action.target, Target::None, "{agent} has no instructions file");
+                assert_eq!(
+                    action.target,
+                    Target::None,
+                    "{agent} has no instructions file"
+                );
             }
         }
         let one = find(&desired, ItemKind::Mcp, "files", agent);
@@ -257,13 +335,27 @@ fn every_builtin_agent_takes_each_kind_at_its_documented_linux_path() {
     }
 
     let cursor = refused(&unsupported, ItemKind::Instructions, "global", "cursor");
-    assert!(reason(cursor).contains("app settings"), "{}", reason(cursor));
+    assert!(
+        reason(cursor).contains("app settings"),
+        "{}",
+        reason(cursor)
+    );
     let muse = refused(&unsupported, ItemKind::Instructions, "global", "muse");
     assert!(reason(muse).contains("no path"), "{}", reason(muse));
 
     let antigravity = refused(&unsupported, ItemKind::Mcp, "github", "antigravity");
-    assert!(matches!(antigravity.target, Target::Entry { shape: McpShape::AntigravityJson, .. }));
-    assert!(reason(antigravity).contains("no documented env syntax"), "{}", reason(antigravity));
+    assert!(matches!(
+        antigravity.target,
+        Target::Entry {
+            shape: McpShape::AntigravityJson,
+            ..
+        }
+    ));
+    assert!(
+        reason(antigravity).contains("no documented env syntax"),
+        "{}",
+        reason(antigravity)
+    );
 
     for action in &unsupported {
         assert_eq!(action.prior, Observed::Absent);
@@ -288,7 +380,10 @@ fn mcp_entries_carry_each_agents_env_reference_never_a_value() {
     let codex = entry_json(find(&desired, ItemKind::Mcp, "github", "codex"));
     assert_eq!(codex["bearer_token_env_var"], "GITHUB_TOKEN");
     let cursor = entry_json(find(&desired, ItemKind::Mcp, "github", "cursor"));
-    assert_eq!(cursor["headers"]["Authorization"], "Bearer ${env:GITHUB_TOKEN}");
+    assert_eq!(
+        cursor["headers"]["Authorization"],
+        "Bearer ${env:GITHUB_TOKEN}"
+    );
     let opencode = entry_json(find(&desired, ItemKind::Mcp, "files", "opencode"));
     assert_eq!(opencode["command"], json!(["npx", "-y", "server"]));
     let antigravity = entry_json(find(&desired, ItemKind::Mcp, "files", "antigravity"));
@@ -331,7 +426,11 @@ fn skill_files_keep_their_executable_bit_and_file_links_are_copied_as_bytes() {
     let script = sandbox.loadout.join("skills/review/run.sh");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     sandbox.source("shared/style.md", "shared text\n");
-    symlink("../../shared/style.md", sandbox.loadout.join("skills/review/style.md")).unwrap();
+    symlink(
+        "../../shared/style.md",
+        sandbox.loadout.join("skills/review/style.md"),
+    )
+    .unwrap();
 
     let context = sandbox.isolated(Os::Linux);
     let (desired, _) = sandbox.ok(&manifest(&agents_line(r#"["codex"]"#)), &context);
@@ -352,14 +451,23 @@ fn opencode_and_muse_use_dot_config_on_macos_and_windows_and_muse_has_no_windows
     let macos = sandbox.isolated(Os::Macos);
     let (desired, _) = sandbox.ok(&manifest(&list), &macos);
     let opencode = find(&desired, ItemKind::Skill, "review", "opencode");
-    assert_eq!(sandbox.relative(path_of(opencode)), ".config/opencode/skills/review");
+    assert_eq!(
+        sandbox.relative(path_of(opencode)),
+        ".config/opencode/skills/review"
+    );
     let muse = find(&desired, ItemKind::Mcp, "files", "muse");
-    assert_eq!(sandbox.relative(entry_of(muse).0), ".config/muse/settings.json");
+    assert_eq!(
+        sandbox.relative(entry_of(muse).0),
+        ".config/muse/settings.json"
+    );
 
     let windows = sandbox.isolated(Os::Windows);
     let (desired, unsupported) = sandbox.ok(&manifest(&list), &windows);
     let opencode = find(&desired, ItemKind::Instructions, "global", "opencode");
-    assert_eq!(sandbox.relative(path_of(opencode)), ".config/opencode/AGENTS.md");
+    assert_eq!(
+        sandbox.relative(path_of(opencode)),
+        ".config/opencode/AGENTS.md"
+    );
     let claude = find(&desired, ItemKind::Mcp, "files", "claude");
     assert_eq!(sandbox.relative(entry_of(claude).0), ".claude.json");
     for (kind, id) in [
@@ -397,21 +505,54 @@ fn agent_dir_overrides_apply_outside_isolation_and_are_ignored_inside_it() {
             Target::Entry { file, .. } => file.clone(),
             other => panic!("{other:?}"),
         };
-        path.strip_prefix(&base).unwrap().to_string_lossy().replace('\\', "/")
+        path.strip_prefix(&base)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
     };
-    assert_eq!(at(ItemKind::Skill, "review", "claude"), "claude-pool/skills/review");
-    assert_eq!(at(ItemKind::Instructions, "global", "claude"), "claude-pool/CLAUDE.md");
-    assert_eq!(at(ItemKind::Mcp, "files", "claude"), "claude-pool/.claude.json");
-    assert_eq!(at(ItemKind::Skill, "review", "codex"), "home/.agents/skills/review");
-    assert_eq!(at(ItemKind::Instructions, "global", "codex"), "codex-home/AGENTS.md");
-    assert_eq!(at(ItemKind::Mcp, "files", "codex"), "codex-home/config.toml");
+    assert_eq!(
+        at(ItemKind::Skill, "review", "claude"),
+        "claude-pool/skills/review"
+    );
+    assert_eq!(
+        at(ItemKind::Instructions, "global", "claude"),
+        "claude-pool/CLAUDE.md"
+    );
+    assert_eq!(
+        at(ItemKind::Mcp, "files", "claude"),
+        "claude-pool/.claude.json"
+    );
+    assert_eq!(
+        at(ItemKind::Skill, "review", "codex"),
+        "home/.agents/skills/review"
+    );
+    assert_eq!(
+        at(ItemKind::Instructions, "global", "codex"),
+        "codex-home/AGENTS.md"
+    );
+    assert_eq!(
+        at(ItemKind::Mcp, "files", "codex"),
+        "codex-home/config.toml"
+    );
     assert_eq!(at(ItemKind::Mcp, "files", "grok"), "grok-home/config.toml");
     assert_eq!(at(ItemKind::Skill, "review", "pi"), "pi-dir/skills/review");
-    assert_eq!(at(ItemKind::Instructions, "global", "antigravity"), "gemini-home/AGENTS.md");
-    assert_eq!(at(ItemKind::Mcp, "files", "antigravity"), "gemini-home/config/mcp_config.json");
-    assert_eq!(at(ItemKind::Skill, "review", "opencode"), "xdg/opencode/skills/review");
+    assert_eq!(
+        at(ItemKind::Instructions, "global", "antigravity"),
+        "gemini-home/AGENTS.md"
+    );
+    assert_eq!(
+        at(ItemKind::Mcp, "files", "antigravity"),
+        "gemini-home/config/mcp_config.json"
+    );
+    assert_eq!(
+        at(ItemKind::Skill, "review", "opencode"),
+        "xdg/opencode/skills/review"
+    );
     assert_eq!(at(ItemKind::Mcp, "files", "muse"), "xdg/muse/settings.json");
-    assert_eq!(at(ItemKind::Skill, "review", "cursor"), "home/.cursor/skills/review");
+    assert_eq!(
+        at(ItemKind::Skill, "review", "cursor"),
+        "home/.cursor/skills/review"
+    );
 
     let mut isolating = vars.to_vec();
     isolating.push(("LOADOUT_HOME", sandbox.home.clone()));
@@ -420,7 +561,10 @@ fn agent_dir_overrides_apply_outside_isolation_and_are_ignored_inside_it() {
     let claude = find(&desired, ItemKind::Mcp, "files", "claude");
     assert_eq!(sandbox.relative(entry_of(claude).0), ".claude.json");
     let opencode = find(&desired, ItemKind::Skill, "review", "opencode");
-    assert_eq!(sandbox.relative(path_of(opencode)), ".config/opencode/skills/review");
+    assert_eq!(
+        sandbox.relative(path_of(opencode)),
+        ".config/opencode/skills/review"
+    );
 }
 
 #[test]
@@ -454,12 +598,18 @@ fn opencode_writes_the_jsonc_file_the_user_already_keeps() {
 
     let (desired, _) = sandbox.ok(&text, &context);
     let (file, format, ..) = entry_of(find(&desired, ItemKind::Mcp, "files", "opencode"));
-    assert_eq!((sandbox.relative(file).as_str(), format), (".config/opencode/opencode.json", McpFormat::Json));
+    assert_eq!(
+        (sandbox.relative(file).as_str(), format),
+        (".config/opencode/opencode.json", McpFormat::Json)
+    );
 
     sandbox.home_file(".config/opencode/opencode.jsonc", "{\n  // mine\n}\n");
     let (desired, _) = sandbox.ok(&text, &context);
     let (file, format, ..) = entry_of(find(&desired, ItemKind::Mcp, "files", "opencode"));
-    assert_eq!((sandbox.relative(file).as_str(), format), (".config/opencode/opencode.jsonc", McpFormat::Jsonc));
+    assert_eq!(
+        (sandbox.relative(file).as_str(), format),
+        (".config/opencode/opencode.jsonc", McpFormat::Jsonc)
+    );
 }
 
 const DEVIN: &str = r#"
@@ -492,7 +642,10 @@ env_syntax = "none"
 fn declared_custom_agents_get_exactly_their_declared_paths_shapes_and_syntax() {
     let sandbox = sandbox();
     let context = sandbox.isolated(Os::Linux);
-    let text = manifest(&format!("{}{DEVIN}", agents_line(r#"["devin", "copilot"]"#)));
+    let text = manifest(&format!(
+        "{}{DEVIN}",
+        agents_line(r#"["devin", "copilot"]"#)
+    ));
     let (desired, unsupported) = sandbox.ok(&text, &context);
 
     let skill = find(&desired, ItemKind::Skill, "review", "devin");
@@ -502,18 +655,39 @@ fn declared_custom_agents_get_exactly_their_declared_paths_shapes_and_syntax() {
     let github = find(&desired, ItemKind::Mcp, "github", "devin");
     let (file, format, pointer, key, shape) = entry_of(github);
     assert_eq!(sandbox.relative(file), ".devin/mcp.jsonc");
-    assert_eq!((format, pointer, key, shape), (McpFormat::Jsonc, "/servers/mcp", "github", McpShape::OpencodeJson));
-    assert_eq!(entry_json(github)["headers"]["Authorization"], "Bearer {env:GITHUB_TOKEN}");
+    assert_eq!(
+        (format, pointer, key, shape),
+        (
+            McpFormat::Jsonc,
+            "/servers/mcp",
+            "github",
+            McpShape::OpencodeJson
+        )
+    );
+    assert_eq!(
+        entry_json(github)["headers"]["Authorization"],
+        "Bearer {env:GITHUB_TOKEN}"
+    );
 
     let files = find(&desired, ItemKind::Mcp, "files", "copilot");
     assert_eq!(entry_of(files).4, McpShape::GrokToml);
     let github = refused(&unsupported, ItemKind::Mcp, "github", "copilot");
-    assert!(matches!(github.target, Target::Entry { shape: McpShape::GrokToml, .. }));
+    assert!(matches!(
+        github.target,
+        Target::Entry {
+            shape: McpShape::GrokToml,
+            ..
+        }
+    ));
     assert!(reason(github).contains("no documented env syntax"));
 
     let skill = refused(&unsupported, ItemKind::Skill, "review", "copilot");
     assert_eq!(skill.target, Target::None);
-    assert!(reason(skill).contains("no skills path for linux"), "{}", reason(skill));
+    assert!(
+        reason(skill).contains("no skills path for linux"),
+        "{}",
+        reason(skill)
+    );
     let instructions = refused(&unsupported, ItemKind::Instructions, "global", "copilot");
     assert_eq!(instructions.target, Target::None);
     assert!(reason(instructions).contains("no instructions table"));
@@ -538,7 +712,11 @@ fn a_destination_inside_the_active_checkout_is_unsupported_and_its_source_is_nev
     let (desired, unsupported) = moved.ok(&text, &context);
     let devin = refused(&unsupported, ItemKind::Skill, "review", "devin");
     assert!(matches!(devin.target, Target::Path { .. }));
-    assert!(reason(devin).contains("loadout's own state"), "{}", reason(devin));
+    assert!(
+        reason(devin).contains("loadout's own state"),
+        "{}",
+        reason(devin)
+    );
     find(&desired, ItemKind::Skill, "review", "codex");
 }
 
@@ -550,17 +728,17 @@ fn a_skills_folder_aliased_into_an_auth_store_is_unsupported() {
     let sandbox = sandbox();
     fs::create_dir_all(sandbox.home.join(".ssh")).unwrap();
     fs::create_dir_all(sandbox.home.join(".cursor")).unwrap();
-    symlink(sandbox.home.join(".ssh"), sandbox.home.join(".cursor/skills")).unwrap();
+    symlink(
+        sandbox.home.join(".ssh"),
+        sandbox.home.join(".cursor/skills"),
+    )
+    .unwrap();
     let context = sandbox.isolated(Os::Linux);
     let (desired, unsupported) = sandbox.ok(&manifest(&agents_line(r#"["cursor"]"#)), &context);
     let cursor = refused(&unsupported, ItemKind::Skill, "review", "cursor");
     assert!(reason(cursor).contains("auth"), "{}", reason(cursor));
     assert!(matches!(cursor.target, Target::Path { .. }));
-    assert!(
-        desired
-            .iter()
-            .all(|one| one.item.kind != ItemKind::Skill)
-    );
+    assert!(desired.iter().all(|one| one.item.kind != ItemKind::Skill));
 }
 
 #[test]
@@ -613,7 +791,11 @@ fn a_linked_folder_cannot_hide_a_second_writer() {
     let sandbox = sandbox();
     fs::create_dir_all(sandbox.home.join(".agents/skills")).unwrap();
     fs::create_dir_all(sandbox.home.join(".cursor")).unwrap();
-    symlink(sandbox.home.join(".agents/skills"), sandbox.home.join(".cursor/skills")).unwrap();
+    symlink(
+        sandbox.home.join(".agents/skills"),
+        sandbox.home.join(".cursor/skills"),
+    )
+    .unwrap();
     let context = sandbox.isolated(Os::Linux);
     let errors = sandbox.invalid(&manifest(&agents_line(r#"["codex", "cursor"]"#)), &context);
     assert!(errors.contains("skills.review for cursor"), "{errors}");
@@ -627,9 +809,18 @@ fn mcp_keys_collide_per_file_and_pi_folds_dash_and_underscore() {
     let pair = "[mcp.my-docs]\ncommand = \"a\"\n\n[mcp.my_docs]\ncommand = \"b\"\n";
     let base = "[loadout]\nversion = 1\n";
 
-    sandbox.ok(&format!("{base}{}{pair}", agents_line(r#"["claude"]"#)), &context);
-    let errors = sandbox.invalid(&format!("{base}{}{pair}", agents_line(r#"["pi"]"#)), &context);
-    assert!(errors.contains("mcp.my_docs for pi") && errors.contains("mcp.my-docs for pi"), "{errors}");
+    sandbox.ok(
+        &format!("{base}{}{pair}", agents_line(r#"["claude"]"#)),
+        &context,
+    );
+    let errors = sandbox.invalid(
+        &format!("{base}{}{pair}", agents_line(r#"["pi"]"#)),
+        &context,
+    );
+    assert!(
+        errors.contains("mcp.my_docs for pi") && errors.contains("mcp.my-docs for pi"),
+        "{errors}"
+    );
     assert!(errors.contains("sets the same MCP key as"), "{errors}");
 
     let shared = format!(
@@ -637,13 +828,19 @@ fn mcp_keys_collide_per_file_and_pi_folds_dash_and_underscore() {
         agents_line(r#"["cursor", "devin"]"#)
     );
     let errors = sandbox.invalid(&shared, &context);
-    assert!(errors.contains("mcp.docs for devin") && errors.contains("mcp.docs for cursor"), "{errors}");
+    assert!(
+        errors.contains("mcp.docs for devin") && errors.contains("mcp.docs for cursor"),
+        "{errors}"
+    );
 }
 
 #[test]
 fn materialize_reads_nothing_into_the_home_and_writes_nothing() {
     let sandbox = sandbox();
-    sandbox.home_file(".claude.json", "{\"oauthAccount\":{\"token\":\"sentinel\"}}");
+    sandbox.home_file(
+        ".claude.json",
+        "{\"oauthAccount\":{\"token\":\"sentinel\"}}",
+    );
     sandbox.home_file(".codex/auth.json", "sentinel");
     sandbox.home_file(".config/opencode/opencode.jsonc", "{}");
     let before = sandbox.snapshot();
@@ -736,8 +933,12 @@ fn doctor(home: &Path, state: &Path) -> Json {
         .env("LOADOUT_STATE_DIR", state)
         .output()
         .unwrap();
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("doctor --json: {error}: {}", String::from_utf8_lossy(&output.stdout)))
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "doctor --json: {error}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
 }
 
 fn check<'a>(report: &'a Json, name: &str) -> Option<&'a Json> {
@@ -758,18 +959,39 @@ fn doctor_reports_every_adapter_and_t3_pickup_without_writing() {
     assert!(!state.exists());
 
     let overrides = check(&report, "agent overrides").unwrap();
-    assert!(overrides["detail"].as_str().unwrap().contains("ignored under LOADOUT_HOME"));
-    for agent in ["claude", "codex", "cursor", "grok", "muse", "pi", "opencode", "antigravity"] {
+    assert!(
+        overrides["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ignored under LOADOUT_HOME")
+    );
+    for agent in [
+        "claude",
+        "codex",
+        "cursor",
+        "grok",
+        "muse",
+        "pi",
+        "opencode",
+        "antigravity",
+    ] {
         let one = check(&report, &format!("agent {agent}")).unwrap_or_else(|| panic!("{agent}"));
         assert_eq!(one["status"], "info");
     }
-    let antigravity = check(&report, "agent antigravity").unwrap()["detail"].as_str().unwrap();
+    let antigravity = check(&report, "agent antigravity").unwrap()["detail"]
+        .as_str()
+        .unwrap();
     assert!(antigravity.contains("only part"), "{antigravity}");
     assert!(antigravity.contains("private GEMINI_HOME"), "{antigravity}");
-    let cursor = check(&report, "agent cursor").unwrap()["detail"].as_str().unwrap();
+    let cursor = check(&report, "agent cursor").unwrap()["detail"]
+        .as_str()
+        .unwrap();
     assert!(cursor.contains("instructions unsupported"), "{cursor}");
     assert!(cursor.contains("inferred, not proven"), "{cursor}");
-    assert_eq!(check(&report, "skill duplicates").unwrap()["status"], "pass");
+    assert_eq!(
+        check(&report, "skill duplicates").unwrap()["status"],
+        "pass"
+    );
     assert!(check(&report, "codex override").is_none());
 }
 
@@ -791,11 +1013,17 @@ fn doctor_warns_about_double_loading_and_shadowing_files() {
     let detail = duplicates["detail"].as_str().unwrap().replace('\\', "/");
     let muse = if cfg!(windows) { None } else { Some("muse") };
     for agent in ["cursor", "opencode"].into_iter().chain(muse) {
-        assert!(detail.contains(&format!("{agent} loads review from")), "{detail}");
+        assert!(
+            detail.contains(&format!("{agent} loads review from")),
+            "{detail}"
+        );
     }
     assert!(!detail.contains("claude loads"), "{detail}");
     assert_eq!(check(&report, "codex override").unwrap()["status"], "warn");
-    assert_eq!(check(&report, "grok instructions").unwrap()["status"], "warn");
+    assert_eq!(
+        check(&report, "grok instructions").unwrap()["status"],
+        "warn"
+    );
     assert_eq!(check(&report, "opencode config").unwrap()["status"], "warn");
 }
 
@@ -867,7 +1095,10 @@ fn git_metadata_named_by_a_gitfile_or_commondir_stays_refused_after_validation()
 
     let sandbox = sandbox();
     sandbox.source(".git", "gitdir: meta/repo\n");
-    sandbox.source("meta/repo/config", "[remote] url = https://token@example.com\n");
+    sandbox.source(
+        "meta/repo/config",
+        "[remote] url = https://token@example.com\n",
+    );
     sandbox.source("meta/repo/commondir", "../common\n");
     sandbox.source("meta/common/HEAD", "ref: refs/heads/main\n");
     sandbox.source("meta/notes.md", "plain\n");
@@ -886,9 +1117,14 @@ fn git_metadata_named_by_a_gitfile_or_commondir_stays_refused_after_validation()
     let (resolved, _) = resolve::resolve(&loadout, &facts).unwrap();
     let link = sandbox.loadout.join("skills/review/extra");
 
-    for target in ["meta/repo/config", "meta/repo/commondir", "meta/common/HEAD"] {
+    for target in [
+        "meta/repo/config",
+        "meta/repo/commondir",
+        "meta/common/HEAD",
+    ] {
         symlink(sandbox.loadout.join(target), &link).unwrap();
-        let Err(Error::Invalid(errors)) = agents::materialize(&resolved, &context, &sandbox.loadout)
+        let Err(Error::Invalid(errors)) =
+            agents::materialize(&resolved, &context, &sandbox.loadout)
         else {
             panic!("a link to {target} must be refused");
         };

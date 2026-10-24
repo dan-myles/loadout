@@ -61,7 +61,11 @@ fn summary(agent: BuiltinAgent, context: &Context) -> Check {
             let existing = mcp.existing.map_or_else(String::new, |(place, _)| {
                 format!(", or {} when it exists", place.expand(context).display())
             });
-            format!("{} {}{existing}", mcp.file.expand(context).display(), mcp.map)
+            format!(
+                "{} {}{existing}",
+                mcp.file.expand(context).display(),
+                mcp.map
+            )
         }
         Capability::Unsupported(reason) => format!("unsupported ({reason})"),
     };

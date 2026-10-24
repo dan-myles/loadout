@@ -198,7 +198,8 @@ impl Out<'_> {
     }
 
     fn unsupported(&mut self, item: ItemRef, target: Target, reason: String) {
-        self.unsupported.push(Action::unsupported(item, target, reason));
+        self.unsupported
+            .push(Action::unsupported(item, target, reason));
     }
 }
 
@@ -236,12 +237,7 @@ struct Mcp {
     env: EnvSyntax,
 }
 
-fn destinations(
-    agent: &Agent,
-    context: &Context,
-    loadout: &Path,
-    needs_mcp: bool,
-) -> Destinations {
+fn destinations(agent: &Agent, context: &Context, loadout: &Path, needs_mcp: bool) -> Destinations {
     match agent {
         Agent::Builtin { agent } => {
             let adapter = table::adapter(*agent, context.os);

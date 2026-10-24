@@ -78,9 +78,7 @@ fn collision(one: &Forms, other: &Forms) -> Option<&'static str> {
         let how = match (&one.address, &other.address) {
             (Some(x), Some(y)) if a == b => nested(x, y).then_some("sets the same MCP key as"),
             _ if a == b => Some("writes the same path as"),
-            _ if inside(a, b) || inside(b, a) => {
-                Some("nests a file and a folder at one path with")
-            }
+            _ if inside(a, b) || inside(b, a) => Some("nests a file and a folder at one path with"),
             _ => None,
         };
         found = found.or(how);

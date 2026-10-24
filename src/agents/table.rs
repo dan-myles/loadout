@@ -232,9 +232,7 @@ pub(super) fn adapter(agent: BuiltinAgent, os: Os) -> Adapter {
                 mcp,
                 also_reads_skills: also,
                 also_reads_instructions: &[],
-                pickup: Pickup::Yes(
-                    "T3 only strips META_API_KEY and turns off Muse auto-update",
-                ),
+                pickup: Pickup::Yes("T3 only strips META_API_KEY and turns off Muse auto-update"),
                 windows_inferred: false,
                 evidence: "dev.meta.ai/docs/muse-code/configuration and /extending; T3 provider-muse sdk.ts",
             }
@@ -314,7 +312,13 @@ mod tests {
 
     fn free(context: &Context, checkout: &Path, path: &Path, how: Use<'_>, agent: BuiltinAgent) {
         let conflict = reserved::check_path(context, checkout, path, how);
-        assert_eq!(conflict, None, "{agent:?} on {}: {}", context.os, path.display());
+        assert_eq!(
+            conflict,
+            None,
+            "{agent:?} on {}: {}",
+            context.os,
+            path.display()
+        );
     }
 
     #[test]
@@ -364,7 +368,13 @@ mod tests {
                     .chain(found.also_reads_instructions.iter().copied())
                     .chain([CODEX_OVERRIDE]);
                 for place in probed {
-                    free(&context, &checkout, &place.expand(&context), Use::WriteInto, agent);
+                    free(
+                        &context,
+                        &checkout,
+                        &place.expand(&context),
+                        Use::WriteInto,
+                        agent,
+                    );
                 }
             }
         }

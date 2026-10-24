@@ -90,7 +90,10 @@ impl<'a> Sources<'a> {
             } else if kind.is_file() {
                 tree.insert(key, self.read(&path, &path)?);
             } else {
-                return Err(format!("{} is not a regular file or folder", self.shown(&path)));
+                return Err(format!(
+                    "{} is not a regular file or folder",
+                    self.shown(&path)
+                ));
             }
         }
         Ok(())
@@ -105,9 +108,9 @@ impl<'a> Sources<'a> {
                 self.shown(path)
             ));
         }
-        let real = path.canonicalize().map_err(|_| {
-            format!("{} does not exist or is a broken link", self.shown(path))
-        })?;
+        let real = path
+            .canonicalize()
+            .map_err(|_| format!("{} does not exist or is a broken link", self.shown(path)))?;
         if !real.starts_with(&self.root) {
             return Err(format!("{} resolves outside the loadout", self.shown(path)));
         }

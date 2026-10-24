@@ -1087,7 +1087,12 @@ mod tests {
         ] {
             fs::create_dir_all(&checkout).unwrap();
             let file = made(checkout.join("skills").join("review").join("SKILL.md"));
-            assert_eq!(source(&context, &checkout, &file), None, "{}", file.display());
+            assert_eq!(
+                source(&context, &checkout, &file),
+                None,
+                "{}",
+                file.display()
+            );
         }
     }
 
@@ -1136,7 +1141,12 @@ mod tests {
             checkout.join("skills").join("review.md"),
         ] {
             let file = made(path);
-            assert_eq!(source(&context, &checkout, &file), None, "{}", file.display());
+            assert_eq!(
+                source(&context, &checkout, &file),
+                None,
+                "{}",
+                file.display()
+            );
         }
 
         let inside_ssh = home.join(".ssh").join("loadout");
@@ -1178,7 +1188,10 @@ mod tests {
         let relative = Path::new("skills").join("review.md");
         assert_eq!(source(&context, &home, &relative), Some(None));
 
-        let broken = native(&home, &[("CODEX_HOME", home.join("missing").join("..").join("codex"))]);
+        let broken = native(
+            &home,
+            &[("CODEX_HOME", home.join("missing").join("..").join("codex"))],
+        );
         assert_eq!(source(&broken, &home, &file), Some(None));
     }
 
@@ -1186,8 +1199,15 @@ mod tests {
     fn the_source_policy_leaves_destination_checks_unchanged() {
         let (_dir, home) = source_home();
         let context = native(&home, &[]);
-        let target = home.join(".t3").join("worktrees").join("loadout").join("skills");
+        let target = home
+            .join(".t3")
+            .join("worktrees")
+            .join("loadout")
+            .join("skills");
         let conflict = check_path(&context, &no_loadout(), &target, Use::Write);
-        assert_eq!(conflict.and_then(|conflict| conflict.kind()), Some(Kind::Private));
+        assert_eq!(
+            conflict.and_then(|conflict| conflict.kind()),
+            Some(Kind::Private)
+        );
     }
 }
