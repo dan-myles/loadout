@@ -1038,11 +1038,25 @@ mod targets {
             text,
             "error: files.colon.target: ~/a:b is not a valid path on windows"
         );
-        let linux = resolve::check_targets(
+        let linux = lines(&resolve::check_targets(
             &resolved,
             &isolated(Os::Linux, home.path()),
             &tree.loadout.root,
-        );
-        assert!(linux.is_empty(), "{}", lines(&linux));
+        ));
+        if cfg!(windows) {
+            // A native Windows join reads the part `a:b` as the drive-relative path `a:b`, which
+            // leaves the home dir, so even a context claiming Linux must refuse it, not write it.
+            assert!(
+                linux.starts_with(
+                    "error: files.colon.target: a:b cannot verify a:b is not a reserved destination"
+                ),
+                "{linux}"
+            );
+        } else {
+            assert_eq!(
+                linux, "",
+                "a colon is an ordinary POSIX file name character"
+            );
+        }
     }
 }
