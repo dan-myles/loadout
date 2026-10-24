@@ -598,10 +598,25 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   It checks `{config}/` under all three OS meanings. A conflict is an error naming the reserved path
   and its kind.
 - **U1, U4, and U5 (runtime, frozen).** Before any read of a target, any backup, and any write, each
-  fully expanded target (overrides applied) is checked with `reserved::check_path(context, path, use)`.
-  The check runs twice: on the expanded path, and on its canonical form, with symlinks resolved
-  through existing ancestors. A conflict is an `unsupported` action, never a write, and the reserved
-  file is never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
+  expanded target goes through `reserved::check_path(context, path, use)`, called once. That one
+  API owns normalization, and callers never canonicalize for it.
+  - **Both sides are normalized.** The target is compared in its lexical and its normalized form.
+    Every reserved entry is compared at every root it can live under: the override root (such as
+    `CODEX_HOME`) and the default home root, `xdg_config` and `~/.config`, and `Context.state` and
+    the OS default state dir. Each reserved entry is also compared in lexical and normalized form.
+    So an alias of a symlinked protected root (`~/alias/codex/auth.json` where
+    `CODEX_HOME -> real/codex`) or of a protected file that is itself a link
+    (`~/.grok/auth.json -> vault/token`) is caught from either side.
+  - **`reserved::normalize`** canonicalizes the longest existing ancestor and re-appends the missing
+    tail, so future descendants are probed. It follows a dangling link through `read_link`, up to 40
+    links, and rejects non-absolute or `.`/`..` paths. It only stats and reads links; it never opens
+    file contents.
+  - **Failing closed.** Any metadata error other than not-found, on either side, returns
+    `Conflict::Unverifiable`, which callers treat like a conflict.
+  - **Results.** A conflict is an `unsupported` action, never a write, and the reserved file is
+    never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
+  - Static validate keeps its lexical default check (`check_literal`). Sibling paths stay allowed in
+    both.
 - An unowned shared config is never adopted or replaced as a whole file. Only U6's owned keys change.
 - **Doctor diagnostics** (U5): report which overrides are set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
   `GROK_HOME`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`). Warn when Codex `AGENTS.override.md`
@@ -726,7 +741,9 @@ pub const TABLE: &[Entry];                                      // Entry { ancho
 pub enum Kind { Auth, SharedConfig, LoadoutState, Private }
 pub enum Use { Write, WriteInto, KeyMerge }
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
-pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5, expanded and canonical
+pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; normalizes target and every reserved root itself
+pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only
+pub enum Conflict { Reserved { entry: Entry, reserved: String }, Unverifiable { path: PathBuf, error: String } }
 
 // commands::doctor (foundation): units extend `[foundation(context), <subject>::checks(context), …].concat()`
 

@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::context::{Base, Context, split_base};
+use crate::platform::Os;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -57,22 +60,33 @@ impl Anchor {
         }
     }
 
-    fn expand(self, context: &Context) -> PathBuf {
-        let home_or = |var: &str, default: &str| {
+    fn roots(self, context: &Context) -> Vec<PathBuf> {
+        let home = |relative: &str| join(&context.home, relative);
+        let overridable = |var: &str, default: &str| {
             context
                 .agent_dir(var)
-                .map_or_else(|| join(&context.home, default), Path::to_path_buf)
+                .map(Path::to_path_buf)
+                .into_iter()
+                .chain([home(default)])
+                .collect()
         };
-        match self {
-            Anchor::Home => context.home.clone(),
-            Anchor::ClaudeRoot => home_or("CLAUDE_CONFIG_DIR", ""),
-            Anchor::ClaudeDir => home_or("CLAUDE_CONFIG_DIR", ".claude"),
-            Anchor::CodexHome => home_or("CODEX_HOME", ".codex"),
-            Anchor::GrokHome => home_or("GROK_HOME", ".grok"),
-            Anchor::PiDir => home_or("PI_CODING_AGENT_DIR", ".pi/agent"),
-            Anchor::XdgConfig => context.xdg_config.clone(),
-            Anchor::State => context.state.clone(),
-        }
+        let state_default = match context.os {
+            Os::Linux => ".local/state/loadout",
+            Os::Macos => "Library/Application Support/loadout",
+            Os::Windows => "AppData/Local/loadout",
+        };
+        let mut roots: Vec<PathBuf> = match self {
+            Anchor::Home => vec![context.home.clone()],
+            Anchor::ClaudeRoot => overridable("CLAUDE_CONFIG_DIR", ""),
+            Anchor::ClaudeDir => overridable("CLAUDE_CONFIG_DIR", ".claude"),
+            Anchor::CodexHome => overridable("CODEX_HOME", ".codex"),
+            Anchor::GrokHome => overridable("GROK_HOME", ".grok"),
+            Anchor::PiDir => overridable("PI_CODING_AGENT_DIR", ".pi/agent"),
+            Anchor::XdgConfig => vec![context.xdg_config.clone(), home(".config")],
+            Anchor::State => vec![context.state.clone(), home(state_default)],
+        };
+        roots.dedup();
+        roots
     }
 }
 
@@ -145,14 +159,29 @@ pub enum Use {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Conflict {
-    pub entry: Entry,
-    pub reserved: String,
+pub enum Conflict {
+    Reserved { entry: Entry, reserved: String },
+    Unverifiable { path: PathBuf, error: String },
 }
 
 impl Conflict {
     pub fn message(&self) -> String {
-        format!("overlaps {}, {}", self.reserved, self.entry.kind.reason())
+        match self {
+            Conflict::Reserved { entry, reserved } => {
+                format!("overlaps {reserved}, {}", entry.kind.reason())
+            }
+            Conflict::Unverifiable { path, error } => format!(
+                "cannot verify {} is not a reserved destination ({error}); refusing it",
+                path.display()
+            ),
+        }
+    }
+
+    pub fn kind(&self) -> Option<Kind> {
+        match self {
+            Conflict::Reserved { entry, .. } => Some(entry.kind),
+            Conflict::Unverifiable { .. } => None,
+        }
     }
 }
 
@@ -183,7 +212,7 @@ pub fn check_literal(path: &str, how: Use) -> Option<Conflict> {
                 candidates
                     .iter()
                     .any(|candidate| overlaps(&parts(candidate), &parts(&reserved), how))
-                    .then(|| Conflict {
+                    .then(|| Conflict::Reserved {
                         entry: *entry,
                         reserved: format!("~/{reserved}"),
                     })
@@ -192,17 +221,99 @@ pub fn check_literal(path: &str, how: Use) -> Option<Conflict> {
 }
 
 pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict> {
-    TABLE
-        .iter()
-        .filter(|entry| blocks(entry.kind, how))
-        .find_map(|entry| {
-            let reserved = join(&entry.anchor.expand(context), entry.path);
-            let reserved_parts = path_parts(&reserved);
-            overlaps(&path_parts(path), &reserved_parts, how).then(|| Conflict {
-                entry: *entry,
-                reserved: reserved.display().to_string(),
-            })
-        })
+    let unverifiable = |path: &Path, error: io::Error| Conflict::Unverifiable {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    };
+    let targets = match normalize(path) {
+        Ok(real) => [path_parts(path), path_parts(&real)],
+        Err(error) => return Some(unverifiable(path, error)),
+    };
+    for entry in TABLE.iter().filter(|entry| blocks(entry.kind, how)) {
+        for root in entry.anchor.roots(context) {
+            let reserved = join(&root, entry.path);
+            let real = match normalize(&reserved) {
+                Ok(real) => real,
+                Err(error) => return Some(unverifiable(&reserved, error)),
+            };
+            let forms = [path_parts(&reserved), path_parts(&real)];
+            let hit = targets
+                .iter()
+                .any(|target| forms.iter().any(|form| overlaps(target, form, how)));
+            if hit {
+                return Some(Conflict::Reserved {
+                    entry: *entry,
+                    reserved: reserved.display().to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+const MAX_LINKS: usize = 40;
+
+pub fn normalize(path: &Path) -> io::Result<PathBuf> {
+    resolve(path, MAX_LINKS)
+}
+
+fn resolve(path: &Path, links: usize) -> io::Result<PathBuf> {
+    let clean = path.is_absolute()
+        && path
+            .components()
+            .all(|part| !matches!(part, Component::CurDir | Component::ParentDir));
+    if !clean {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not absolute and clean",
+        ));
+    }
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&existing) {
+            Ok(real) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(real, |path, part| path.join(part)));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(error) => {
+                if fs::symlink_metadata(&existing).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                    if links == 0 {
+                        return Err(io::Error::other("too many levels of symbolic links"));
+                    }
+                    let target = fs::read_link(&existing)?;
+                    let parent = existing.parent().unwrap_or(Path::new("/"));
+                    let dangling = missing
+                        .iter()
+                        .rev()
+                        .fold(parent.join(target), |path, part| path.join(part));
+                    return resolve(&lexical(&dangling), links - 1);
+                }
+                let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
+                    return Err(error);
+                };
+                missing.push(name);
+                existing.pop();
+            }
+        }
+    }
+}
+
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn overlaps(target: &[String], reserved: &[String], how: Use) -> bool {
@@ -239,7 +350,7 @@ mod tests {
     use crate::platform::Os;
 
     fn conflict(path: &str, how: Use) -> Option<Kind> {
-        check_literal(path, how).map(|conflict| conflict.entry.kind)
+        check_literal(path, how).and_then(|conflict| conflict.kind())
     }
 
     #[test]
@@ -329,7 +440,7 @@ mod tests {
         };
         let context = Context::resolve(Os::Linux, vars, Some("/h".into())).unwrap();
         let kind = |path: &str| {
-            check_path(&context, Path::new(path), Use::Write).map(|conflict| conflict.entry.kind)
+            check_path(&context, Path::new(path), Use::Write).and_then(|conflict| conflict.kind())
         };
         assert_eq!(kind("/alt/codex/auth.json"), Some(Kind::Auth));
         assert_eq!(kind("/alt/claude/.claude.json"), Some(Kind::SharedConfig));
@@ -337,7 +448,101 @@ mod tests {
             kind("/h/.local/state/loadout/state.json"),
             Some(Kind::LoadoutState)
         );
-        assert_eq!(kind("/h/.codex/auth.json"), None);
+        assert_eq!(kind("/h/.codex/auth.json"), Some(Kind::Auth));
         assert_eq!(kind("/h/.gitconfig"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_sides_are_normalized_through_symlinks_and_missing_tails() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let at = |relative: &str| root.join(relative);
+        for dir in [
+            "home/.grok",
+            "real/codex",
+            "real/default-codex",
+            "real/state",
+            "vault",
+        ] {
+            fs::create_dir_all(at(dir)).unwrap();
+        }
+        fs::write(at("real/codex/auth.json"), "synthetic").unwrap();
+        fs::write(at("vault/token"), "synthetic").unwrap();
+        symlink(at("real/codex"), at("codex-link")).unwrap();
+        symlink(at("real"), at("home/ordinary-alias")).unwrap();
+        symlink(at("real/default-codex"), at("home/.codex")).unwrap();
+        symlink(at("vault/token"), at("home/.grok/auth.json")).unwrap();
+        symlink(at("real/state"), at("state-link")).unwrap();
+        symlink(at("home/.codex/auth.json"), at("home/dangling")).unwrap();
+
+        let codex = at("codex-link").into_os_string();
+        let state = at("state-link").into_os_string();
+        let vars = move |name: &str| match name {
+            "CODEX_HOME" => Some(codex.clone()),
+            "LOADOUT_STATE_DIR" => Some(state.clone()),
+            _ => None,
+        };
+        let context = Context::resolve(Os::Linux, vars, Some(at("home"))).unwrap();
+        let kind = |relative: &str| {
+            check_path(&context, &at(relative), Use::Write).and_then(|conflict| conflict.kind())
+        };
+
+        assert_eq!(
+            kind("home/ordinary-alias/codex/auth.json"),
+            Some(Kind::Auth)
+        );
+        assert_eq!(kind("real/codex/auth.json"), Some(Kind::Auth));
+        assert_eq!(kind("real/default-codex/auth.json"), Some(Kind::Auth));
+        assert_eq!(kind("vault/token"), Some(Kind::Auth));
+        assert_eq!(kind("vault"), Some(Kind::Auth));
+        assert_eq!(kind("home/dangling"), Some(Kind::Auth));
+        assert_eq!(
+            kind("home/ordinary-alias/codex/mcp-oauth-locks/new/file"),
+            Some(Kind::Auth)
+        );
+        assert_eq!(kind("real/state/state.json"), Some(Kind::LoadoutState));
+
+        assert_eq!(kind("real/codex/AGENTS.md"), None);
+        assert_eq!(kind("home/.gitconfig"), None);
+        assert_eq!(kind("vault-sibling/file"), None);
+        assert_eq!(
+            check_path(
+                &context,
+                &at("home/ordinary-alias/codex/skills"),
+                Use::WriteInto
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_errors_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let locked = scratch.path().join("locked");
+        fs::create_dir_all(locked.join("inner")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let context =
+            Context::resolve(Os::Linux, |_| None, Some(scratch.path().join("home"))).unwrap();
+        let result = check_path(&context, &locked.join("inner/file"), Use::Write);
+        let readable = fs::read_dir(&locked).is_ok();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            eprintln!("running with permission to read a 000 folder (root?); skipped");
+            return;
+        }
+        assert!(
+            matches!(result, Some(Conflict::Unverifiable { .. })),
+            "{result:?}"
+        );
+        assert!(
+            check_path(&context, Path::new("relative/x"), Use::Write).is_some(),
+            "unclean paths fail closed"
+        );
     }
 }
