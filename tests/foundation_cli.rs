@@ -764,6 +764,85 @@ fn reserved_destinations_are_rejected_but_siblings_and_key_merges_pass() {
     assert_eq!(code, 0, "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn git_metadata_is_never_loadout_content() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let case = |name: &str, manifest: &str, build: &dyn Fn(&Path)| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(
+            root.join(".git/config"),
+            "[remote]\nurl = https://user:token@x\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        build(&root);
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let skill = |root: &Path| {
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    };
+
+    let (code, text) = case(
+        "direct",
+        "[files.a]\nsource = \".git/config\"\ntarget = \"~/.a\"\n",
+        &|_| {},
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains(".git/config is Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "file-link",
+        "[files.a]\nsource = \"cfg\"\ntarget = \"~/.a\"\n",
+        &|root| symlink(root.join(".git/config"), root.join("cfg")).unwrap(),
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("cfg is Git metadata"), "{text}");
+
+    let (code, text) = case("skill-link", "[skills.s]\nsource = \"skill\"\n", &|root| {
+        skill(root);
+        symlink(root.join(".git/config"), root.join("skill/cfg")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("skill/cfg links into Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "skill-worktree-file",
+        "[skills.s]\nsource = \"skill\"\n",
+        &|root| {
+            skill(root);
+            fs::write(root.join("skill/.git"), "gitdir: ../.git/worktrees/x\n").unwrap();
+        },
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("skill/.git is Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "skill-nested-repo",
+        "[skills.s]\nsource = \"skill\"\n",
+        &|root| {
+            skill(root);
+            fs::create_dir_all(root.join("skill/vendor/.GIT")).unwrap();
+        },
+    );
+    assert_eq!(code, 3, "{text}");
+
+    let (code, text) = case("clean", "[skills.s]\nsource = \"skill\"\n", &skill);
+    assert_eq!(
+        code, 0,
+        "a loadout's own .git beside a skill is fine: {text}"
+    );
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

@@ -15,6 +15,7 @@ use crate::reserved::{self, Use};
 
 const TEMPLATE_SUFFIX: &str = ".tmpl";
 const SKILL_FILE: &str = "SKILL.md";
+const GIT_DIR: &str = ".git";
 
 pub(super) fn check(loadout: &Loadout) -> Diagnostics {
     let custom: BTreeSet<String> = loadout
@@ -348,6 +349,13 @@ impl Checker {
             self.error(key, format!("{source} resolves outside the loadout"));
             return;
         }
+        if self.in_git(&real) {
+            self.error(
+                key,
+                format!("{source} is Git metadata (.git), not loadout content"),
+            );
+            return;
+        }
         match kind {
             Source::File if !real.is_file() => self.error(key, format!("{source} is not a file")),
             Source::Skill if !real.is_dir() => {
@@ -361,6 +369,14 @@ impl Checker {
             }
             Source::File => {}
         }
+    }
+
+    fn in_git(&self, real: &Path) -> bool {
+        real.strip_prefix(&self.root).is_ok_and(|relative| {
+            relative
+                .components()
+                .any(|part| part.as_os_str().eq_ignore_ascii_case(GIT_DIR))
+        })
     }
 
     fn skill_tree(&mut self, key: &str, dir: &Path) {
@@ -387,6 +403,13 @@ impl Checker {
                 }
             };
             let path = entry.path();
+            if entry.file_name().eq_ignore_ascii_case(GIT_DIR) {
+                self.error(
+                    key,
+                    format!("{} is Git metadata, not skill content", shown(&path)),
+                );
+                continue;
+            }
             let kind = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata.file_type(),
                 Err(error) => {
@@ -402,6 +425,10 @@ impl Checker {
                     Ok(real) if !real.starts_with(&self.root) => self.error(
                         key,
                         format!("{} links outside the loadout", shown(&path)),
+                    ),
+                    Ok(real) if self.in_git(&real) => self.error(
+                        key,
+                        format!("{} links into Git metadata (.git)", shown(&path)),
                     ),
                     Ok(real) if !real.is_file() => self.error(
                         key,

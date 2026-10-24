@@ -292,6 +292,10 @@ What validate enforces today, before any machine is known:
   `~1`.
 - Ids are lowercase `[a-z0-9][a-z0-9_-]*`.
 - Sources exist inside the loadout, with symlinks resolved.
+- No source, and no link inside a skill folder, may resolve into `.git` metadata. A skill folder may
+  not contain a `.git` entry at all, whether a folder (a nested repo) or a file (the worktree or
+  submodule pointer form). The comparison is case-insensitive. A clone's `.git` can hold remote URLs
+  with credentials, hooks, and machine-local state, so it is never loadout content.
 - A skill folder is walked in full. A link inside it may point only to a file inside the loadout.
   A link to a folder, a broken link, a link leaving the loadout, and any special file are errors.
   Folder links are never followed, so a link loop can't make the walk loop. An unreadable entry
