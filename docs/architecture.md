@@ -303,7 +303,8 @@ What validate enforces today, before any machine is known:
     found from `<root>/.git`: a folder (or a link to one) is the metadata root itself. A gitfile (or
     a link to one), as made by `--separate-git-dir`, worktrees, and submodules, counts as metadata
     itself, and so does the folder its `gitdir:` line names. If that folder holds a `commondir`
-    pointer (a worktree), the folder that pointer names counts too. That check runs after **either**
+    pointer (a worktree), that pointer file counts as metadata itself (at its canonical location, so a
+    `commondir` link into a skill reserves the file it lands on), and so does the folder it names. That check runs after **either**
     form is resolved, so a `.git` link straight to a worktree's admin folder also reserves its common
     folder.
   - **Unsupported layout.** Only these one-line pointer files are read, size-capped at 4 KiB; no

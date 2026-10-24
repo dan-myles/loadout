@@ -757,7 +757,8 @@ fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
                     "it resolves outside the loadout, which loadout never reads",
                 );
             }
-            metadata.push(git_pointer(root, &real, &gitdir, "")?);
+            let common_dir = git_pointer(root, &real, &gitdir, "")?;
+            metadata.extend([real, common_dir]);
         }
     }
     Ok(metadata)

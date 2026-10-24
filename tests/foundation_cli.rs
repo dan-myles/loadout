@@ -1367,6 +1367,51 @@ fn relative_git_pointers_resolve_from_git_logical_base_not_the_link_target() {
         assert!(text.contains("Git metadata"), "{text}");
     }
 
+    fs::create_dir_all(root.join("skill")).unwrap();
+    fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    fs::rename(&pointer, root.join("skill/pointer")).unwrap();
+    fs::remove_file(admin.join("commondir")).unwrap();
+    symlink(root.join("skill/pointer"), admin.join("commondir")).unwrap();
+    for manifest in [
+        "[files.x]\nsource = \"skill/pointer\"\ntarget = \"~/.x\"\n",
+        "[skills.s]\nsource = \"skill\"\n",
+    ] {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        for json in [false, true] {
+            let (code, text) = run(json);
+            assert_eq!(
+                code, 3,
+                "active linked commondir file is metadata json={json}: {text}"
+            );
+        }
+    }
+    fs::remove_file(admin.join("commondir")).unwrap();
+    fs::write(admin.join("commondir"), "../..\n").unwrap();
+    for manifest in [
+        "[files.x]\nsource = \"skill/pointer\"\ntarget = \"~/.x\"\n",
+        "[skills.s]\nsource = \"skill\"\n",
+    ] {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        assert_eq!(
+            run(false).0,
+            0,
+            "a detached copy of the pointer bytes is ordinary content"
+        );
+    }
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.x]\nsource = \"common/config\"\ntarget = \"~/.x\"\n",
+    )
+    .unwrap();
+
     let sub = root.join("sub");
     fs::create_dir_all(&sub).unwrap();
     fs::write(sub.join("gitfile"), "gitdir: common/worktrees/checkout\n").unwrap();
