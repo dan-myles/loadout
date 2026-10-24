@@ -825,15 +825,24 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   tree is killed and the result is `Error::Detect`. A query's stdout and stderr are read in full up
   to `QUERY_OUTPUT_CAP` (8 MiB each); a larger answer is an error, never parsed truncated. Once the
   query itself exits, anything it left in its group is killed, so leftovers can't hold the pipes.
-- **Installs have no deadline.** They run in loadout's own process group, so `sudo` can prompt and
-  Ctrl-C reaches them. Errors keep the last 64 KiB of each output stream. After the installer
-  exits, its output is read for at most 30 more seconds, in case a process it started still holds
-  it.
-  - A hung install or UAC prompt is not bounded by U7.
-  - **U8 must bound every background run and cancel its descendants on all three OSes** before
-    automatic updates can be claimed safe: the service unit's own time limit (systemd
-    `RuntimeMaxSec`, Task Scheduler `ExecutionTimeLimit`), and a watchdog in `update --background`
-    where the OS has none (launchd).
+- **Installs have no deadline, and U7 can't cancel them.** An install runs in loadout's own
+  process group, so `sudo` can prompt and Ctrl-C reaches it. Errors keep the last 64 KiB of each
+  output stream. After the installer exits, loadout reads its output for at most 30 more seconds.
+  That drain only stops *reading*: it cancels nothing, and a process the installer started keeps
+  running. `programs::install` has no timeout and no cancel handle. A hung install, a hung
+  descendant, or a UAC or `sudo` prompt blocks it until the process tree ends or something outside
+  loadout kills it.
+- **What U8 must supply.** Before automatic updates can be claimed to finish safely in the
+  background, the supervisor that starts `update --background` must bound the whole run and kill
+  every descendant on all three OSes:
+  - Linux: the systemd unit's time limit (`RuntimeMaxSec`), with its control-group kill.
+  - Windows: Task Scheduler's `ExecutionTimeLimit` covers only the task's own process, so
+    `update --background` itself needs a job object for its descendants.
+  - macOS: launchd has no runtime limit, so `update --background` needs its own watchdog, which
+    kills its process group.
+
+  Until U8 proves that natively, no claim is made that a background run completes or cancels
+  cleanly. Native negative tests of hung installs and UAC use an external finite watchdog.
 - **Doctor** (`programs::checks`) adds three checks:
   - `programs`: this OS's managers, grouped as per user, with `--elevated`, per package, and not on
     PATH; a warning when none is available.
