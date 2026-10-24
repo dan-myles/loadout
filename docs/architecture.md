@@ -26,6 +26,7 @@ async would buy v1 nothing.
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
 | `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
 | `process-wrap` (std, process-group, job-object) | programs: queries killed as a whole process tree at their deadline (U7) |
+| `nix` (`signal`, Unix only) | programs: confirms a stopped query left no process in its group (U7) |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -877,8 +878,9 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
     count as per user until native evidence shows otherwise.
   - Otherwise the machine scope is asked separately. Only an installer winget shows as applicable
     there makes the package system scope, which needs `--elevated`.
-  - With neither, the step is `Unsupported` with the reason. Any other text is `Error::Detect`,
-    never a guessed scope.
+  - With neither, the step is `Unsupported` with the reason. Any other text, including an
+    `Installer Type:` line with no type, is `Error::Detect`, never a guessed scope, and comes
+    before any install or elevation.
 
   The `winget` field names an id in the `winget` community source. Every winget call passes
   `--source winget`, so a broken `msstore` source (as in the Windows test guest) can't stop an
@@ -912,10 +914,34 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   success that left the program missing is `Error::NotInstalled`.
 - **Bounded queries.** Every installed-query, scope query, and doctor query runs in its own process
   group (Unix) or job object (Windows), through `process-wrap`. `QUERY_DEADLINE` (10 minutes)
-  covers the query and any process it starts that keeps its output open. At the deadline the whole
-  tree is killed and the result is `Error::Detect`. A query's stdout and stderr are read in full up
-  to `QUERY_OUTPUT_CAP` (8 MiB each); a larger answer is an error, never parsed truncated. Once the
-  query itself exits, anything it left in its group is killed, so leftovers can't hold the pipes.
+  bounds waiting for the query's own process. A query's stdout and stderr are read in full up to
+  `QUERY_OUTPUT_CAP` (8 MiB each). A larger answer stops the query early, and is an error, never
+  parsed truncated.
+- **Every query is settled, success included.** However a query ends (it exits, overflows, times
+  out, or can't be waited on), loadout kills its whole group or job and confirms the stop:
+  - The kill result is checked. On Unix, `ESRCH` from `killpg` means the group is already gone;
+    any other error is a failure.
+  - The direct child is reaped.
+  - On Unix, the process group is confirmed empty (`killpg` with signal 0 answers `ESRCH`).
+  - Both output readers reach EOF.
+
+  One shared `QUERY_CLEANUP_GRACE` (5 seconds) bounds all of these together, with no unbounded
+  wait. If the stop can't be confirmed, the result is `QueryError::Cleanup`, which keeps what
+  ended the query as its cause, and the detection is `Error::Detect`. Only then are the output
+  buffers read, each under its own lock: an overflow first, then a read error, then the bytes.
+  Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error.
+
+  Limits:
+  - **Windows:** a safe API can't confirm that a job has no processes left. There, the job's
+    `TerminateJobObject`, the direct child's exit, and both readers' EOF are the confirmation, and
+    a descendant whose output is redirected is covered only by `TerminateJobObject`'s documented
+    semantics. `process-wrap`'s first-message job wait is not used as proof.
+  - **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
+    The reader blocked on it stays blocked until that process exits; that is a resource limit,
+    not success.
+  - **Unix kill timing:** the group is signalled just after its leader is reaped. A reused group
+    id in that instant can only make the empty-group probe fail closed, but in principle the
+    SIGKILL could reach a new group that took the id first.
 - **Installs have no deadline, and U7 can't cancel them.** An install runs in loadout's own
   process group, so `sudo` can prompt and Ctrl-C reaches it. Errors keep the last 64 KiB of each
   output stream. After the installer exits, loadout reads its output for at most 30 more seconds.

@@ -184,7 +184,13 @@ fn winget_installer(shown: &Captured) -> Result<Option<String>, String> {
         .nth(1)
         .unwrap_or_default();
     if let Some(kind) = line.strip_prefix("Installer Type:") {
-        Ok(Some(kind.trim().to_owned()))
+        match kind.trim() {
+            "" => Err(format!(
+                "winget show printed an empty installer type{}",
+                shown.tail()
+            )),
+            kind => Ok(Some(kind.to_owned())),
+        }
     } else if line.starts_with("No applicable installer found") {
         Ok(None)
     } else {
@@ -847,11 +853,68 @@ mod tests {
             .is_err()
         );
         assert!(winget_installer(&out(0, "Found Foo [A.B]\r\n", "")).is_err());
+        for empty in ["  Installer Type:", "  Installer Type:   ", "  Installer Type:\t"] {
+            let shown =
+                format!("Found X [A.B]\r\nInstaller:\r\n{empty}\r\n  Installer Url: https://x\r\n");
+            assert!(winget_installer(&out(0, &shown, "")).is_err(), "{empty:?}");
+        }
         let localized = "Gefunden 7-Zip [7zip.7zip]\r\nInstallationsprogramm:\r\n  Typ: exe\r\n";
         assert!(winget_installer(&out(0, localized, "")).is_err());
         let extra =
             "Found 7-Zip [7zip.7zip]\r\nInstaller:\r\n  Something new\r\n  Installer Type: exe\r\n";
         assert!(winget_installer(&out(0, extra, "")).is_err());
+    }
+
+    /// Drives the real two-scope `eligibility` through a fake winget whose `show` answers per
+    /// scope, so the empty-type refusal is checked on the path `steps` takes, not just the parser.
+    #[cfg(unix)]
+    #[test]
+    fn winget_eligibility_asks_both_scopes_and_refuses_an_empty_installer_type() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let none = "  No applicable installer found; see logs for more details.";
+        let exe = "  Installer Type: exe";
+        let mut cases = vec![
+            ("  Installer Type: portable (zip)", none, "user"),
+            (none, exe, "system"),
+            (exe, none, "unsupported: only portable installers qualify"),
+            (none, none, "unsupported: user or machine scope"),
+        ];
+        for empty in ["  Installer Type:", "  Installer Type:   "] {
+            cases.extend([(empty, exe, "error"), (none, empty, "error"), (exe, empty, "error")]);
+        }
+        // Every script is written before any runs: executing a file another thread's fork may
+        // still hold open for writing can fail with ETXTBSY.
+        let dir = tempfile::tempdir().unwrap();
+        let scripts: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (user, machine, _))| {
+                let winget = dir.path().join(format!("winget-{index}"));
+                let script = format!(
+                    "#!/bin/sh\ncase \"$*\" in\n*\"--scope user\"*) line='{user}';;\n*\"--scope machine\"*) line='{machine}';;\n*) exit 64;;\nesac\nprintf 'Found X [A.B]\\nInstaller:\\n%s\\n  Installer Url: https://x\\n' \"$line\"\n"
+                );
+                std::fs::write(&winget, script).unwrap();
+                std::fs::set_permissions(&winget, std::fs::Permissions::from_mode(0o755)).unwrap();
+                winget
+            })
+            .collect();
+        for ((user, machine, expected), winget) in cases.iter().zip(&scripts) {
+            let decided = eligibility(Manager::Winget, winget, "A.B");
+            let label = format!("user {user:?}, machine {machine:?}: {decided:?}");
+            match *expected {
+                "user" => assert_eq!(decided, Ok(Eligibility::Scope(Scope::User)), "{label}"),
+                "system" => assert_eq!(decided, Ok(Eligibility::Scope(Scope::System)), "{label}"),
+                "error" => assert!(decided.is_err(), "{label}"),
+                unsupported => {
+                    let reason = unsupported.trim_start_matches("unsupported: ");
+                    assert!(
+                        matches!(&decided, Ok(Eligibility::Unsupported(why)) if why.contains(reason)),
+                        "{label}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -208,7 +208,10 @@ esac; exit 64"#,
             "npm",
             r#"case "$1" in install) mark npm; exit 0;;
 prefix) printf '%s\n' "$FAKE_NPM_PREFIX"; exit "${FAKE_NPM_PREFIX_CODE:-0}";;
-ls) if [ -n "$FAKE_NPM_ENOENT" ]; then
+ls) if [ -n "$FAKE_NPM_PAD" ]; then printf '{"name":"lib"}'
+  /usr/bin/head -c 8388608 /dev/zero | /usr/bin/tr '\000' ' '; printf '!'; exit 1; fi
+  if [ -n "$FAKE_NPM_SPAWN" ]; then /bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$S/spawned"; fi
+  if [ -n "$FAKE_NPM_ENOENT" ]; then
   printf '{"error":{"code":"ENOENT","summary":"ENOENT: no such file or directory, lstat \047%s\047"}}\n' "$FAKE_NPM_ENOENT"; exit 254; fi
   if [ -e "$S/npm" ]; then printf '{"name":"lib","dependencies":{"%s":{"version":"1.0.0"}}}\n' "$5"; exit 0; fi
   printf '{\n  "name": "lib"\n}\n'; exit 1;;
@@ -780,6 +783,41 @@ esac; exit 64"#,
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn an_answer_past_the_output_cap_is_refused_before_it_is_parsed() {
+        let bench = Bench::new(&fake_tools());
+        let run = bench.probe(
+            &request("linux", true, false, &[("cowsay", "npm", "cowsay")]),
+            &[("FAKE_NPM_PAD", "1")],
+        );
+        let error = run.result["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("must be an error: {}", run.result));
+        assert!(error.contains("more than 8 MiB on stdout"), "{error}");
+        assert_eq!(
+            run.commands(&bench.bin()),
+            ["npm ls --global --depth=0 --json cowsay"]
+        );
+    }
+
+    #[test]
+    fn a_manager_process_left_running_is_gone_when_detection_returns() {
+        let bench = Bench::new(&fake_tools());
+        let run = bench.probe(
+            &request("linux", false, false, &[("cowsay", "npm", "cowsay")]),
+            &[("FAKE_NPM_SPAWN", "1")],
+        );
+        assert_eq!(run.step("cowsay")["state"], "missing", "{}", run.result);
+        let pid = fs::read_to_string(bench.dir.path().join("state/spawned")).unwrap();
+        let alive = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -0 {} 2>/dev/null", pid.trim()))
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the sleep {} npm left behind must be gone", pid.trim());
     }
 
     #[test]
