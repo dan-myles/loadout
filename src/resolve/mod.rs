@@ -1,9 +1,56 @@
+mod all;
+mod finish;
+mod merge;
+mod paths;
+
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::manifest::{BuiltinAgent, CustomAgent, Manager, Value, Variable};
+use crate::context::Context;
+use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
+use crate::machine::Facts;
+use crate::manifest::{BuiltinAgent, CustomAgent, Loadout, Manager, Value, Variable};
+
+/// `Ok` carries warnings too, such as an item naming an agent this machine doesn't enable.
+pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<(Resolved, Diagnostics), Diagnostics> {
+    let mut diagnostics = Diagnostics::default();
+    let merged = merge::merge(loadout, facts, &mut diagnostics);
+    let resolved = finish::finish(loadout, facts, merged, &mut diagnostics);
+    if diagnostics.has_errors() {
+        Err(diagnostics)
+    } else {
+        Ok((resolved, diagnostics))
+    }
+}
+
+/// Uses synthetic facts only, so what validate reports never depends on the machine running it.
+pub fn check_all(loadout: &Loadout) -> Diagnostics {
+    all::check_all(loadout)
+}
+
+/// `loadout` is the active checkout, which is reserved like loadout's own state. Only stats
+/// paths, so a reserved file is never opened.
+pub fn check_targets(resolved: &Resolved, context: &Context, loadout: &Path) -> Diagnostics {
+    paths::check_targets(resolved, context, loadout)
+}
+
+fn report(
+    diagnostics: &mut Diagnostics,
+    severity: Severity,
+    file: Option<&Path>,
+    key: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let key = key.into();
+    diagnostics.push(Diagnostic {
+        severity,
+        file: file.map(Path::to_path_buf),
+        key: (!key.is_empty()).then_some(key),
+        message: message.into(),
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Resolved {

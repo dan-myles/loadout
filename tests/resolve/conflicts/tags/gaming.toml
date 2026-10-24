@@ -1,0 +1,13 @@
+[files.profile-upper]
+source = "f"
+target = "~/.Profile"
+
+[skills.half]
+agents = ["claude"]
+
+[mcp.extra]
+command = "extra"
+agents = ["cursor"]
+
+[files.colon]
+target = "~/scores:high"
