@@ -6,6 +6,9 @@ use minijinja::machinery::ast::{self, CallArg, Expr, Spanned, Stmt};
 /// value with `Undefined`, so no builtin, container, comparison, or assignment can consume one.
 pub(super) const GUARD: &str = "__loadout_defined";
 
+/// The function a method call named `cycle` is routed through; see `builtins::cycle`.
+pub(super) const CYCLE: &str = "__loadout_cycle";
+
 const ESCAPE_TESTS: [&str; 2] = ["defined", "undefined"];
 const ESCAPE_FILTERS: [&str; 2] = ["default", "d"];
 
@@ -41,12 +44,17 @@ pub(super) fn guard(
 /// Rebuilds a parsed template with a guard on every lookup, filter result, and call result that
 /// computes a value. What stays unguarded is only what never yields a value to a consumer:
 /// - the direct operand of `is defined`, `is undefined`, `default`, and `d`, the explicit ways to
-///   handle a missing value (the operand's own receiver and arguments are still guarded);
+///   handle a missing value, also inside a `{% filter %}` or `{% set %}` header chain (the
+///   operand's own receiver and arguments are still guarded);
 /// - a name being assigned (`set`, `for`, `with` targets);
 /// - a called function's name and a called method's attribute (its receiver is guarded);
-/// - the filters chained in a `{% filter %}` or `{% set %}` block header, which have no operand.
 ///
-/// Guards run only when their expression does, so a branch that isn't taken needs nothing.
+/// The one undefined value a template can still produce is the explicit empty value of an `if`
+/// expression without `else`, which reads no missing variable.
+///
+/// Guards run only when their expression does, so a branch that isn't taken needs nothing. A
+/// method call named `cycle` goes through `CYCLE`, which refuses an empty argument list
+/// instead of letting the loop object divide by zero.
 pub(super) fn rewrite<'a>(source: &'a str, template: &Stmt<'a>) -> Stmt<'a> {
     Rewriter { source }.stmt(template)
 }
@@ -58,6 +66,7 @@ enum Position {
     Callee,
     Target,
     FilterBlock,
+    ChainEscaped,
 }
 
 struct Rewriter<'a> {
@@ -175,6 +184,19 @@ impl<'a> Rewriter<'a> {
     }
 
     fn call(&self, node: &Spanned<ast::Call<'a>>) -> Spanned<ast::Call<'a>> {
+        if let Expr::GetAttr(method) = &node.expr
+            && method.name == "cycle"
+        {
+            let mut args = vec![CallArg::Pos(self.expr(&method.expr, Position::Value))];
+            args.extend(self.args(&node.args, Position::Value));
+            return Spanned::new(
+                ast::Call {
+                    expr: Expr::Var(Spanned::new(ast::Var { id: CYCLE }, method.span())),
+                    args,
+                },
+                node.span(),
+            );
+        }
         Spanned::new(
             ast::Call {
                 expr: self.expr(&node.expr, Position::Callee),
@@ -185,14 +207,21 @@ impl<'a> Rewriter<'a> {
     }
 
     fn expr(&self, expr: &Expr<'a>, position: Position) -> Expr<'a> {
-        use Position::{Callee, Escaped, FilterBlock, Target, Value};
+        use Position::{Callee, ChainEscaped, Escaped, FilterBlock, Target, Value};
+        // Inside a header chain only a filter continues the chain; anything else in an escaped
+        // spot is an ordinary escaped operand.
+        let position = match (position, expr) {
+            (ChainEscaped, Expr::Filter(_)) => ChainEscaped,
+            (ChainEscaped, _) => Escaped,
+            (position, _) => position,
+        };
         // Targets are names being bound, not values being read; they stay exactly as parsed.
         let inner = if position == Target { Target } else { Value };
         match expr {
             Expr::Var(node) => {
                 let var = Expr::Var(Spanned::new(ast::Var { id: node.id }, node.span()));
                 match position {
-                    Escaped | Callee | Target => var,
+                    Escaped | ChainEscaped | Callee | Target => var,
                     Value | FilterBlock => self.guarded(var, node.span(), true),
                 }
             }
@@ -211,7 +240,7 @@ impl<'a> Rewriter<'a> {
                     node.span(),
                 ));
                 match position {
-                    Escaped | Callee | Target => attr,
+                    Escaped | ChainEscaped | Callee | Target => attr,
                     Value | FilterBlock => self.guarded(attr, node.span(), true),
                 }
             }
@@ -224,17 +253,17 @@ impl<'a> Rewriter<'a> {
                     node.span(),
                 ));
                 match position {
-                    Escaped | Target => item,
+                    Escaped | ChainEscaped | Target => item,
                     Value | Callee | FilterBlock => self.guarded(item, node.span(), true),
                 }
             }
             Expr::Filter(node) => {
-                let operand = if position == FilterBlock {
-                    FilterBlock
-                } else if ESCAPE_FILTERS.contains(&node.name) {
-                    Escaped
-                } else {
-                    Value
+                let in_chain = matches!(position, FilterBlock | ChainEscaped);
+                let operand = match (in_chain, ESCAPE_FILTERS.contains(&node.name)) {
+                    (true, true) => ChainEscaped,
+                    (true, false) => FilterBlock,
+                    (false, true) => Escaped,
+                    (false, false) => Value,
                 };
                 let filter = Expr::Filter(Spanned::new(
                     ast::Filter {
@@ -255,14 +284,14 @@ impl<'a> Rewriter<'a> {
                     None => node.span(),
                 };
                 match position {
-                    Escaped | FilterBlock => filter,
-                    Value | Callee | Target => self.guarded(filter, span, false),
+                    Escaped | ChainEscaped => filter,
+                    Value | Callee | Target | FilterBlock => self.guarded(filter, span, false),
                 }
             }
             Expr::Call(node) => {
                 let call = Expr::Call(self.call(node));
                 match position {
-                    Escaped => call,
+                    Escaped | ChainEscaped => call,
                     Value | Callee | Target | FilterBlock => self.guarded(call, node.span(), false),
                 }
             }

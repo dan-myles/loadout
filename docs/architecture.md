@@ -415,21 +415,57 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     `typo.attr is defined` is an error, as in minijinja's strict mode;
   - a name being assigned (`set`, `for`, `with` targets);
   - a called function's name and a called method's attribute (its receiver is guarded);
-  - the filters chained in a `{% filter %}` or `{% set … | f %}` header, which have no operand.
+  - inside a `{% filter %}` or `{% set … | f %}` header chain, only the operand of a `default`
+    or `d` link. Every other result in the chain, the final one included, is guarded, so an empty
+    capture through `first | pprint` fails while `first | default("empty")` works.
 
   Guards run only when their expression runs, so a variable in a branch that isn't taken isn't
-  needed, and a Windows-only variable may live in `os/windows.toml`. The attribute builtins
-  (`map`, `sort`, `groupby`, `unique`, `min`, and `max` with `attribute=`) look attributes up out
-  of the guards' sight, so they are replaced by wrappers. Each wrapper requires every item to have
-  the attribute unless the filter's own `default=` is given, then calls minijinja's filter. An `if`
-  expression without `else` still yields Jinja's empty value; it reads no missing variable.
-- **Panics.** minijinja's `divisibleby` test computes `a % 0` unchecked, so it is replaced by a
-  checked one: a zero divisor is a `Render` error with its line. Any other panic inside the engine
-  is caught at `render` and becomes `Problem::Render("the template engine failed: …")` for the
-  file, with no line, because a panic carries none. A panic hook installed once suppresses the
-  report only while the current thread renders a template, and keeps the previous hook for
-  everything else. A builtin that asks for a vast but representable allocation (`indent(10**12)`)
-  can still exhaust memory, and no in-process handler catches an allocation failure.
+  needed, and a Windows-only variable may live in `os/windows.toml`. The one undefined value a
+  template can still produce is the explicit empty value of an `if` expression without `else`,
+  which reads no missing variable.
+- **Builtins** (`src/template/builtins.rs`). Some builtins compute or consume values inside Rust,
+  where no guard runs. Every filter, test, and global minijinja registers under the enabled
+  features (47 filters, 42 tests, and `range`, `dict`, `namespace`; `debug` is removed) was
+  inventoried from `defaults.rs`, including multi-line registrations. With the replacements below,
+  they keep one invariant: **a missing value is never stored in a container, and never consumed
+  inside a builtin unless an explicit escape asked for it.** Builtins that only move, compare, or
+  format elements (`select`, `reject`, `sum`, `join`, `chain`, `zip`, `list`, `batch`, `slice`,
+  `reverse`, `pprint`, and the rest) therefore never see one and are not wrapped. The replaced
+  builtins:
+  - `map`. With `attribute=`, every item needs the attribute unless `default=` is given. With a
+    filter name, minijinja calls that filter per item inside Rust (`map("attr", "x")`,
+    `map("first")`), so every result is checked before the list exists. Nested `map("map", …)`
+    reaches the same wrapper.
+  - `selectattr` and `rejectattr` need the attribute on every item, except when the test is
+    `defined` or `undefined`.
+  - `sort` (including `"a,b"`), `groupby`, `unique`, `min`, and `max` with an attribute need it on
+    every item; `groupby` accepts its `default=`.
+  - For an attribute path, every part before the last must exist even under an escape, as for
+    `a.b is defined`.
+  - `items` and `dictsort` reject a pair whose value is undefined. The loop object lists `length`
+    and `revindex` even when a loop over a lazy iterator has no known length.
+  - A wrapper collects its input once, so a one-shot iterator is never consumed twice.
+
+  Correction: the U2 report for `fbd7579` said `selectattr` and `rejectattr` were not registered.
+  minijinja 3.0.3 registers both under `builtins`, and both are wrapped here.
+- **Panics.**
+  - minijinja's `divisibleby` computes `a % b` unchecked on its integer path (neither operand a
+    float), which panics for a zero divisor and for `i128::MIN % -1`. The replacement uses one rule
+    for every numeric zero: when both operands are numbers or booleans, a divisor of `0`, `0.0`,
+    `-0.0`, or `false` is `Render("divisibleby(0) divides by zero")` with its line. `i128::MIN %
+    -1` is true. Every other input delegates to minijinja's test, so its coercion and results stand:
+    `true is divisibleby(0.5)` and `9223372036854775808.0 is divisibleby(2)` are true, and
+    `"x" is divisibleby(0)` is false.
+  - The loop object's `cycle()` divides by its argument count. A method call named `cycle` goes
+    through a function that refuses an empty argument list (`cycle()`, `cycle(*[])`) with its line,
+    but only on the loop object, which it recognises by the exact key list it enumerates. Every
+    other receiver's `cycle` is called unchanged.
+  - Any other panic inside the engine is caught at `render` and becomes
+    `Problem::Render("the template engine failed: …")` for the file, with no line, because a panic
+    carries none. A panic hook installed once suppresses the report only while the current thread
+    renders a template, and keeps the previous hook for everything else.
+  - A builtin that asks for a vast but representable allocation (`indent(10**12)`) can still
+    exhaust memory, and no in-process handler catches an allocation failure.
 - **Pinned machinery.** `unstable_machinery` is minijinja's public but unstable API: `parse`, the
   AST, `CodeGenerator`, and `eval`. Loadout depends on it at exactly `=3.0.3`. An upgrade must
   re-review `strict.rs` against the new AST and codegen, not only recompile it. The rewrite's

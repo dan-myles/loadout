@@ -482,15 +482,35 @@ fn divisibleby_zero_is_a_template_error_not_a_panic() {
         }
         other => panic!("divisibleby(0) must be a template error, got {other:?}"),
     }
-    assert!(render("{{ 1.0 is divisibleby(0.0) }}", &linux()).is_err());
+    for zero in [
+        "0 is divisibleby(0)",
+        "true is divisibleby(false)",
+        "1.0 is divisibleby(0.0)",
+        "1.5 is divisibleby(-0.0)",
+        "3 is divisibleby(0.0)",
+        "1.5 is divisibleby(false)",
+    ] {
+        match render(&format!("{{{{ {zero} }}}}"), &linux()) {
+            Err(Error {
+                line: Some(1),
+                problem: Problem::Render(message),
+                ..
+            }) => assert_eq!(message, "divisibleby(0) divides by zero", "{zero}"),
+            other => panic!("{zero} must be the zero-divisor error, got {other:?}"),
+        }
+    }
     assert_eq!(
         render(
             "{{ 6 is divisibleby(3) }} {{ 7 is divisibleby(2) }} {{ 1.5 is divisibleby(0.5) }} \
-             {{ font_size is divisibleby(13) }} {{ \"x\" is divisibleby(2) }}",
+             {{ font_size is divisibleby(13) }} {{ \"x\" is divisibleby(2) }} \
+             {{ true is divisibleby(0.5) }} {{ 9223372036854775808.0 is divisibleby(2) }} \
+             {{ true is divisibleby(1) }} {{ 4 is divisibleby(2.0) }} {{ \"x\" is divisibleby(0) }} \
+             {{ -9223372036854775808 is divisibleby(-1) }}",
             &linux()
         )
         .unwrap(),
-        "True False True True False"
+        "True False True True False True True True True False True",
+        "every input that didn't panic keeps minijinja's own result"
     );
 }
 
@@ -552,4 +572,254 @@ fn attribute_builtins_require_the_attribute_unless_given_a_default() {
         .unwrap(),
         "h linux g 2 1 work-laptop 2 A"
     );
+}
+
+fn fails_with(source: &str, needle: &str) {
+    match render(source, &linux()) {
+        Err(Error {
+            line: Some(_),
+            problem: Problem::Render(message) | Problem::Missing(message),
+            ..
+        }) => assert!(message.contains(needle), "{source:?}: {message}"),
+        other => panic!("{source:?} must fail with {needle:?}, got {other:?}"),
+    }
+}
+
+fn renders(cases: &[(&str, &str)]) {
+    for (source, expected) in cases {
+        assert_eq!(
+            render(source, &linux()).as_deref(),
+            Ok(*expected),
+            "{source:?}"
+        );
+    }
+}
+
+#[test]
+fn selectattr_and_rejectattr_need_the_attribute_except_for_definedness_tests() {
+    for source in [
+        "{{ [machine] | selectattr(\"hostname\") | length }}",
+        "{{ [machine] | rejectattr(\"hostname\") | length }}",
+        "{{ [machine] | selectattr(\"hostname\", \"string\") | length }}",
+        "{{ [machine] | rejectattr(\"hostname\", \"eq\", \"x\") | length }}",
+        "{{ [machine] | selectattr(\"hostname.child\", \"undefined\") | length }}",
+        "{{ [machine] | rejectattr(\"hostname.child\", \"defined\") | length }}",
+    ] {
+        fails_with(source, "an item has no `hostname`");
+    }
+    fails_with(
+        "{{ [machine] | selectattr(\"os\", \"eq\", typo) | length }}",
+        "typo",
+    );
+    renders(&[
+        (
+            "{{ [machine] | selectattr(\"os\", \"eq\", \"linux\") | length }}",
+            "1",
+        ),
+        (
+            "{{ [machine] | rejectattr(\"os\", \"eq\", \"linux\") | length }}",
+            "0",
+        ),
+        ("{{ [machine] | selectattr(\"os\") | length }}", "1"),
+        (
+            "{{ [machine] | selectattr(\"hostname\", \"defined\") | length }}",
+            "0",
+        ),
+        (
+            "{{ [machine] | selectattr(\"hostname\", \"undefined\") | length }}",
+            "1",
+        ),
+        (
+            "{{ [machine] | rejectattr(\"hostname\", \"undefined\") | length }}",
+            "0",
+        ),
+        ("{{ [] | selectattr(\"hostname\") | length }}", "0"),
+    ]);
+}
+
+#[test]
+fn a_map_result_is_checked_before_any_later_filter_or_test_sees_it() {
+    for consumer in [
+        "map(\"pprint\") | join",
+        "length",
+        "select(\"string\") | length",
+        "reject | length",
+        "sum",
+        "join",
+        "chain([1]) | list | length",
+        "zip([1]) | list | pprint",
+        "sort | length",
+        "unique | length",
+        "min",
+        "max",
+        "first is defined",
+        "list | pprint",
+    ] {
+        fails_with(
+            &format!("{{{{ [machine] | map(\"attr\", \"hostname\") | {consumer} }}}}"),
+            "an item's result is undefined",
+        );
+    }
+    fails_with(
+        "{{ [[]] | map(\"first\") | length }}",
+        "an item's result is undefined",
+    );
+    fails_with(
+        "{{ [\"\"] | map(\"last\") | join }}",
+        "an item's result is undefined",
+    );
+    fails_with(
+        "{{ [[machine]] | map(\"map\", \"attr\", \"hostname\") | pprint }}",
+        "an item's result is undefined",
+    );
+    fails_with(
+        "{{ [machine] | map(attribute=\"hostname.child\", default=\"h\") | join }}",
+        "an item has no `hostname`",
+    );
+    renders(&[
+        ("{{ [\"a\", \"b\"] | map(\"upper\") | join }}", "AB"),
+        ("{{ [[1], [2]] | map(\"first\") | sum }}", "3"),
+        ("{{ range(3) | map(\"string\") | join }}", "012"),
+        ("{{ [1, 2] | zip([3, 4]) | map(\"last\") | join }}", "34"),
+        ("{{ [1] | chain([2]) | list | join }}", "12"),
+        (
+            "{{ [[1, 2], [3]] | map(\"map\", \"string\") | map(\"join\") | join(\",\") }}",
+            "12,3",
+        ),
+        (
+            "{{ range(4) | select(\"odd\") | map(\"string\") | reject(\"eq\", \"1\") | join }}",
+            "3",
+        ),
+        ("{{ [] | map(\"upper\") | list | length }}", "0"),
+        ("{{ [] | map(\"first\") | sum }}", "0"),
+        ("{{ [machine] | map(\"attr\", \"os\") | join }}", "linux"),
+        (
+            "{{ [machine] | map(attribute=\"hostname\", default=\"h\") | join }}",
+            "h",
+        ),
+        (
+            "{{ [machine] | map(\"default\", \"d\") | map(\"length\") | join }}",
+            "5",
+        ),
+        (
+            "{% if work %}{{ [machine] | map(\"attr\", \"hostname\") }}{% endif %}done",
+            "done",
+        ),
+    ]);
+}
+
+#[test]
+fn every_result_in_a_block_header_chain_is_guarded_except_an_escapes_operand() {
+    for source in [
+        "{% filter first | pprint %}{% endfilter %}",
+        "{% set captured | first | pprint %}{% endset %}{{ captured }}",
+        "{% set captured | first %}{% endset %}done",
+        "{% filter first %}{% endfilter %}",
+        "{% filter first | pprint | default(\"empty\") %}{% endfilter %}",
+    ] {
+        fails_with(source, "`first` is undefined");
+    }
+    fails_with("{% filter first | default(typo) %}{% endfilter %}", "typo");
+    renders(&[
+        (
+            "{% filter first | default(\"empty\") %}{% endfilter %}",
+            "empty",
+        ),
+        (
+            "{% filter first | d(\"empty\") | upper %}{% endfilter %}",
+            "EMPTY",
+        ),
+        (
+            "{% set captured | first | default(\"empty\") %}{% endset %}{{ captured }}",
+            "empty",
+        ),
+        ("{% filter first | upper %}abc{% endfilter %}", "A"),
+        ("{% filter upper | trim %} a {% endfilter %}", "A"),
+        ("{% set captured | upper %}x{% endset %}{{ captured }}", "X"),
+    ]);
+}
+
+#[test]
+fn a_loop_of_unknown_length_has_no_length_to_read_or_pair() {
+    let unknown = "{% for c in \"ab\" %}";
+    match render(
+        &format!("{unknown}{{{{ loop.length }}}}{{% endfor %}}"),
+        &linux(),
+    ) {
+        Err(Error {
+            problem: Problem::Missing(variable),
+            ..
+        }) => assert_eq!(variable, "loop.length"),
+        other => panic!("an unknown loop length must be missing, got {other:?}"),
+    }
+    for pairs in ["items | list | length", "dictsort | length"] {
+        fails_with(
+            &format!("{unknown}{{{{ loop | {pairs} }}}}{{% endfor %}}"),
+            "the value of \"length\" is undefined",
+        );
+    }
+    renders(&[
+        (
+            "{% for x in [1, 2] %}{{ loop | dictsort | length }}{% endfor %}",
+            "99",
+        ),
+        (
+            "{{ {\"b\": 1, \"a\": 2} | dictsort | map(\"first\") | join }}",
+            "ab",
+        ),
+        ("{{ {\"a\": 1} | items | map(\"last\") | join }}", "1"),
+        (
+            "{% for c in \"ab\" %}{{ loop.index }}{{ c }}{% endfor %}",
+            "1a2b",
+        ),
+        (
+            "{% for x in [1] | zip([2]) %}{{ loop.length }}{% endfor %}",
+            "1",
+        ),
+    ]);
+}
+
+#[test]
+fn loop_cycle_needs_a_value_instead_of_dividing_by_zero() {
+    renders(&[(
+        "{% for x in [1, 2, 3] %}{{ loop.cycle(\"a\", \"b\") }}{% endfor %}",
+        "aba",
+    )]);
+    for source in [
+        "{% for x in [1] %}\n{{ loop.cycle() }}{% endfor %}",
+        "{% for x in [1] %}\n{{ loop.cycle(*[]) }}{% endfor %}",
+    ] {
+        match render(source, &linux()) {
+            Err(Error {
+                line: Some(2),
+                problem: Problem::Render(message),
+                ..
+            }) => assert!(
+                message.contains("loop.cycle() needs at least one value"),
+                "{message}"
+            ),
+            other => panic!("{source:?} must be a template error, got {other:?}"),
+        }
+    }
+    for other in [
+        "{{ email.cycle() }}",
+        "{{ email.cycle(\"a\") }}",
+        "{{ {\"index0\": 0, \"depth0\": 0}.cycle() }}",
+        "{% set ns = namespace(a=1) %}{{ ns.cycle() }}",
+    ] {
+        match render(other, &linux()) {
+            Err(Error {
+                problem: Problem::Render(message),
+                ..
+            }) => assert!(
+                !message.contains("loop.cycle()"),
+                "{other:?} is not a loop and keeps minijinja's own error: {message}"
+            ),
+            other_result => panic!("{other:?} has no cycle method, got {other_result:?}"),
+        }
+    }
+    renders(&[(
+        "{% for row in [[1, 2]] %}{% for x in row %}{{ loop.cycle(\"o\", \"e\") }}{% endfor %}{% endfor %}",
+        "oe",
+    )]);
 }
