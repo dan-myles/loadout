@@ -134,44 +134,52 @@ The script pins everything it controls:
   log. Linux musl targets link with that toolchain's `rust-lld`. With the host's `cc`/`ld`, the same
   commit gave different bytes on Ubuntu 22.04 (binutils 2.38) and the 24.04 runner (2.42).
 
-So the same commit gives the same Linux binary on any machine. macOS and Windows binaries still
-link with the runner image's Xcode `ld` and MSVC `link.exe`. Rebuilds on one runner image
-should match, but that isn't verified, and image updates can change the bytes. Also not pinned:
+So the same commit gives the same Linux binary on any build host of the same architecture. At
+d8da3c0, the x86_64 musl binary built locally on Ubuntu 22.04 matched the ubuntu-24.04 runner's
+byte for byte. That doesn't hold across host architectures. An aarch64 binary cross-built on
+x86_64 differs from the native ubuntu-24.04-arm build: same size, same LLD, no leaked paths, but a
+different code layout. To check an aarch64 release, rebuild it on an aarch64 host.
+
+macOS and Windows binaries link with the runner image's Xcode `ld` and MSVC `link.exe`. Rebuilds on
+one runner image should match, but that isn't verified, and image updates can change the bytes.
+Also not pinned:
 
 - **Python's zlib.** It can compress the archive differently across Python builds. The binary
   inside stays byte-identical.
 
 ## Validation status
 
-Verified locally on 2026-10-24 with a disposable std-only `loadout` fixture crate (not the real CLI):
+Checked on 2026-10-24 against the real crate at d8da3c0 (CI run 40060874531, Release run
+40060874548):
 
-- `actionlint` 1.7.12 with shellcheck 0.11.0: 0 errors on both workflows and on `publish.sh`. The
-  new runner labels are accepted, and actionlint rejects unknown labels.
-- Release-script unit tests: 22/22 pass on Python 3.8.20, 3.9.25 and 3.10.12. They cover:
-  - deterministic tar.gz and zip, fixed metadata, checksum bytes
-  - the exact `--version` token and `--require-smoke`
-  - symlinked README/LICENSE rejection
-  - `publish.sh` against a fake `gh`: prerelease and stable create, draft reclassify, published
-    refusal
+- CI on all six native runners: rustfmt, clippy `-D warnings`, and `cargo test`. Release-script
+  unit tests on Python 3.8 and 3.12.
+- Release: each target built natively with rustc 1.98.1. Each passed `--require-smoke`, then 9/9
+  `smoke.py` checks on its own archive. `SHA256SUMS` was assembled after strict checks on all six
+  sidecars.
+- Linux VM (Ubuntu 24.04.5 x86_64, no Rust installed), using the CI archive: 46/46 checks pass.
+  - checksum: strict check passes, and a tampered archive is rejected
+  - archive: three entries, all owned 0/0
+  - binary: static-pie, no shared libraries, linked by LLD, `--version` exactly `loadout 0.1.0`
+  - doctor: healthy with git; exits 4 without git, with git as the only failed check
+  - validate: exit 0 on the complete fixture and exit 3 on the invalid one, with the exact counts
+  - the isolated home is left untouched
+- Windows VM (Windows 11 26300 x64, no Rust, no Git), using the CI x86_64 MSVC zip:
+  - the sidecar matches `Get-FileHash`, and the zip holds only `loadout.exe` and `README.md`
+  - `--version` prints exactly `loadout 0.1.0`
+  - doctor exits 4, with `git` as the only failed check and the `winget` hint
+  - validate gives 0/0/3/3, and the isolated home is left untouched
+  - with official MinGit 2.56.0.3 on `PATH` (SHA-256 checked against its release notes), doctor
+    exits 0 and is healthy
+- Both MSVC exes import only OS DLLs: no `vcruntime`, `msvcp` or `api-ms-win-crt`, so the static CRT
+  is in effect. `objdump` reports the PE timestamp as a reproducible-build hash, so `/Brepro` is in
+  effect.
+- `publish.sh` with a fake `gh`, run on the real 13 release files: stable and prerelease create, a
+  draft is reclassified before upload, and a published release is refused with exit 1.
 
-  Each regression test was confirmed to fail against the code it fixes.
-- `x86_64-unknown-linux-musl`: built from two checkout paths, one containing spaces, with
-  `--require-smoke`. Same binary SHA256 (`a9961644…`) and same archive SHA256 (`6764a121…`).
-- Path remapping, checked with a `regex-syntax` dependency: a plain `cargo build` embeds 4 `~/.cargo`
-  paths. The script's build embeds none.
-- A `0.1.0-beta.1` fixture packages with `--expect-version 0.1.0-beta.1`, and `publish.sh` creates it
-  with `--prerelease --latest=false`. The `gh` binary was faked; no real release was created.
-- Linux VM slot 3 (Ubuntu 24.04.5 x86_64, no Rust installed): `sha256sum --check --strict` passed, the
-  archive unpacked, the static binary ran `--version`, and a tampered archive was rejected.
-- Error paths: a tag/version mismatch, a missing `loadout` package, a missing `Cargo.toml`, a
-  symlinked README, and `--require-smoke` on a target the host can't run each exit 1 with a clear
-  message.
+Not covered:
 
-Pending until the real crate is merged and Actions runs:
-
-- Every Rust job on the six real runners: clippy, tests, native builds, `/Brepro`, the Windows zip,
-  and the `--version` smoke test against the real CLI. The 3.8 packaging-test job's first real run
-  is also pending.
-- The tag-push draft release path against real GitHub. It needs a tag, which is the maintainer's call.
-- VM execution of the real archive. Only Linux x86_64 VMs are available here. The other five
-  platforms are exercised only by the smoke step on GitHub's native runners.
+- Real tag-push and draft-release behavior on GitHub, which needs a maintainer's tag.
+- macOS, aarch64 Linux and aarch64 Windows execution beyond the native runner smoke. No VMs for
+  those exist here.
+- Install, update, and apply behavior, which the later units own.
