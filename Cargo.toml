@@ -15,6 +15,7 @@ jsonc-parser = { version = "0.34", features = ["cst"] }
 minijinja = { version = "=3.0.3", default-features = false, features = ["builtins", "debug", "unstable_machinery"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
 thiserror = "2"
 toml = "1.1"
 toml_edit = "0.25"
