@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::cli::Exit;
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::manifest::{Loadout, Scope};
+use crate::template;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -33,12 +34,15 @@ struct Layer<'a> {
 }
 
 pub fn run(args: &Args) -> anyhow::Result<Exit> {
-    let result = Loadout::load(&args.dir);
-    let (loadout, diagnostics) = match &result {
+    let (loadout, mut diagnostics) = match Loadout::load(&args.dir) {
         Ok((loadout, diagnostics)) => (Some(loadout), diagnostics),
         Err(diagnostics) => (None, diagnostics),
     };
-    let valid = loadout.is_some();
+    if let Some(loadout) = &loadout {
+        diagnostics.extend(template::check_all(loadout));
+    }
+    let loadout = loadout.as_ref();
+    let valid = !diagnostics.has_errors();
 
     if args.json {
         let report = Report {
@@ -53,7 +57,7 @@ pub fn run(args: &Args) -> anyhow::Result<Exit> {
                 })
                 .collect(),
             items: loadout.map_or(0, Loadout::item_count),
-            diagnostics,
+            diagnostics: &diagnostics,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -61,7 +65,7 @@ pub fn run(args: &Args) -> anyhow::Result<Exit> {
             println!("{diagnostic}");
         }
         let warnings = diagnostics.count(Severity::Warning);
-        match loadout {
+        match loadout.filter(|_| valid) {
             Some(loadout) => println!(
                 "valid: {} ({} layers, {} items, {warnings} warnings)",
                 args.dir.display(),

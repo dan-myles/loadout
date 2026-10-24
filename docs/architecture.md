@@ -23,6 +23,7 @@ async would buy v1 nothing.
 | `thiserror` | each module's error enum |
 | `anyhow` | command-level errors with context |
 | `gethostname` | the default machine name |
+| `minijinja` | templates (U2). Default features off; only `builtins` and `debug` |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -83,7 +84,7 @@ src/
     status.rs, rollback.rs                                                  [U3]
     update.rs, service.rs                                                   [U8]
     init.rs                                                                 [U9]
-  template/                                                                 [U2]
+  template/mod.rs         render, check, check_all                          [built: U2]
   state/                                                                    [U3]
   apply/                                                                    [U4]
   agents/                 adapter table, skills + instructions targets      [U5]
@@ -102,7 +103,7 @@ context                        -> platform
 machine                        -> platform, context, id
 manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
 resolve                        -> manifest, machine, diagnostic
-template                       -> resolve, machine
+template                       -> manifest (Loadout, Variable), machine, diagnostic
 mcp                            -> manifest, resolve, plan (types)
 agents                         -> manifest, resolve, mcp, plan (types), machine, context, diagnostic
 programs                       -> manifest, resolve, machine, context, diagnostic
@@ -354,17 +355,49 @@ Each key takes a string or a list, which matches any of its values. Every key pr
 An item whose condition fails is absent on that machine, as if a layer had removed it.
 `Condition::matches(&Facts)` is foundation code.
 
-### Templates (frozen, U2)
+### Templates (built, U2, `src/template/mod.rs`)
 
 A user file whose `source` ends in `.tmpl` is a template, and nothing else is rendered. **Default**:
 the suffix, not a field, marks the template. The mark is then visible in the repo tree, and no layer
-can switch rendering on or off by accident. The syntax is minijinja's Jinja subset, with undefined
-values as errors: `{{ email }}`, `{% if work %}…{% else %}…{% endif %}`,
-`{% if machine.os == "windows" %}`. Values come from the resolved `[variables]` at top level, plus
-facts under `machine` (`name`, `os`, `distro`, `arch`, `home`). There is no environment access, no
-include, and no filesystem. A missing variable stops the run before any write and names the file
-and the variable. A `.tmpl` source on a skill or instructions item gets a warning, because only user
-files are rendered.
+can switch rendering on or off by accident. A `.tmpl` source on a skill or instructions item gets a
+warning, because only user files are rendered. Skills and instructions are never parsed.
+
+The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif … %}…{% else %}…{% endif %}`,
+`{% if machine.os == "windows" %}`, `{% for %}`, `{% set %}`, and the builtin filters and tests.
+
+- **Values.** The resolved `[variables]` sit at top level with their TOML types: a string, an
+  integer (`{{ size + 1 }}`), or a boolean (`{% if work %}`, where `"false"` as a string is
+  truthy). Facts sit under `machine`: `name`, `os` (`macos`/`linux`/`windows`), `distro`, `arch`
+  (`x86_64`/`aarch64`), and `home` (the home path as text; a home that isn't UTF-8 is an error,
+  never a lossy path). `distro` is none on a machine without one: it compares unequal to every
+  string and is falsy, and printing it is an error, so a template writes
+  `{{ machine.distro or "unknown" }}`.
+- **Strict.** An undefined value is an error when printed, tested, iterated, passed to a filter,
+  or looked into, so a typo never renders as an empty string. `is defined` and `default(...)` are
+  the explicit escapes. A variable in a branch that isn't taken isn't needed, so a Windows-only
+  variable may live in `os/windows.toml`.
+- **Closed.** There is no loader, so no file is reachable from a template. `include`, `import`,
+  `from`, `extends`, `block`, and `macro` aren't even parsed (minijinja's `multi_template` and
+  `macros` features are off), so they are syntax errors that validate reports. Nothing reads the
+  process environment (`{{ HOME }}` is an undefined variable). The `debug()` global, which would
+  print the whole context, is removed.
+- **Output.** Never auto-escaped, whatever the file name. The final newline is kept, and text with
+  no tags renders byte for byte, CRLF included. Block whitespace follows Jinja (no `trim_blocks`);
+  use `{%-` and `-%}` to trim.
+- **Errors** are `template::Error { file, line, problem }`, shown as `file:line: problem`. A missing
+  variable is `Problem::Missing(name)`, naming nested lookups in full (`machine.hostname`): for
+  example ``files/gitconfig.tmpl:2: variable `signing_key` is not defined for this machine``. Other
+  problems are `Syntax`, `Render` (an unknown filter, a type error, printing none), and `Home`.
+- **Validate** (`template::check_all`) runs only after `Loadout::load` accepts the loadout, so every
+  source has already passed the confinement checks in section 3 before its content is read. It
+  then re-canonicalizes each distinct `.tmpl` user-file source from every layer, requires it to sit
+  inside the root and be a regular UTF-8 file, and syntax-checks it with no machine and no
+  variables. Each failure is one error diagnostic on the template file, such as
+  `files/gitconfig.tmpl: error: line 3: syntax error: …`, with exit 3. Unknown filters and missing
+  variables are found only by `render`, because they depend on the machine.
+- **Plan (U4)** reads the confined source and calls `render` with `Resolved.variables` and the
+  machine's `Facts` before building any action, so a missing variable stops the run with zero
+  writes. `render` itself reads and writes nothing.
 
 ### Paths
 
@@ -770,7 +803,7 @@ Automatic updates are required, so they are on by default.
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
-| `loadout validate [DIR] [--json]`: strict schema and static checks; exit 3 when invalid | foundation | U1 adds resolution across every machine on all three OSes, U2 adds template syntax |
+| `loadout validate [DIR] [--json]`: strict schema and static checks, plus the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid | foundation | U1 adds resolution across every machine on all three OSes |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
 | `loadout status [--json]` | frozen | U3 |
@@ -839,9 +872,13 @@ impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warni
 pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<Resolved, Diagnostics>;
 pub fn check_all(loadout: &Loadout) -> Diagnostics;   // every listed machine plus an unlisted one, on all three OSes
 
-// template (U2)
+// template (U2, built)
+pub const SUFFIX: &str;                                  // ".tmpl"
+pub struct Error { pub file: PathBuf, pub line: Option<usize>, pub problem: Problem }
+pub enum Problem { Syntax(String), Missing(String /* variable */), Render(String), Home(PathBuf) }
 pub fn render(file: &Path, source: &str, variables: &BTreeMap<String, Variable>, facts: &Facts) -> Result<String, template::Error>;
-pub fn check(file: &Path, source: &str) -> Result<(), template::Error>;
+pub fn check(file: &Path, source: &str) -> Result<(), template::Error>;   // syntax only; no variables needed
+pub fn check_all(loadout: &Loadout) -> Diagnostics;                       // validate: every .tmpl user-file source, read confined
 
 // mcp (U6)
 pub fn entry(server: &McpServer, shape: McpShape, env: EnvSyntax) -> Result<serde_json::Value, mcp::Unsupported>;
