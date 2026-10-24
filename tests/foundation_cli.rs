@@ -1304,6 +1304,81 @@ fn an_unresolvable_commondir_fails_validation_instead_of_counting_as_absent() {
     fs::set_permissions(denied.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn relative_git_pointers_resolve_from_git_logical_base_not_the_link_target() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let root = scratch.join("checkout");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", root.to_str().unwrap()],
+    );
+    fs::remove_file(root.join(".git")).unwrap();
+    fs::rename(main.join(".git"), root.join("common")).unwrap();
+    let admin = root.join("common/worktrees/checkout");
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", root.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(root.join(".git"), "gitdir: common/worktrees/checkout\n").unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.x]\nsource = \"common/config\"\ntarget = \"~/.x\"\n",
+    )
+    .unwrap();
+    let run = |json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(code, 3, "regular commondir json={json}: {text}");
+    }
+
+    let pointer = root.join("alt/level/three/pointer");
+    fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+    fs::write(&pointer, "../..\n").unwrap();
+    fs::remove_file(admin.join("commondir")).unwrap();
+    symlink(&pointer, admin.join("commondir")).unwrap();
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(
+            code, 3,
+            "linked commondir keeps Git's base json={json}: {text}"
+        );
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("gitfile"), "gitdir: common/worktrees/checkout\n").unwrap();
+    fs::remove_file(root.join(".git")).unwrap();
+    symlink(sub.join("gitfile"), root.join(".git")).unwrap();
+    assert_eq!(
+        run(false).0,
+        3,
+        "a linked gitfile resolves gitdir from the checkout root"
+    );
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

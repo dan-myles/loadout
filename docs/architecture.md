@@ -308,7 +308,9 @@ What validate enforces today, before any machine is known:
     folder.
   - **Unsupported layout.** Only these one-line pointer files are read, size-capped at 4 KiB; no
     config contents are read. A pointer file is opened only when its canonical location is inside
-    the loadout. A `.git` or `commondir` that resolves outside the loadout (for example, a link to
+    the loadout. Its relative contents resolve the way Git resolves them: a `gitdir:` line from the
+    folder holding `.git`, and `commondir` from the gitdir, never from the folder where a linked
+    pointer file really lives. A `.git` or `commondir` that resolves outside the loadout (for example, a link to
     `~/.codex/auth.json`) is an error, and the outside file is never opened. A gitdir outside the
     loadout, as in an ordinary worktree or an external separate Git dir, is only statted. Its
     `commondir` is not read, because everything outside the root is already refused as a source. A pointer that is unreadable, oversized, malformed, or names a

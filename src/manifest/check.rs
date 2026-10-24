@@ -737,7 +737,7 @@ fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let (gitdir, mut metadata) = if real.is_dir() {
         (real.clone(), vec![real])
     } else {
-        let gitdir = git_pointer(root, &real, "gitdir: ")?;
+        let gitdir = git_pointer(root, &real, root, "gitdir: ")?;
         (gitdir.clone(), vec![real, gitdir])
     };
     if !gitdir.starts_with(root) {
@@ -757,7 +757,7 @@ fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
                     "it resolves outside the loadout, which loadout never reads",
                 );
             }
-            metadata.push(git_pointer(root, &real, "")?);
+            metadata.push(git_pointer(root, &real, &gitdir, "")?);
         }
     }
     Ok(metadata)
@@ -770,7 +770,7 @@ fn unsupported<T>(file: &Path, why: &str) -> Result<T, String> {
     ))
 }
 
-fn git_pointer(root: &Path, file: &Path, prefix: &str) -> Result<PathBuf, String> {
+fn git_pointer(root: &Path, file: &Path, base: &Path, prefix: &str) -> Result<PathBuf, String> {
     if !file.starts_with(root) {
         return unsupported(
             file,
@@ -794,7 +794,6 @@ fn git_pointer(root: &Path, file: &Path, prefix: &str) -> Result<PathBuf, String
     else {
         return unsupported(file, "no pointer line");
     };
-    let base = file.parent().unwrap_or(Path::new("/"));
     match base.join(target).canonicalize() {
         Ok(dir) if dir.is_dir() => Ok(dir),
         _ => unsupported(file, "its pointer does not name a folder"),
