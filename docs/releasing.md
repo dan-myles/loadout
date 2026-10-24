@@ -53,14 +53,19 @@ Triggers:
 - **Pushing a `vX.Y.Z` tag**: builds as above, fails if the tag doesn't match the `version` in
   `Cargo.toml`, then creates a **draft** GitHub release with every asset and `SHA256SUMS`. Only this
   job gets `contents: write`. Rerunning it replaces the draft's assets. It refuses to touch a release
-  that is already published.
+  that is already published. `scripts/release/publish.sh` does the GitHub side.
+- **Prerelease tags** (a SemVer pre-release such as `v0.2.0-beta.1`, the tag still equal to the
+  `Cargo.toml` version) become drafts marked `--prerelease --latest=false`. That keeps them out of
+  `releases/latest`. Every other tag, including build metadata only (`v1.0.0+build.5`), is marked
+  `--prerelease=false`. On a rerun, the existing draft is reclassified before its assets are replaced.
 
 ## Cutting a release
 
 1. Set `version` in `Cargo.toml`, commit it with the matching `Cargo.lock`, and merge to `main`.
 2. `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`
 3. Wait for the Release workflow to finish. Review the draft release on GitHub, then publish it.
-   Self-update and `releases/latest` only see published releases.
+   Self-update and `releases/latest` only see published, non-prerelease releases. Don't untick
+   "pre-release" on a beta draft.
 
 ## Building a release archive locally
 
