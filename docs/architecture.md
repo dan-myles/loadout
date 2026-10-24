@@ -273,8 +273,15 @@ What validate enforces today, before any machine is known:
 - `remove = true` stands alone.
 - A `replace = true` item must be complete.
 - A server is stdio (`command`, `args`, `env`) or remote (`url`, `headers`), never both.
-- A remote `url` is `http://` or `https://` with a real host (a DNS name, IPv4, or `[IPv6]`) and an
-  optional port from 1 to 65535. It has no whitespace and no `user:pass@` credentials.
+- A remote `url` is `http://` or `https://` with a real host and an optional port. It has no
+  whitespace and no `user:pass@` credentials.
+  - **DNS name:** labels of 1–63 letters, digits, or `-` (not at a label's edge), at most 253
+    characters in all. One trailing dot is allowed (`example.com.`).
+  - **IPv4:** a dotted-decimal host must parse as `std::net::Ipv4Addr`.
+  - **IPv6:** must be bracketed and parse as `std::net::Ipv6Addr` (`[2001:db8::1]`,
+    `[::ffff:192.0.2.1]`). Zone ids and IPvFuture are rejected. An unbracketed IPv6 address is an
+    error.
+  - **Port:** ASCII digits only, from 1 to 65535.
 - A custom MCP `map` is an RFC 6901 pointer with non-empty parts, where `~` appears only as `~0` or
   `~1`.
 - Ids are lowercase `[a-z0-9][a-z0-9_-]*`.

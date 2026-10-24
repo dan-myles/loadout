@@ -577,6 +577,48 @@ fn remote_urls_and_map_pointers_must_be_well_formed() {
     );
 }
 
+fn validate_url(url: &str) -> (i32, String, Value) {
+    let text = format!("[loadout]\nversion = 1\n[mcp.x]\nurl = \"{url}\"\n");
+    let (code, human) = validate_text(&text);
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loadout.toml"), &text).unwrap();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap(), "--json"]);
+    assert_eq!(
+        output.status.code().unwrap(),
+        code,
+        "{url}: human and JSON exits differ"
+    );
+    (code, human, serde_json::from_slice(&output.stdout).unwrap())
+}
+
+#[test]
+fn bracketed_hosts_must_be_real_ipv6_addresses() {
+    for bad in [
+        "https://[::::]/mcp",
+        "https://[abcd]/mcp",
+        "https://[abc]/mcp",
+        "https://[1:2:3]/mcp",
+        "https://[::1::2]/mcp",
+        "https://[12345::]/mcp",
+        "https://[127.0.0.1]/mcp",
+    ] {
+        let (code, human, json) = validate_url(bad);
+        assert_eq!(code, 3, "{bad}: {human}");
+        assert!(human.contains("mcp.x.url: host ["), "{bad}: {human}");
+        assert_eq!(json["valid"], false, "{bad}");
+        assert_eq!(json["diagnostics"][0]["key"], "mcp.x.url", "{bad}");
+    }
+    for good in [
+        "https://[2001:db8::1]:65535/mcp",
+        "https://[::ffff:192.0.2.1]/mcp",
+        "https://example.com./mcp",
+    ] {
+        let (code, human, json) = validate_url(good);
+        assert_eq!(code, 0, "{good}: {human}");
+        assert_eq!(json["valid"], true, "{good}");
+    }
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

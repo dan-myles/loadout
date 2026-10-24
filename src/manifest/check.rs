@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
 use super::schema::{
@@ -687,47 +688,66 @@ fn url_problem(url: &str) -> Option<String> {
     }
     let (host, port) = match authority.strip_prefix('[') {
         Some(bracketed) => {
-            let Some((host, after)) = bracketed.split_once(']') else {
+            let Some((address, after)) = bracketed.split_once(']') else {
                 return Some("has an unclosed [ in its host".to_owned());
             };
-            if host.is_empty()
-                || !host
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
-            {
-                return Some(format!("host [{host}] is not an IPv6 address"));
+            if address.parse::<Ipv6Addr>().is_err() {
+                return Some(format!("host [{address}] is not an IPv6 address"));
             }
             match after {
-                "" => (host, None),
+                "" => (None, None),
                 _ => match after.strip_prefix(':') {
-                    Some(port) => (host, Some(port)),
+                    Some(port) => (None, Some(port)),
                     None => return Some("has text after its [IPv6] host".to_owned()),
                 },
             }
         }
         None => match authority.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
+            Some((_, port)) if port.contains(':') => {
+                return Some("an IPv6 host must be in brackets, such as [::1]".to_owned());
+            }
+            Some((host, port)) => (Some(host), Some(port)),
+            None => (Some(authority), None),
         },
     };
-    let bracketed = authority.starts_with('[');
-    let host_ok = bracketed
-        || (!host.is_empty()
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            }));
-    if !host_ok {
-        return Some(format!("needs a host name, got {host:?}"));
+    if let Some(host) = host
+        && let Some(problem) = host_problem(host)
+    {
+        return Some(problem);
     }
     if let Some(port) = port
-        && !port.parse::<u16>().is_ok_and(|port| port > 0)
+        && !(port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port > 0))
     {
         return Some(format!("port {port:?} is not a number from 1 to 65535"));
     }
     None
+}
+
+const MAX_HOST: usize = 253;
+const MAX_LABEL: usize = 63;
+
+fn host_problem(host: &str) -> Option<String> {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let invalid = || Some(format!("needs a host name, got {host:?}"));
+    if name.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return match name.parse::<Ipv4Addr>() {
+            Ok(_) if name.len() == host.len() => None,
+            _ => invalid(),
+        };
+    }
+    let labels_ok = !name.is_empty()
+        && name.len() <= MAX_HOST
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_LABEL
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if labels_ok { None } else { invalid() }
 }
 
 fn looks_secret(name: &str) -> bool {
@@ -772,8 +792,11 @@ mod tests {
             "https://api.githubcopilot.com/mcp/",
             "http://localhost:8080/mcp",
             "https://mcp.example.com",
+            "https://example.com./mcp",
             "http://127.0.0.1:3000",
             "https://[::1]:8443/x",
+            "https://[2001:db8::1]:65535/mcp",
+            "https://[::ffff:192.0.2.1]/mcp",
             "https://example.com?x=1",
         ] {
             assert_eq!(url_problem(good), None, "{good}");
@@ -787,13 +810,32 @@ mod tests {
             "https://example.com:0",
             "https://example.com:99999",
             "https://example.com:",
+            "https://example.com:+80",
             "https://-bad-.com",
             "https://a..b",
+            "https://.",
+            "https://example.com..",
+            "https://999.1.1.1",
+            "https://1.2.3",
+            "https://127.0.0.1.",
+            "https://::1/mcp",
             "https://[]/",
             "https://[::1",
+            "https://[::::]/mcp",
+            "https://[abcd]/mcp",
+            "https://[abc]/mcp",
+            "https://[1:2:3]/mcp",
+            "https://[::1::2]/mcp",
+            "https://[12345::]/mcp",
+            "https://[127.0.0.1]/mcp",
+            "https://[fe80::1%25eth0]/mcp",
+            "https://[v1.x]/mcp",
+            "https://[::1]x/mcp",
         ] {
             assert!(url_problem(bad).is_some(), "{bad}");
         }
+        let label = "a".repeat(MAX_LABEL + 1);
+        assert!(url_problem(&format!("https://{label}.com")).is_some());
     }
 
     #[test]
