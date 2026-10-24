@@ -39,7 +39,9 @@ pub enum Anchor {
     CodexHome,
     GrokHome,
     PiDir,
+    GeminiHome,
     XdgConfig,
+    XdgData,
     State,
 }
 
@@ -51,7 +53,9 @@ impl Anchor {
             Anchor::CodexHome => &[".codex"],
             Anchor::GrokHome => &[".grok"],
             Anchor::PiDir => &[".pi/agent"],
+            Anchor::GeminiHome => &[".gemini"],
             Anchor::XdgConfig => &[".config"],
+            Anchor::XdgData => &[".local/share"],
             Anchor::State => &[
                 ".local/state/loadout",
                 "Library/Application Support/loadout",
@@ -82,7 +86,9 @@ impl Anchor {
             Anchor::CodexHome => overridable("CODEX_HOME", ".codex"),
             Anchor::GrokHome => overridable("GROK_HOME", ".grok"),
             Anchor::PiDir => overridable("PI_CODING_AGENT_DIR", ".pi/agent"),
+            Anchor::GeminiHome => overridable("GEMINI_HOME", ".gemini"),
             Anchor::XdgConfig => vec![context.xdg_config.clone(), home(".config")],
+            Anchor::XdgData => vec![context.xdg_data.clone(), home(".local/share")],
             Anchor::State => vec![context.state.clone(), home(state_default)],
         };
         roots.dedup();
@@ -170,7 +176,7 @@ pub const TABLE: &[Entry] = &[
         "toml",
         "grok-toml",
     ),
-    entry(Anchor::Home, ".local/share/opencode", Kind::Auth),
+    entry(Anchor::XdgData, "opencode", Kind::Auth),
     shared(
         Anchor::XdgConfig,
         "opencode/opencode.json",
@@ -198,14 +204,14 @@ pub const TABLE: &[Entry] = &[
         "muse-json",
     ),
     entry(
-        Anchor::Home,
-        ".gemini/antigravity/mcp_oauth_tokens.json",
+        Anchor::GeminiHome,
+        "antigravity/mcp_oauth_tokens.json",
         Kind::Auth,
     ),
-    entry(Anchor::Home, ".gemini/antigravity-cli/mcp", Kind::Private),
+    entry(Anchor::GeminiHome, "antigravity-cli/mcp", Kind::Private),
     shared(
-        Anchor::Home,
-        ".gemini/config/mcp_config.json",
+        Anchor::GeminiHome,
+        "config/mcp_config.json",
         "/mcpServers",
         "json",
         "antigravity-json",
@@ -775,6 +781,63 @@ mod tests {
         assert_eq!(
             kind(checkout.join("mcp.json"), CLAUDE_MCP),
             Some(Kind::LoadoutState)
+        );
+    }
+
+    #[test]
+    fn xdg_data_and_gemini_home_move_their_protected_files() {
+        let vars = |name: &str| match name {
+            "XDG_DATA_HOME" => Some(OsString::from("/alt/data")),
+            "GEMINI_HOME" => Some(OsString::from("/alt/gemini")),
+            _ => None,
+        };
+        let context = Context::resolve(Os::Linux, vars, Some("/h".into())).unwrap();
+        let kind = |path: &str| {
+            check_path(&context, Path::new(NO_LOADOUT), Path::new(path), Use::Write)
+                .and_then(|conflict| conflict.kind())
+        };
+        assert_eq!(kind("/alt/data/opencode/mcp-auth.json"), Some(Kind::Auth));
+        assert_eq!(
+            kind("/h/.local/share/opencode/mcp-auth.json"),
+            Some(Kind::Auth)
+        );
+        assert_eq!(
+            kind("/alt/gemini/antigravity/mcp_oauth_tokens.json"),
+            Some(Kind::Auth)
+        );
+        assert_eq!(
+            kind("/alt/gemini/config/mcp_config.json"),
+            Some(Kind::SharedConfig)
+        );
+        assert_eq!(
+            kind("/h/.gemini/antigravity/mcp_oauth_tokens.json"),
+            Some(Kind::Auth)
+        );
+        assert_eq!(kind("/alt/data/other-app/state"), None);
+        assert_eq!(kind("/alt/gemini/AGENTS.md"), None);
+
+        let isolated = Context::resolve(
+            Os::Linux,
+            |name| match name {
+                "LOADOUT_HOME" => Some(OsString::from("/sandbox")),
+                other => vars(other),
+            },
+            Some("/h".into()),
+        )
+        .unwrap();
+        let isolated_kind = |path: &str| {
+            check_path(
+                &isolated,
+                Path::new(NO_LOADOUT),
+                Path::new(path),
+                Use::Write,
+            )
+            .and_then(|conflict| conflict.kind())
+        };
+        assert_eq!(isolated_kind("/alt/data/opencode/mcp-auth.json"), None);
+        assert_eq!(
+            isolated_kind("/sandbox/.local/share/opencode/mcp-auth.json"),
+            Some(Kind::Auth)
         );
     }
 }

@@ -7,11 +7,12 @@ use crate::platform::Os;
 
 pub const HOME_OVERRIDE: &str = "LOADOUT_HOME";
 pub const STATE_OVERRIDE: &str = "LOADOUT_STATE_DIR";
-pub const AGENT_DIR_VARS: [&str; 4] = [
+pub const AGENT_DIR_VARS: [&str; 5] = [
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "GROK_HOME",
     "PI_CODING_AGENT_DIR",
+    "GEMINI_HOME",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,7 @@ pub struct Context {
     pub isolated: bool,
     pub config: PathBuf,
     pub xdg_config: PathBuf,
+    pub xdg_data: PathBuf,
     pub state: PathBuf,
     pub agent_dirs: BTreeMap<&'static str, PathBuf>,
 }
@@ -68,6 +70,7 @@ impl Context {
             |name: &str, fallback: &[&str]| ambient(name).unwrap_or_else(|| join(&home, fallback));
 
         let xdg_config = xdg("XDG_CONFIG_HOME", &[".config"]);
+        let xdg_data = xdg("XDG_DATA_HOME", &[".local", "share"]);
         let config = match os {
             Os::Linux => xdg_config.clone(),
             Os::Macos => join(&home, &["Library", "Application Support"]),
@@ -92,6 +95,7 @@ impl Context {
             isolated,
             config,
             xdg_config,
+            xdg_data,
             state,
             agent_dirs,
         })
@@ -261,12 +265,15 @@ mod tests {
             ("XDG_STATE_HOME", "/real/.local/state"),
             ("CLAUDE_CONFIG_DIR", "/real/.claude"),
             ("CODEX_HOME", "/real/.codex"),
+            ("XDG_DATA_HOME", "/real/.data"),
+            ("GEMINI_HOME", "/real/.gemini-alt"),
         ];
         let mut isolated = ambient.to_vec();
         isolated.push(("LOADOUT_HOME", "/sandbox"));
         let context = Context::resolve(Os::Linux, vars(&isolated), Some("/real".into())).unwrap();
         assert_eq!(context.config, PathBuf::from("/sandbox/.config"));
         assert_eq!(context.xdg_config, PathBuf::from("/sandbox/.config"));
+        assert_eq!(context.xdg_data, PathBuf::from("/sandbox/.local/share"));
         assert_eq!(
             context.state,
             PathBuf::from("/sandbox/.local/state/loadout")
@@ -286,6 +293,11 @@ mod tests {
             Some(Path::new("/real/.codex"))
         );
         assert_eq!(context.agent_dir("GROK_HOME"), None);
+        assert_eq!(context.xdg_data, PathBuf::from("/real/.data"));
+        assert_eq!(
+            context.agent_dir("GEMINI_HOME"),
+            Some(Path::new("/real/.gemini-alt"))
+        );
     }
 
     #[test]

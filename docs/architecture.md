@@ -414,8 +414,8 @@ absolute when set; an empty value counts as unset.
 - **`LOADOUT_HOME` (isolation).** When set, it replaces the home dir, and `Context.isolated` is
   `true`. Every path is then derived from that home and nothing else: `{config}`, `xdg_config`, and
   the default state dir. The ambient `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are ignored, and so are
-  the agent dir variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `PI_CODING_AGENT_DIR`),
-  so `Context.agent_dirs` is empty. Every path that **Loadout itself** reads or writes (targets,
+  the ambient `XDG_DATA_HOME`, and the agent dir variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `GROK_HOME`, `PI_CODING_AGENT_DIR`, `GEMINI_HOME`), so `Context.agent_dirs` is empty. Every path that **Loadout itself** reads or writes (targets,
   agent dirs, state) stays inside the isolated home, except an explicit `LOADOUT_STATE_DIR`.
   Isolation does not cover what a subprocess does with the real environment:
   - `git` (U8) runs against the state dir clone only.
@@ -428,6 +428,8 @@ absolute when set; an empty value counts as unset.
   `XDG_STATE_HOME`, and the absolute agent dir variables, which are collected into
   `Context.agent_dirs`. Units read agent overrides only through `Context::agent_dir(name)` and never
   call `std::env` themselves, so isolation is enforced in one place.
+- `Context.xdg_data` is `$XDG_DATA_HOME` or `~/.local/share` on every OS, where OpenCode keeps its
+  auth store. Isolation filters it the same way.
 - `Context.xdg_config` is `$XDG_CONFIG_HOME` or `~/.config` on every OS, for agents such as OpenCode
   and Muse that use XDG paths even on macOS and Windows. `Context.config` is the OS-native config dir
   behind `{config}`.
@@ -538,7 +540,7 @@ install time (U8).
 | opencode | `<xdg_config>/opencode/skills` on every OS | `<xdg_config>/opencode/AGENTS.md` | `<xdg_config>/opencode/opencode.json` or `.jsonc`, `/mcp`, `opencode-json` | `{env:VAR}` |
 | pi | `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, then `/skills` | `…/AGENTS.md` | `…/mcp.json`, `/mcpServers`, `pi-json` | `${VAR}` |
 | muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json`, `/mcp_servers`, `muse-json` | `${VAR}` |
-| antigravity | `~/.gemini/antigravity-cli/skills` | `~/.gemini/AGENTS.md` | `~/.gemini/config/mcp_config.json`, `/mcpServers`, `antigravity-json` | none (undocumented) |
+| antigravity | `$GEMINI_HOME` or `~/.gemini`, then `/antigravity-cli/skills` | `…/AGENTS.md` | `…/config/mcp_config.json`, `/mcpServers`, `antigravity-json` | none (undocumented) |
 
 `<xdg_config>` is `Context.xdg_config`: `$XDG_CONFIG_HOME` (outside isolation) or `~/.config` on
 **every** OS. OpenCode and Muse use it even on macOS (not `~/Library/Application Support`) and
@@ -583,14 +585,15 @@ kinds:
 
 | Kind | Entries (default anchor shown) | Allowed use |
 | --- | --- | --- |
-| `auth` | `~/.claude/.credentials.json`, `~/.claude/mcp-needs-auth-cache.json`; `~/.codex/{auth.json,.credentials.json,mcp-oauth-locks}`; `~/.cursor/auth.json`, `~/.config/cursor/auth.json`, `~/AppData/Roaming/Cursor/auth.json`; `~/.grok/{auth.json,mcp_credentials.json}`; `~/.local/share/opencode` (the auth file and credential DB); `~/.pi/agent/{auth.json,mcp-auth.json}`; `<xdg_config>/muse/{auth.json,trust.json}`; `~/.gemini/antigravity/mcp_oauth_tokens.json` | none: never read, backed up, copied, or written |
-| `shared-config` | `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), `~/.codex/config.toml`, `~/.cursor/mcp.json`, `~/.grok/config.toml`, `<xdg_config>/opencode/opencode.json[c]`, `~/.pi/agent/mcp.json`, `<xdg_config>/muse/settings.json`, `~/.gemini/config/mcp_config.json` | U6 key-merge of owned MCP server names only |
+| `auth` | `~/.claude/.credentials.json`, `~/.claude/mcp-needs-auth-cache.json`; `~/.codex/{auth.json,.credentials.json,mcp-oauth-locks}`; `~/.cursor/auth.json`, `~/.config/cursor/auth.json`, `~/AppData/Roaming/Cursor/auth.json`; `~/.grok/{auth.json,mcp_credentials.json}`; `<xdg_data>/opencode` (the auth file and credential DB); `~/.pi/agent/{auth.json,mcp-auth.json}`; `<xdg_config>/muse/{auth.json,trust.json}`; `<gemini_home>/antigravity/mcp_oauth_tokens.json` | none: never read, backed up, copied, or written |
+| `shared-config` | `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), `~/.codex/config.toml`, `~/.cursor/mcp.json`, `~/.grok/config.toml`, `<xdg_config>/opencode/opencode.json[c]`, `~/.pi/agent/mcp.json`, `<xdg_config>/muse/settings.json`, `<gemini_home>/config/mcp_config.json` | U6 key-merge of owned MCP server names only |
 | `loadout-state` | the state dir (`Context.state`; static defaults for all three OSes), `<xdg_config>/loadout` | none: only U3, U8, and U9 manage state, the clone, and `machine.toml` |
-| `private` | `~/.claude/backups`, `~/.grok/.config-init.lock`, `~/.gemini/antigravity-cli/mcp` (generated), `~/.t3` (T3 settings with provider secrets, private profiles) | none |
+| `private` | `~/.claude/backups`, `~/.grok/.config-init.lock`, `<gemini_home>/antigravity-cli/mcp` (generated), `~/.t3` (T3 settings with provider secrets, private profiles) | none |
 
 **Anchors.** `Home`, `ClaudeRoot`/`ClaudeDir` (`CLAUDE_CONFIG_DIR`), `CodexHome` (`CODEX_HOME`),
-`GrokHome` (`GROK_HOME`), `PiDir` (`PI_CODING_AGENT_DIR`), `XdgConfig` (`Context.xdg_config`), and
-`State` (`Context.state`). They expand through `Context`, so isolation rules apply.
+`GrokHome` (`GROK_HOME`), `PiDir` (`PI_CODING_AGENT_DIR`), `GeminiHome` (`GEMINI_HOME`, default `~/.gemini`), `XdgConfig`
+(`Context.xdg_config`), `XdgData` (`Context.xdg_data`), and `State` (`Context.state`). An
+overridable anchor protects both its override root and its default root. They expand through `Context`, so isolation rules apply.
 
 **Uses:**
 
@@ -761,7 +764,7 @@ pub fn name(context: &Context) -> Result<Name, machine::Error>;
 
 // context (foundation)
 pub struct Context {
-    pub os: Os, pub home: PathBuf, pub isolated: bool, pub config: PathBuf, pub xdg_config: PathBuf,
+    pub os: Os, pub home: PathBuf, pub isolated: bool, pub config: PathBuf, pub xdg_config: PathBuf, pub xdg_data: PathBuf,
     pub state: PathBuf, pub agent_dirs: BTreeMap<&'static str, PathBuf>,
 }
 impl Context {
@@ -771,7 +774,7 @@ impl Context {
     pub fn agent_dir(&self, var: &str) -> Option<&Path>;        // always None under isolation
     pub fn machine_file(&self) -> PathBuf;
 }
-pub const AGENT_DIR_VARS: [&str; 4];                            // CLAUDE_CONFIG_DIR, CODEX_HOME, GROK_HOME, PI_CODING_AGENT_DIR
+pub const AGENT_DIR_VARS: [&str; 5];                            // CLAUDE_CONFIG_DIR, CODEX_HOME, GROK_HOME, PI_CODING_AGENT_DIR, GEMINI_HOME
 pub fn split_base(path: &str) -> Option<(Base, &str)>;          // Base::{Home, Config}
 pub fn windows_problem(rest: &str) -> Option<String>;
 pub fn which(program: &str) -> Option<PathBuf>;                 // executable files only on Unix
