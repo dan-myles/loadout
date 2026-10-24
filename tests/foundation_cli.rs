@@ -719,6 +719,52 @@ fn tag_references_never_consult_a_rejected_outside_tags_folder() {
 }
 
 #[test]
+fn reserved_destinations_are_rejected_but_siblings_and_key_merges_pass() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n\
+             [files.a]\nsource = \"f\"\ntarget = \"~/.codex/auth.json\"\n\
+             [files.b]\nsource = \"f\"\ntarget = \"~/.claude.json\"\n\
+             [files.c]\nsource = \"f\"\ntarget = \"~/.claude/.credentials.json\"\n\
+             [files.d]\nsource = \"f\"\ntarget = \"{config}/loadout/machine.toml\"\n\
+             [files.e]\nsource = \"f\"\ntarget = \"~/.local/state/loadout/state.json\"\n\
+             [files.f]\nsource = \"f\"\ntarget = \"~/.codex\"\n\
+             [agents.custom.x]\nevidence = \"e\"\ninstructions = { linux = \"~/.claude.json\" }\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    for (key, reason) in [
+        ("files.a.target", "auth or OAuth store"),
+        ("files.b.target", "shared config"),
+        ("files.c.target", "auth or OAuth store"),
+        ("files.d.target", "loadout's own state"),
+        ("files.e.target", "loadout's own state"),
+        ("files.f.target", "auth or OAuth store"),
+        ("agents.custom.x.instructions.linux", "shared config"),
+    ] {
+        assert!(
+            text.lines()
+                .any(|line| line.contains(key) && line.contains(reason)),
+            "{key}: {text}"
+        );
+    }
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n\
+             [files.a]\nsource = \"f\"\ntarget = \"~/.claude/CLAUDE.md\"\n\
+             [agents.custom.x]\nevidence = \"e\"\nskills = { linux = \"~/.claude/skills\" }\n\
+             mcp = { linux = \"~/.cursor/mcp.json\", format = \"json\", map = \"/mcpServers\", shape = \"cursor-json\", env_syntax = \"${env:VAR}\" }\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+}
+
+#[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["doctor", "--json"]);

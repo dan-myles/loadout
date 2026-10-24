@@ -71,6 +71,7 @@ src/
   context.rs              Context: os, home, config, state; overrides; which [foundation]
   diagnostic.rs           Diagnostic, Diagnostics, Check                    [foundation]
   id.rs                   the id rule for items, tags, machines, agents     [foundation]
+  reserved.rs             reserved destinations: auth, shared configs, state [foundation]
   machine.rs              Facts, machine name                               [foundation]
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
   resolve/mod.rs          Resolved model                                    [types: foundation; resolve(): U1]
@@ -96,9 +97,10 @@ Which subject may import which:
 
 ```
 platform, diagnostic, id       -> (none)
+reserved                       -> context, platform
 context                        -> platform
 machine                        -> platform, context, id
-manifest                       -> platform, machine, context (path syntax), diagnostic, id
+manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
 resolve                        -> manifest, machine, diagnostic
 template                       -> resolve, machine
 mcp                            -> manifest, resolve, plan (types)
@@ -295,6 +297,7 @@ What validate enforces today, before any machine is known:
   Folder links are never followed, so a link loop can't make the walk loop. An unreadable entry
   is an error.
 - Targets are clean `~/` or `{config}/` paths, and two file items in one layer may not share a target.
+- Targets and custom-agent paths never touch a reserved destination (section 6).
 - Every agent named anywhere is built in or declared.
 
 U1 adds the checks that need a machine: an added item that turns out incomplete, a server left with
@@ -525,11 +528,48 @@ or corrects them.
     shows an `unsupported` action for Codex; nothing is renamed or resolved.
 - **Custom agents** get exactly the declared paths, their declared `format`, `map`, `shape`, and
   `env_syntax`, and copy-only skills.
-- **Never touched**: OAuth and auth stores (Claude Keychain and `.credentials.json`; Codex
-  `auth.json`, `.credentials.json`, and keyring; Cursor `auth.json`; Grok `auth.json` and
-  `mcp_credentials.json`; OpenCode `mcp-auth.json`; Pi `auth.json` and `mcp-auth.json`; Muse
-  `auth.json` and `trust.json`; Antigravity `mcp_oauth_tokens.json`), T3's `settings.json` (it holds
-  provider secrets), and T3's private profiles and shadow homes.
+- **Never touched**: OS keychains, every path in the reserved table below, and T3's private profiles
+  and shadow homes.
+
+### Reserved destinations (foundation, `src/reserved.rs`)
+
+One table, `reserved::TABLE`, built from the agent-inventory no-touch evidence. No real auth file
+was ever opened to build it. Each entry is an anchor plus a relative path, and has one of four
+kinds:
+
+| Kind | Entries (default anchor shown) | Allowed use |
+| --- | --- | --- |
+| `auth` | `~/.claude/.credentials.json`, `~/.claude/mcp-needs-auth-cache.json`; `~/.codex/{auth.json,.credentials.json,mcp-oauth-locks}`; `~/.cursor/auth.json`, `~/.config/cursor/auth.json`, `~/AppData/Roaming/Cursor/auth.json`; `~/.grok/{auth.json,mcp_credentials.json}`; `~/.local/share/opencode` (the auth file and credential DB); `~/.pi/agent/{auth.json,mcp-auth.json}`; `<xdg_config>/muse/{auth.json,trust.json}`; `~/.gemini/antigravity/mcp_oauth_tokens.json` | none: never read, backed up, copied, or written |
+| `shared-config` | `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), `~/.codex/config.toml`, `~/.cursor/mcp.json`, `~/.grok/config.toml`, `<xdg_config>/opencode/opencode.json[c]`, `~/.pi/agent/mcp.json`, `<xdg_config>/muse/settings.json`, `~/.gemini/config/mcp_config.json` | U6 key-merge of owned MCP server names only |
+| `loadout-state` | the state dir (`Context.state`; static defaults for all three OSes), `<xdg_config>/loadout` | none: only U3, U8, and U9 manage state, the clone, and `machine.toml` |
+| `private` | `~/.claude/backups`, `~/.grok/.config-init.lock`, `~/.gemini/antigravity-cli/mcp` (generated), `~/.t3` (T3 settings with provider secrets, private profiles) | none |
+
+**Anchors.** `Home`, `ClaudeRoot`/`ClaudeDir` (`CLAUDE_CONFIG_DIR`), `CodexHome` (`CODEX_HOME`),
+`GrokHome` (`GROK_HOME`), `PiDir` (`PI_CODING_AGENT_DIR`), `XdgConfig` (`Context.xdg_config`), and
+`State` (`Context.state`). They expand through `Context`, so isolation rules apply.
+
+**Uses:**
+
+- `Write`: replace a file or tree. Blocked when the target equals a reserved entry, sits inside one,
+  or is an ancestor of one. Replacing `~/.codex` would replace `auth.json`.
+- `WriteInto`: write children into a dir, as with a skills dir. Blocked only when the dir equals or
+  sits inside an entry, so `~/.claude/skills` beside `~/.claude/.credentials.json` is fine.
+- `KeyMerge`: U6 MCP merge. Allowed into `shared-config` and blocked everywhere else.
+
+Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocked on every OS.
+
+**Enforcement:**
+
+- **Validate (foundation, static).** `reserved::check_literal` checks every literal `files` target
+  (`Write`) and every custom-agent path: skills `WriteInto`, instructions `Write`, mcp `KeyMerge`.
+  It checks `{config}/` under all three OS meanings. A conflict is an error naming the reserved path
+  and its kind.
+- **U1, U4, and U5 (runtime, frozen).** Before any read of a target, any backup, and any write, each
+  fully expanded target (overrides applied) is checked with `reserved::check_path(context, path, use)`.
+  The check runs twice: on the expanded path, and on its canonical form, with symlinks resolved
+  through existing ancestors. A conflict is an `unsupported` action, never a write, and the reserved
+  file is never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
+- An unowned shared config is never adopted or replaced as a whole file. Only U6's owned keys change.
 - **Doctor diagnostics** (U5): report which overrides are set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
   `GROK_HOME`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`). Warn when Codex `AGENTS.override.md`
   shadows `AGENTS.md`. Note that a T3-launched Antigravity sees skills only: T3 gives it a private

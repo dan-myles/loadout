@@ -11,6 +11,7 @@ use super::{LayerFile, Loadout, Scope, is_id};
 use crate::context::{split_base, windows_problem};
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::platform::Os;
+use crate::reserved::{self, Use};
 
 const TEMPLATE_SUFFIX: &str = ".tmpl";
 const SKILL_FILE: &str = "SKILL.md";
@@ -196,7 +197,7 @@ impl Checker {
             }
             if let Some(target) = &item.target {
                 let reach = windows_reach(&file.scope, item.when.as_ref());
-                self.target(&format!("{key}.target"), target, reach);
+                self.target(&format!("{key}.target"), target, reach, Use::Write);
                 if let Some(other) = targets.insert(target.clone(), id.clone()) {
                     self.error(
                         format!("{key}.target"),
@@ -420,7 +421,7 @@ impl Checker {
         }
     }
 
-    fn target(&mut self, key: &str, target: &str, windows: Reach) {
+    fn target(&mut self, key: &str, target: &str, windows: Reach, how: Use) {
         let Some((_, rest)) = split_base(target) else {
             self.error(
                 key,
@@ -428,6 +429,9 @@ impl Checker {
             );
             return;
         };
+        if let Some(conflict) = reserved::check_literal(target, how) {
+            self.error(key, format!("{target} {}", conflict.message()));
+        }
         let Some(problem) = windows_problem(rest) else {
             return;
         };
@@ -521,14 +525,14 @@ impl Checker {
             self.error(key, "declare at least one of skills, instructions, or mcp");
         }
         if let Some(skills) = &agent.skills {
-            self.per_os(&format!("{key}.skills"), skills);
+            self.per_os(&format!("{key}.skills"), skills, Use::WriteInto);
         }
         if let Some(instructions) = &agent.instructions {
-            self.per_os(&format!("{key}.instructions"), instructions);
+            self.per_os(&format!("{key}.instructions"), instructions, Use::Write);
         }
         if let Some(mcp) = &agent.mcp {
             let key = format!("{key}.mcp");
-            self.per_os(&key, &mcp.paths());
+            self.per_os(&key, &mcp.paths(), Use::KeyMerge);
             if mcp.shape.is_toml() != (mcp.format == McpFormat::Toml) {
                 self.error(
                     format!("{key}.format"),
@@ -560,7 +564,7 @@ impl Checker {
         }
     }
 
-    fn per_os(&mut self, key: &str, paths: &PerOs) {
+    fn per_os(&mut self, key: &str, paths: &PerOs, how: Use) {
         let mut any = false;
         for (os, path) in paths.paths() {
             any = true;
@@ -569,7 +573,7 @@ impl Checker {
             } else {
                 Reach::Never
             };
-            self.target(&format!("{key}.{os}"), path, reach);
+            self.target(&format!("{key}.{os}"), path, reach, how);
         }
         if !any {
             self.error(key, "name a path for at least one of macos, linux, windows");
