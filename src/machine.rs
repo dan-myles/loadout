@@ -77,7 +77,20 @@ pub fn name(context: &Context) -> Result<Name, Error> {
         Err(source) => return Err(Error::Read { path, source }),
         Ok(_) => {}
     }
-    match fs::metadata(&path) {
+    let canonical = |path: &Path| {
+        path.canonicalize().map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+    };
+    let real = canonical(&path)?;
+    if !real.starts_with(canonical(&context.state)?) {
+        return Err(Error::Invalid {
+            path,
+            message: "resolves outside the state dir, which loadout never reads".to_owned(),
+        });
+    }
+    match fs::metadata(&real) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
             return Err(Error::Invalid {
@@ -87,7 +100,7 @@ pub fn name(context: &Context) -> Result<Name, Error> {
         }
         Err(source) => return Err(Error::Read { path, source }),
     }
-    let text = fs::read_to_string(&path).map_err(|source| Error::Read {
+    let text = fs::read_to_string(&real).map_err(|source| Error::Read {
         path: path.clone(),
         source,
     })?;

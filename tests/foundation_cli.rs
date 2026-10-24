@@ -1501,6 +1501,53 @@ fn doctor_reports_a_non_regular_machine_file_instead_of_hanging() {
     assert!(text.contains("linked-box (saved in"), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_never_reads_a_saved_identity_linked_outside_the_state_dir() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    let outside = sandbox.home.join(".codex");
+    fs::create_dir_all(&outside).unwrap();
+    let fifo = outside.join("auth.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    symlink(&fifo, sandbox.state.join("machine.toml")).unwrap();
+    for json in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+        command
+            .arg("doctor")
+            .args(json.then_some("--json"))
+            .env("LOADOUT_HOME", &sandbox.home)
+            .env("LOADOUT_STATE_DIR", &sandbox.state);
+        let output = run_with_deadline(command);
+        assert_eq!(output.status.code(), Some(4), "json={json}");
+        assert!(
+            stdout(&output).contains("resolves outside the state dir"),
+            "{}",
+            stdout(&output)
+        );
+    }
+
+    let regular = sandbox.home.join("name.toml");
+    fs::write(&regular, "name = \"outside-name\"\n").unwrap();
+    fs::remove_file(sandbox.state.join("machine.toml")).unwrap();
+    symlink(&regular, sandbox.state.join("machine.toml")).unwrap();
+    let output = sandbox.run(&["doctor"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        !stdout(&output).contains("outside-name"),
+        "{}",
+        stdout(&output)
+    );
+}
+
 #[test]
 fn doctor_fails_on_a_broken_machine_file_or_missing_home() {
     let sandbox = Sandbox::new();
