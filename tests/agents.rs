@@ -310,19 +310,16 @@ fn every_builtin_agent_takes_each_kind_at_its_documented_linux_path() {
     for (agent, skill, instructions, mcp, map, shape, format) in expected {
         let one = find(&desired, ItemKind::Skill, "review", agent);
         assert_eq!(sandbox.relative(path_of(one)), skill, "{agent} skill");
-        match instructions {
-            Some(path) => {
-                let one = find(&desired, ItemKind::Instructions, "global", agent);
-                assert_eq!(sandbox.relative(path_of(one)), path, "{agent} instructions");
-            }
-            None => {
-                let action = refused(&unsupported, ItemKind::Instructions, "global", agent);
-                assert_eq!(
-                    action.target,
-                    Target::None,
-                    "{agent} has no instructions file"
-                );
-            }
+        if let Some(path) = instructions {
+            let one = find(&desired, ItemKind::Instructions, "global", agent);
+            assert_eq!(sandbox.relative(path_of(one)), path, "{agent} instructions");
+        } else {
+            let action = refused(&unsupported, ItemKind::Instructions, "global", agent);
+            assert_eq!(
+                action.target,
+                Target::None,
+                "{agent} has no instructions file"
+            );
         }
         let one = find(&desired, ItemKind::Mcp, "files", agent);
         let (file, actual_format, pointer, key, actual_shape) = entry_of(one);

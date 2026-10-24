@@ -1071,8 +1071,19 @@ mod tests {
         path
     }
 
-    fn source(context: &Context, checkout: &Path, path: &Path) -> Option<Option<Kind>> {
-        check_source(context, checkout, path).map(|conflict| conflict.kind())
+    #[derive(Debug, PartialEq, Eq)]
+    enum Found {
+        Clear,
+        Reserved(Kind),
+        Unverifiable,
+    }
+
+    fn source(context: &Context, checkout: &Path, path: &Path) -> Found {
+        match check_source(context, checkout, path) {
+            None => Found::Clear,
+            Some(Conflict::Reserved { entry, .. }) => Found::Reserved(entry.kind),
+            Some(Conflict::Unverifiable { .. }) => Found::Unverifiable,
+        }
     }
 
     #[test]
@@ -1089,7 +1100,7 @@ mod tests {
             let file = made(checkout.join("skills").join("review").join("SKILL.md"));
             assert_eq!(
                 source(&context, &checkout, &file),
-                None,
+                Found::Clear,
                 "{}",
                 file.display()
             );
@@ -1101,17 +1112,34 @@ mod tests {
         let (_dir, home) = source_home();
         let context = native(&home, &[]);
         let cases = [
-            (home.join(".t3").join("settings.json"), Some(Kind::Private)),
-            (home.join(".claude.json"), Some(Kind::SharedConfig)),
-            (context.state.join("state.json"), Some(Kind::LoadoutState)),
-            (home.join(".codex").join("auth.json"), Some(Kind::Auth)),
-            (home.join(".ssh").join("id_ed25519"), Some(Kind::Auth)),
-            (home.join(".SSH").join("config"), Some(Kind::Auth)),
-            (home.join("skills").join("review.md"), None),
+            (
+                home.join(".t3").join("settings.json"),
+                Found::Reserved(Kind::Private),
+            ),
+            (
+                home.join(".claude.json"),
+                Found::Reserved(Kind::SharedConfig),
+            ),
+            (
+                context.state.join("state.json"),
+                Found::Reserved(Kind::LoadoutState),
+            ),
+            (
+                home.join(".codex").join("auth.json"),
+                Found::Reserved(Kind::Auth),
+            ),
+            (
+                home.join(".ssh").join("id_ed25519"),
+                Found::Reserved(Kind::Auth),
+            ),
+            (
+                home.join(".SSH").join("config"),
+                Found::Reserved(Kind::Auth),
+            ),
+            (home.join("skills").join("review.md"), Found::Clear),
         ];
-        for (path, kind) in cases {
+        for (path, want) in cases {
             let file = made(path);
-            let want = kind.map(Some);
             assert_eq!(source(&context, &home, &file), want, "{}", file.display());
         }
     }
@@ -1134,7 +1162,7 @@ mod tests {
         for path in auth {
             let file = made(path);
             let found = source(&context, &checkout, &file);
-            assert_eq!(found, Some(Some(Kind::Auth)), "{}", file.display());
+            assert_eq!(found, Found::Reserved(Kind::Auth), "{}", file.display());
         }
         for path in [
             checkout.join("codex").join("AGENTS.md"),
@@ -1143,7 +1171,7 @@ mod tests {
             let file = made(path);
             assert_eq!(
                 source(&context, &checkout, &file),
-                None,
+                Found::Clear,
                 "{}",
                 file.display()
             );
@@ -1151,7 +1179,10 @@ mod tests {
 
         let inside_ssh = home.join(".ssh").join("loadout");
         let file = made(inside_ssh.join("skills").join("review.md"));
-        assert_eq!(source(&context, &inside_ssh, &file), Some(Some(Kind::Auth)));
+        assert_eq!(
+            source(&context, &inside_ssh, &file),
+            Found::Reserved(Kind::Auth)
+        );
     }
 
     #[cfg(unix)]
@@ -1166,18 +1197,21 @@ mod tests {
         let alias = home.join("alias");
         symlink(&checkout, &alias).unwrap();
         let through = alias.join("skills").join("review.md");
-        assert_eq!(source(&context, &alias, &through), None);
-        assert_eq!(source(&context, &checkout, &file), None);
+        assert_eq!(source(&context, &alias, &through), Found::Clear);
+        assert_eq!(source(&context, &checkout, &file), Found::Clear);
 
         let auth = made(home.join(".codex").join("auth.json"));
         let link = home.join("notes").join("token");
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         symlink(&auth, &link).unwrap();
-        assert_eq!(source(&context, &home, &link), Some(Some(Kind::Auth)));
+        assert_eq!(source(&context, &home, &link), Found::Reserved(Kind::Auth));
         let settings = made(home.join(".t3").join("settings.json"));
         let link = home.join("notes").join("settings");
         symlink(&settings, &link).unwrap();
-        assert_eq!(source(&context, &home, &link), Some(Some(Kind::Private)));
+        assert_eq!(
+            source(&context, &home, &link),
+            Found::Reserved(Kind::Private)
+        );
     }
 
     #[test]
@@ -1186,13 +1220,13 @@ mod tests {
         let context = native(&home, &[]);
         let file = made(home.join("skills").join("review.md"));
         let relative = Path::new("skills").join("review.md");
-        assert_eq!(source(&context, &home, &relative), Some(None));
+        assert_eq!(source(&context, &home, &relative), Found::Unverifiable);
 
         let broken = native(
             &home,
             &[("CODEX_HOME", home.join("missing").join("..").join("codex"))],
         );
-        assert_eq!(source(&broken, &home, &file), Some(None));
+        assert_eq!(source(&broken, &home, &file), Found::Unverifiable);
     }
 
     #[test]

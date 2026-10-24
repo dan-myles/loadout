@@ -111,9 +111,9 @@ pub fn materialize(
                     sources.file(&instructions.source),
                 )
             });
-            if let Some(content) = read {
-                let content = Content::File(content.clone());
-                out.desired(item, Target::Path { path }, content);
+            if let Some(copy) = read {
+                let copy = Content::File(copy.clone());
+                out.desired(item, Target::Path { path }, copy);
             }
         }
     }
@@ -260,8 +260,8 @@ fn destinations(agent: &Agent, context: &Context, loadout: &Path, needs_mcp: boo
     }
 }
 
-/// OpenCode reads `opencode.jsonc` as well as `opencode.json`; loadout writes the one the user
-/// already keeps. The other name is statted only after its own reserved check passes.
+/// The opencode adapter reads `opencode.jsonc` as well as `opencode.json`; loadout writes the one
+/// the user already keeps. The other name is statted only after its own reserved check passes.
 fn builtin_mcp(place: McpPlace, context: &Context, loadout: &Path, needs_mcp: bool) -> Mcp {
     let mut file = place.file.expand(context);
     let mut format = place.format;
