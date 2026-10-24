@@ -88,7 +88,7 @@ src/
   apply/                                                                    [U4]
   agents/                 adapter table, skills + instructions targets      [U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [U6]
-  programs/                                                                 [U7]
+  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries) [built, U7]
   sync/                   git clone/fetch, background service               [U8]
   release/                self-update                                       [U9]
 ```
@@ -701,7 +701,7 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   `GEMINI_HOME`, so user MCP and instructions don't reach it. Report double loading through
   `~/.claude` compat dirs. Doctor claims nothing about T3 profile settings it doesn't read.
 
-## 7. Programs (frozen, U7)
+## 7. Programs (built, U7)
 
 - **Selection.** Loadout uses the first manager the item declares that is available on the machine,
   in this OS order:
@@ -726,6 +726,55 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   Real installs are tested only in a disposable VM guest's actual `HOME` (section 4).
 - No direct downloads and no install scripts in v1. Loadout never installs a package manager itself;
   doctor names what is missing.
+
+### How U7 runs each manager (built)
+
+A manager is available when every tool it needs is on PATH (`context::which`); `install` runs the
+executable found there. Every subprocess gets its argv as an array (no shell), a null stdin, and
+`LC_ALL=C`, so nothing waits on a prompt and the not-found messages below are stable.
+
+| Manager | Needs | Installed-query (one per program) | Not installed when | Install |
+| --- | --- | --- | --- | --- |
+| `brew` | brew | `brew info --json=v2 --formula P` | `formulae[0].installed` is `[]` | `brew install --formula P` |
+| `cask` | brew | `brew info --json=v2 --cask P` | `casks[0].installed` is `null` | `brew install --cask P` |
+| `apt` | apt-get, dpkg-query | `dpkg-query -W -f '${db:Status-Status} ' P` | exit 1, or no status is `installed` | `apt-get install -y --no-upgrade P`, `DEBIAN_FRONTEND=noninteractive` |
+| `dnf` | dnf, rpm | `rpm -q P` | exit 1 with "is not installed" | `dnf install -y P` |
+| `pacman` | pacman | `pacman -Q P` | exit 1 with "was not found" | `pacman -S --needed --noconfirm P` |
+| `zypper` | zypper | `zypper --non-interactive --no-refresh search --installed-only --match-exact --type package P` | exit 104 | `zypper --non-interactive install P` |
+| `flatpak` | flatpak | `flatpak info P` (any installation) | exit 1 with "not installed" | `flatpak install --user --noninteractive P` |
+| `snap` | snap | `snap list P` | exit 1 with "no matching snaps installed" | `snap install P` |
+| `winget` | winget | `winget list --id P --exact` | `0x8A150014` | `winget install --id P --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --scope user\|machine` |
+| `scoop` | scoop | `scoop prefix APP` (`APP` is `P` after any `bucket/`) | exit 1 with "Could not find app path" | `scoop install P` |
+| `choco` | choco (2.x) | `choco list --exact P --limit-output` | no `P\|version` line, or exit 2 | `choco install P -y --no-progress`; 1641 and 3010 are success |
+| `npm`, `pnpm` | npm / pnpm | `ls --global --depth=0 --json P` | no `dependencies.P` (exit 0 or 1) | `npm install --global P` / `pnpm add --global P` |
+| `bun` | bun | `bun pm ls --global` | no `── P@…` line | `bun add --global P` |
+| `cargo` | cargo | `cargo install --list` | no `P v…:` line | `cargo install P` |
+| `uv` | uv | `uv tool list` | no `P v…` line (PEP 503 names) | `uv tool install P` |
+| `pipx` | pipx | `pipx list --json` | no `venvs` entry (PEP 503 names) | `pipx install P` |
+| `go` | go | `go env GOBIN GOPATH`, then `go version -m BIN` | `BIN` (from `GOBIN` or `GOPATH/bin`) is absent | `go install P@latest` |
+
+- **Installed needs positive evidence.** Every row's other outcomes (an unexpected exit code,
+  unreadable JSON, a missing tool) are `programs::Error::Detect`, so a broken or locked manager is
+  never read as "installed", and `steps` fails before any write. A Go binary at `BIN` built from a
+  different package is an error, never overwritten.
+- **Package ids are passed as one exact argument.** `steps` refuses, before any subprocess, an id
+  that is empty, starts with `-`, has a character outside letters, digits, and `@ / . _ + : ~ -`,
+  or pins a version (`name@1.2` for npm, pnpm, bun; any `@` for cargo, uv, pipx, go). Go is the
+  one manager given `@latest`, because `go install` requires a version.
+- **Scope.** `apt`, `dnf`, `pacman`, `zypper`, `snap`, and `choco` are system scope. A missing
+  winget package is user scope when `winget show --id P --exact --scope user` finds an installer,
+  and machine scope when it returns `0x8A150010` (no applicable installer). Everything else is
+  user scope. `install(step, false)` refuses a system-scope step with `Error::NeedsElevation`
+  before any subprocess. With `elevated`, Unix runs `sudo -- [env K=V] TOOL …` (or the tool
+  directly as root), and an absent `sudo` is `Error::NoSudo`. Windows runs the tool directly.
+  User-scope managers are never elevated.
+- **Verified.** After the manager exits with success, `install` runs the installed-query again; a
+  success that left the program missing is `Error::NotInstalled`.
+- **Doctor** (`programs::checks`) adds `programs` (this OS's managers grouped as per user, with
+  `--elevated`, per package, and not on PATH; a warning when none is available), `elevation` on
+  macOS and Linux when a system-scope manager is present (sudo found, root, or a warning), and
+  `flatpak` (its per-user remotes; a warning when there is none). Under isolation it only looks on
+  PATH and runs no manager.
 
 ## 8. Updates (frozen, U8 + U9)
 
@@ -852,10 +901,17 @@ pub fn write(file: &Path, format: McpFormat, pointer: &str, set: &BTreeMap<Strin
 pub fn materialize(resolved: &Resolved, facts: &Facts, context: &Context) -> Result<(Vec<Desired>, Vec<Action /* unsupported */>), agents::Error>;
 pub fn checks(context: &Context) -> Vec<Check>;
 
-// programs (U7)
+// programs (U7, built)
+pub struct Step { pub program: String, pub state: State }       // Step::needs_elevation(): Missing with Scope::System
+pub enum State { Installed(Package), Missing { package: Package, scope: Scope }, Unsupported(String), Blocked(String) }
+pub struct Package { pub manager: Manager, pub id: String, pub executable: PathBuf }   // the selected manager and its exact id
+pub enum Scope { User, System }
+pub const ISOLATED: &str;                                       // the Blocked reason under LOADOUT_HOME
 pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts, context: &Context) -> Result<Vec<Step>, programs::Error>; // every step blocked when context.isolated
-pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;
+pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;   // Missing steps only; re-queries after
 pub fn checks(context: &Context) -> Vec<Check>;
+// plan::build: Installed -> unchanged (prior Installed); Missing -> install (prior Absent), or blocked when it
+// needs elevation the run lacks; Unsupported and Blocked carry their reason. Order follows `programs` (by id).
 
 // state (U3)
 impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; }

@@ -7,5 +7,6 @@ pub mod machine;
 pub mod manifest;
 pub mod plan;
 pub mod platform;
+pub mod programs;
 pub mod reserved;
 pub mod resolve;
