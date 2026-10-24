@@ -10,7 +10,7 @@ mod run;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,14 @@ pub enum Error {
     RollbackBlocked { run: String, targets: Vec<String> },
     #[error("the backup of {target} in run {run} doesn't match what the run recorded")]
     BackupCorrupt { run: String, target: String },
+    #[error(
+        "the lock is for the state dir {locked}, not {state}; take the lock of the state dir the run writes"
+    )]
+    WrongLock { locked: PathBuf, state: PathBuf },
+    #[error(
+        "{path} is not under the home dir, the config dirs, or an agent dir override, where loadout's targets live"
+    )]
+    OutsideRoots { path: PathBuf },
 }
 
 impl Error {
@@ -144,6 +152,21 @@ impl State {
         }
         let mut records = BTreeMap::new();
         for record in file.records {
+            let problem = if !target_shape(&record.target) {
+                Some("records a target that is not an absolute clean path")
+            } else if !valid_sha(&record.sha256) {
+                Some("records an invalid hash")
+            } else if !journal::is_run_id(&record.run) {
+                Some("records an invalid run id")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                return Err(Error::Invalid {
+                    path,
+                    message: format!("{problem} ({})", label(&record.target)),
+                });
+            }
             if records.insert(record.target.clone(), record).is_some() {
                 return Err(Error::Invalid {
                     path,
@@ -170,7 +193,7 @@ impl State {
     }
 
     fn save(&self, context: &Context) -> Result<(), Error> {
-        let path = context.state.join(STATE_FILE);
+        let path = disk::state_root(context)?.join(STATE_FILE);
         let file = StateFile {
             version: VERSION,
             records: self.records.values().cloned().collect(),
@@ -179,20 +202,21 @@ impl State {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        disk::private_dir(&context.state)?;
         disk::save(&path, &bytes)
     }
 }
 
-/// Held for one plan and apply, or one rollback. Dropping it releases the lock.
+/// Held for one plan and apply, or one rollback. Dropping it releases the lock. It remembers
+/// the canonical state dir it locks, so it only admits runs on that state dir.
 #[derive(Debug)]
 pub struct Lock {
     _file: File,
+    state: PathBuf,
 }
 
 pub fn lock(context: &Context) -> Result<Lock, Error> {
-    disk::private_dir(&context.state)?;
-    let path = context.state.join(LOCK_FILE);
+    let state = disk::state_root(context)?;
+    let path = state.join(LOCK_FILE);
     if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.is_file()) {
         return Err(Error::Invalid {
             path,
@@ -207,7 +231,7 @@ pub fn lock(context: &Context) -> Result<Lock, Error> {
         .open(&path)
         .map_err(disk::io("open", &path))?;
     match file.try_lock() {
-        Ok(()) => Ok(Lock { _file: file }),
+        Ok(()) => Ok(Lock { _file: file, state }),
         Err(TryLockError::WouldBlock) => Err(Error::Locked { path }),
         Err(TryLockError::Error(source)) => Err(Error::Io {
             action: "lock",
@@ -295,7 +319,7 @@ fn tree_files(
 /// store, loadout's own state, or the active checkout (`loadout`) is never opened or hashed.
 /// A symlinked target is followed to the real file or folder.
 pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, Error> {
-    let path = path_of(target)?;
+    let path = check_target(context, target)?;
     check_reserved(context, loadout, path)?;
     Ok(observed(disk::read(&disk::real(path)?)?.as_ref()))
 }
@@ -319,6 +343,60 @@ fn path_of(target: &Target) -> Result<&Path, Error> {
             target: label(target),
         }),
     }
+}
+
+fn clean_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|part| !matches!(part, Component::CurDir | Component::ParentDir))
+}
+
+fn valid_sha(sha256: &str) -> bool {
+    sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_observed(observed: &Observed) -> bool {
+    match observed {
+        Observed::Absent => true,
+        Observed::Present { sha256 } => valid_sha(sha256),
+        Observed::Installed => false,
+    }
+}
+
+/// The file or folder a path or entry target names must be absolute and clean.
+fn target_shape(target: &Target) -> bool {
+    match target {
+        Target::Path { path } | Target::Entry { file: path, .. } => clean_absolute(path),
+        Target::Program { .. } => false,
+    }
+}
+
+/// Where loadout's targets may live: the bases `Context::expand` uses for `~/` and `{config}/`,
+/// the XDG config dir some agents use on every OS, and each agent dir override. These are the
+/// same roots the resolver and the agent adapters build targets from, so a target outside all
+/// of them never came from a loadout. The check is lexical: a symlink below a root may still
+/// lead elsewhere, and the write follows it (section 5).
+fn within_roots(context: &Context, path: &Path) -> bool {
+    [&context.home, &context.config, &context.xdg_config]
+        .into_iter()
+        .chain(context.agent_dirs.values())
+        .any(|root| path.starts_with(root))
+}
+
+/// The path of a file or tree target, after checking it is absolute, clean, and under a target
+/// root. Entries and programs are refused here, before any read.
+fn check_target<'a>(context: &Context, target: &'a Target) -> Result<&'a Path, Error> {
+    let path = path_of(target)?;
+    if !clean_absolute(path) || !within_roots(context, path) {
+        return Err(Error::OutsideRoots {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(path)
 }
 
 fn check_reserved(context: &Context, loadout: &Path, path: &Path) -> Result<(), Error> {

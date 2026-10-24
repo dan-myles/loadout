@@ -19,6 +19,12 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
             for target in &rolled_back.restored {
                 println!("  {}", state::label(target));
             }
+            for path in &rolled_back.leftovers {
+                eprintln!(
+                    "warning: left {} in place; it isn't verifiably this run's scratch",
+                    path.display()
+                );
+            }
             Ok(Exit::Success)
         }
         Err(error) if error.is_blocked() => {

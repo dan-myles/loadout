@@ -3,10 +3,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::disk::{self, Disk, Mode, Planned, Put};
+use super::disk::{self, Disk, Mode, Node, Planned, Put};
 use super::journal::{self, Backup, BackupKind, Entry, Journal, Status, Step};
 use super::{
-    Error, Lock, Record, State, check_reserved, digest, label, observed, path_of, tree_files,
+    Error, Lock, Record, State, check_reserved, clean_absolute, digest, label, observed, path_of,
+    tree_files, valid_observed, within_roots,
 };
 use crate::context::Context;
 use crate::plan::{Action, Change, Content, Observed, Plan, Target};
@@ -60,11 +61,29 @@ impl Run {
         state: &State,
         plan: &Plan,
     ) -> Result<Run, Error> {
+        let root = disk::state_root(context)?;
+        if root != lock.state {
+            return Err(Error::WrongLock {
+                locked: lock.state.clone(),
+                state: root,
+            });
+        }
         let mut index = BTreeMap::new();
         let mut entries = Vec::new();
         for action in &plan.actions {
             if !journaled(&action.change) || matches!(action.target, Target::Program { .. }) {
                 continue;
+            }
+            let (Target::Path { path } | Target::Entry { file: path, .. }) = &action.target else {
+                continue;
+            };
+            if !clean_absolute(path) || !within_roots(context, path) {
+                return Err(Error::OutsideRoots { path: path.clone() });
+            }
+            if !valid_observed(&action.prior) {
+                return Err(Error::InvalidContent {
+                    message: format!("{} has an invalid prior", label(&action.target)),
+                });
             }
             let position = entries.len();
             if index.insert(action.target.clone(), position).is_some() {
@@ -90,18 +109,18 @@ impl Run {
                 error: None,
             });
         }
-        let runs = context.state.join(journal::RUNS);
-        disk::private_dir(&runs)?;
+        let runs = disk::internal_dir(&root, &[journal::RUNS], true)?;
         let (id, started, dir) = loop {
             let (id, started) = journal::now();
-            let dir = runs.join(&id);
-            match fs::create_dir(&dir) {
-                Ok(()) => break (id, started, dir),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(disk::io("create", &dir)(error)),
+            match fs::symlink_metadata(runs.join(&id)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(disk::io("inspect", &runs.join(&id))(error)),
+                Ok(_) => continue,
             }
+            let dir = disk::internal_dir(&root, &[journal::RUNS, &id], true)?;
+            break (id, started, dir);
         };
-        disk::private_dir(&dir.join("backups"))?;
+        disk::internal_dir(&root, &[journal::RUNS, &id, "backups"], true)?;
         let journal = Journal::new(id, started, loadout.to_path_buf(), entries);
         journal.save(&dir)?;
         Ok(Run {
@@ -368,13 +387,19 @@ fn planned(content: &Content, current: Option<&Disk>) -> Result<Put, Error> {
 
 fn take_backup(run: &Path, relative: &str, current: &Disk) -> Result<Backup, Error> {
     let path = run.join(relative);
-    let private = |bytes: &[u8]| Planned {
-        bytes: bytes.to_vec(),
-        mode: Mode::Exact(0o600),
+    if fs::symlink_metadata(&path).is_ok() {
+        return Err(Error::Invalid {
+            path,
+            message: "a backup is already in this slot; loadout never overwrites one".to_owned(),
+        });
+    }
+    let exact = |node: &Node| Planned {
+        bytes: node.bytes.clone(),
+        mode: Mode::Exact(node.mode),
     };
     let backup = match current {
         Disk::File(node) => {
-            disk::put(&path, &Put::File(private(&node.bytes)), "backup", || Ok(()))?;
+            disk::put(&path, &Put::File(exact(node)), "backup", || Ok(()))?;
             Backup {
                 path: relative.to_owned(),
                 kind: BackupKind::File,
@@ -384,10 +409,13 @@ fn take_backup(run: &Path, relative: &str, current: &Disk) -> Result<Backup, Err
         }
         Disk::Tree { dirs, files } => {
             let put = Put::Tree {
-                dirs: dirs.keys().map(|key| (key.clone(), Some(0o700))).collect(),
+                dirs: dirs
+                    .iter()
+                    .map(|(key, mode)| (key.clone(), Some(*mode)))
+                    .collect(),
                 files: files
                     .iter()
-                    .map(|(key, node)| (key.clone(), private(&node.bytes)))
+                    .map(|(key, node)| (key.clone(), exact(node)))
                     .collect(),
             };
             disk::put(&path, &put, "backup", || Ok(()))?;

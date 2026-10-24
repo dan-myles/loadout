@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::disk::{self, io};
-use super::{Error, Record};
+use super::{Error, Record, clean_absolute, label, target_shape, valid_observed, valid_sha};
 use crate::plan::{Change, ItemRef, Observed, Target};
 
 pub(super) const FILE: &str = "journal.json";
@@ -114,13 +114,140 @@ impl Journal {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        if journal.version != VERSION {
-            return Err(Error::Invalid {
-                path,
-                message: format!("has version {}, expected {VERSION}", journal.version),
-            });
-        }
+        let folder = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        journal.validate(folder).map_err(|message| Error::Invalid {
+            path: path.clone(),
+            message,
+        })?;
         Ok(journal)
+    }
+
+    /// Checks everything rollback will act on before it reads or writes anything: the journal
+    /// names its own folder, every target and created folder is an absolute clean path, created
+    /// folders form a chain of ancestors of their target, hashes are well formed, each step is
+    /// consistent with its change and result, and every backup sits in its own slot with a
+    /// plain tree layout. This catches a malformed or tampered journal; it can't authenticate
+    /// one, because the state dir's owner can rewrite any of it.
+    fn validate(&self, folder: &str) -> Result<(), String> {
+        if self.version != VERSION {
+            return Err(format!("has version {}, expected {VERSION}", self.version));
+        }
+        if self.run != folder || !is_run_id(&self.run) {
+            return Err(format!(
+                "names run {:?} but is in folder {folder:?}",
+                self.run
+            ));
+        }
+        if !clean_absolute(&self.loadout) {
+            return Err("names a checkout that is not an absolute clean path".to_owned());
+        }
+        let mut targets = BTreeSet::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            entry.validate(index).map_err(|problem| {
+                format!("entry {index} ({}): {problem}", label(&entry.target))
+            })?;
+            if !targets.insert(&entry.target) {
+                return Err(format!("names {} twice", label(&entry.target)));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Entry {
+    fn validate(&self, index: usize) -> Result<(), String> {
+        if !target_shape(&self.target) {
+            return Err("the target is not an absolute clean path".to_owned());
+        }
+        let writes = matches!(
+            self.change,
+            Change::Create
+                | Change::Update
+                | Change::Adopt
+                | Change::Replace
+                | Change::Drifted
+                | Change::Remove
+        );
+        if !writes {
+            return Err("its change never writes, so it can't be journaled".to_owned());
+        }
+        if !valid_observed(&self.prior) || !self.after.as_ref().is_none_or(valid_observed) {
+            return Err("has an invalid hash".to_owned());
+        }
+        if let Some(record) = &self.record
+            && (record.target != self.target
+                || !valid_sha(&record.sha256)
+                || !is_run_id(&record.run))
+        {
+            return Err("has an invalid ownership record".to_owned());
+        }
+        let removing = self.change == Change::Remove;
+        let consistent = match self.step {
+            Step::Pending => self.after.is_none(),
+            Step::Released => removing && self.after.is_none(),
+            Step::Started | Step::Done | Step::Failed => match &self.after {
+                None => false,
+                Some(after) => !removing || *after == Observed::Absent,
+            },
+        };
+        if !consistent {
+            return Err(format!(
+                "its step {:?} doesn't fit its change and result",
+                self.step
+            ));
+        }
+        match (&self.prior, &self.backup) {
+            (Observed::Present { .. }, Some(backup)) => backup.validate(index)?,
+            (Observed::Absent, None) => {}
+            _ => return Err("its backup slot doesn't match its prior".to_owned()),
+        }
+        if let Some(outermost) = self.created.first() {
+            let chain = self
+                .created
+                .windows(2)
+                .all(|pair| pair[1].parent() == Some(pair[0].as_path()));
+            let clean = self.created.iter().all(|dir| clean_absolute(dir));
+            if !chain || !clean || outermost.parent().is_none() {
+                return Err(
+                    "its created folders are not one chain of clean absolute paths".to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Backup {
+    fn validate(&self, index: usize) -> Result<(), String> {
+        if self.path != format!("backups/{index}") {
+            return Err(format!(
+                "its backup must be backups/{index}, not {:?}",
+                self.path
+            ));
+        }
+        if self
+            .modes
+            .values()
+            .chain(self.dirs.values())
+            .any(|mode| *mode > 0o777)
+        {
+            return Err("its backup has a mode outside 0o777".to_owned());
+        }
+        match self.kind {
+            BackupKind::Pending => Ok(()),
+            BackupKind::File => {
+                if self.dirs.is_empty() && self.modes.keys().eq([""].iter().copied()) {
+                    Ok(())
+                } else {
+                    Err("its file backup lists folders or other files".to_owned())
+                }
+            }
+            BackupKind::Tree => disk::check_tree(&self.dirs, &self.modes)
+                .map_err(|error| format!("its tree backup: {error}")),
+        }
     }
 }
 

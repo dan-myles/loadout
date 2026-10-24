@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::Error;
 use super::hash::{self, Blob};
+use crate::context::Context;
 
 /// What a path target holds on disk. Modes are the Unix permission bits (`0o777`), and always
 /// 0 on Windows, where loadout ignores them.
@@ -61,6 +62,8 @@ pub(super) struct Planned {
     pub(super) mode: Mode,
 }
 
+/// Content to put at a target. Tree keys are plain `/`-separated relative paths (`tree_key`);
+/// `dirs` holds every folder, `""` for the root, with its exact mode or `None` for the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Put {
     File(Planned),
@@ -77,6 +80,10 @@ pub(super) fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) ->
         path,
         source,
     }
+}
+
+fn already_exists(error: &Error) -> bool {
+    matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
 }
 
 /// Applies the mode rule in architecture section 5. Setuid, setgid, and sticky bits are dropped.
@@ -197,6 +204,26 @@ pub(super) fn tree_key(path: &Path) -> Result<String, Error> {
     }
 }
 
+/// True when `key` is already in the form `tree_key` produces, so joining it under a root can
+/// never leave that root: no `..`, `.`, root, drive, or Windows separator.
+pub(super) fn plain_key(key: &str) -> bool {
+    tree_key(Path::new(key)).is_ok_and(|normal| normal == key)
+}
+
+fn join_key(root: &Path, key: &str) -> Result<PathBuf, Error> {
+    if key.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    if !plain_key(key) {
+        return Err(Error::InvalidContent {
+            message: format!("{key:?} is not a plain relative path"),
+        });
+    }
+    Ok(key
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part)))
+}
+
 /// Names of loadout's scratch siblings: `.<name>.loadout-<tag>.tmp` and `.old`.
 pub(super) fn scratch(real: &Path, tag: &str, suffix: &str) -> Result<PathBuf, Error> {
     let name = real
@@ -219,6 +246,7 @@ pub(super) fn missing_dirs(dir: &Path) -> Vec<PathBuf> {
     missing
 }
 
+/// Deletes a scratch path this process just created, or one rollback has verified.
 pub(super) fn remove_scratch(path: &Path) -> Result<(), Error> {
     let result = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
@@ -229,10 +257,24 @@ pub(super) fn remove_scratch(path: &Path) -> Result<(), Error> {
     result.map_err(io("remove", path))
 }
 
-/// Writes `content` at `real`, replacing whatever is there, so that each step is atomic:
-/// the content is built in a scratch sibling and fsynced, `verify` runs last, and a rename puts it
-/// in place. A file over a file is one rename. Anything involving a folder moves the old one
-/// aside first and moves it back if the second rename fails.
+/// A scratch name that is already taken belongs to something loadout can't vouch for (a crashed
+/// run that rollback hasn't verified, or a planted file), so it is never deleted or overwritten.
+fn vacant(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io("inspect", path)(error)),
+        Ok(_) => Err(Error::Invalid {
+            path: path.to_path_buf(),
+            message: "already exists; loadout won't overwrite or delete what it can't verify"
+                .to_owned(),
+        }),
+    }
+}
+
+/// Writes `content` at `real`, replacing whatever is there, so that each step is atomic: the
+/// content is staged privately in a scratch sibling and fsynced, gets its final modes, `verify`
+/// runs last, and a rename puts it in place. A file over a file is one rename. Anything
+/// involving a folder moves the old one aside first and moves it back if the second rename fails.
 pub(super) fn put(
     real: &Path,
     content: &Put,
@@ -242,18 +284,24 @@ pub(super) fn put(
     let parent = real.parent().ok_or_else(|| Error::InvalidContent {
         message: format!("{} has no parent folder", real.display()),
     })?;
+    let missing = missing_dirs(parent);
     fs::create_dir_all(parent).map_err(io("create", parent))?;
+    for dir in &missing {
+        sync_parent(dir)?;
+    }
     let temp = scratch(real, tag, "tmp")?;
-    remove_scratch(&temp)?;
+    vacant(&temp)?;
     let built = match content {
         Put::File(planned) => write_file(&temp, planned),
         Put::Tree { dirs, files } => write_tree(&temp, dirs, files),
     };
-    if let Err(error) = built.and_then(|()| verify()) {
-        remove_scratch(&temp)?;
+    if let Err(error) = built {
+        if !already_exists(&error) {
+            remove_scratch(&temp)?;
+        }
         return Err(error);
     }
-    if let Err(error) = swap(real, &temp, content, tag) {
+    if let Err(error) = verify().and_then(|()| swap(real, &temp, content, tag)) {
         remove_scratch(&temp)?;
         return Err(error);
     }
@@ -267,15 +315,15 @@ fn swap(real: &Path, temp: &Path, content: &Put, tag: &str) -> Result<(), Error>
     if simple {
         return fs::rename(temp, real).map_err(io("replace", real));
     }
-    let old = scratch(real, tag, "old")?;
-    remove_scratch(&old)?;
-    if existing.is_some() {
-        fs::rename(real, &old).map_err(io("move aside", real))?;
+    if existing.is_none() {
+        return fs::rename(temp, real).map_err(io("replace", real));
     }
+    let old = scratch(real, tag, "old")?;
+    vacant(&old)?;
+    fs::rename(real, &old).map_err(io("move aside", real))?;
+    sync_parent(real)?;
     if let Err(error) = fs::rename(temp, real) {
-        if existing.is_some() {
-            fs::rename(&old, real).map_err(io("move back", real))?;
-        }
+        fs::rename(&old, real).map_err(io("move back", real))?;
         return Err(io("replace", real)(error));
     }
     remove_scratch(&old)
@@ -290,8 +338,9 @@ pub(super) fn remove(real: &Path, tag: &str) -> Result<(), Error> {
     };
     if metadata.is_dir() {
         let old = scratch(real, tag, "old")?;
-        remove_scratch(&old)?;
+        vacant(&old)?;
         fs::rename(real, &old).map_err(io("move aside", real))?;
+        sync_parent(real)?;
         remove_scratch(&old)?;
     } else {
         fs::remove_file(real).map_err(io("remove", real))?;
@@ -299,34 +348,68 @@ pub(super) fn remove(real: &Path, tag: &str) -> Result<(), Error> {
     sync_parent(real)
 }
 
-fn write_file(path: &Path, planned: &Planned) -> Result<(), Error> {
+/// Creates `path` and writes its bytes while only the owner can read it. The file is created
+/// empty with `0o666`, so the kernel applies the umask and its mode is the process default for
+/// a new file; it is made `0o600` before the first byte. Returns the final mode to apply.
+fn stage_file(path: &Path, planned: &Planned) -> Result<(File, u32), Error> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o666);
     let mut file = options.open(path).map_err(io("create", path))?;
+    let default = mode_of(&file.metadata().map_err(io("inspect", path))?);
+    #[cfg(unix)]
+    chmod_file(&file, path, 0o600)?;
     file.write_all(&planned.bytes).map_err(io("write", path))?;
-    set_mode(&file, path, planned.mode)?;
+    file.sync_all().map_err(io("sync", path))?;
+    let bits = match planned.mode {
+        Mode::Exact(bits) => bits & 0o777,
+        Mode::Executable { base, executable } => x_rule(base.unwrap_or(default), executable),
+    };
+    Ok((file, bits))
+}
+
+fn write_file(path: &Path, planned: &Planned) -> Result<(), Error> {
+    let (file, bits) = stage_file(path, planned)?;
+    #[cfg(unix)]
+    chmod_file(&file, path, bits)?;
+    #[cfg(not(unix))]
+    let _ = bits;
     file.sync_all().map_err(io("sync", path))
 }
 
-fn set_mode(file: &File, path: &Path, mode: Mode) -> Result<(), Error> {
-    let bits = match mode {
-        Mode::Exact(bits) => bits & 0o777,
-        Mode::Executable { base, executable } => {
-            let base = match base {
-                Some(base) => base,
-                None => mode_of(&file.metadata().map_err(io("inspect", path))?),
-            };
-            x_rule(base, executable)
-        }
-    };
+#[cfg(unix)]
+fn chmod_file(file: &File, path: &Path, bits: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(bits))
+        .map_err(io("set the mode of", path))
+}
+
+/// Builds a tree under `root` with every folder `0o700` while files are written, so nothing in
+/// it is reachable by others before it is complete. Files get their final modes as they are
+/// written. Returns the folders' final modes, deepest first, for `finish_tree`.
+fn stage_tree(
+    root: &Path,
+    dirs: &BTreeMap<String, Option<u32>>,
+    files: &BTreeMap<String, Planned>,
+) -> Result<Vec<(PathBuf, u32)>, Error> {
+    fs::create_dir(root).map_err(io("create", root))?;
+    let default = mode_of(&fs::symlink_metadata(root).map_err(io("inspect", root))?);
     #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(bits))
-        .map_err(io("set the mode of", path))?;
-    #[cfg(not(unix))]
-    let _ = bits;
-    Ok(())
+    chmod_dir(root, 0o700)?;
+    let mut modes = Vec::new();
+    for (key, mode) in dirs {
+        let dir = join_key(root, key)?;
+        if !key.is_empty() {
+            create_private_dir(&dir)?;
+        }
+        modes.push((dir, mode.map_or(default, |mode| mode & 0o777)));
+    }
+    for (key, planned) in files {
+        write_file(&join_key(root, key)?, planned)?;
+    }
+    modes.reverse();
+    Ok(modes)
 }
 
 fn write_tree(
@@ -334,55 +417,92 @@ fn write_tree(
     dirs: &BTreeMap<String, Option<u32>>,
     files: &BTreeMap<String, Planned>,
 ) -> Result<(), Error> {
-    let join = |relative: &str| {
-        relative
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .fold(root.to_path_buf(), |path, part| path.join(part))
+    check_tree(dirs, files)?;
+    let modes = stage_tree(root, dirs, files)?;
+    finish_tree(&modes)
+}
+
+/// Checks a tree's shape before anything is created: plain keys only, a root, every parent
+/// folder listed, and no path that is both a file and a folder.
+pub(super) fn check_tree<D, F>(
+    dirs: &BTreeMap<String, D>,
+    files: &BTreeMap<String, F>,
+) -> Result<(), Error> {
+    let parent = |key: &str| key.rsplit_once('/').map_or("", |(head, _)| head).to_owned();
+    let problem = if !dirs.contains_key("") {
+        Some("has no root folder".to_owned())
+    } else if let Some(key) = dirs
+        .keys()
+        .filter(|key| !key.is_empty())
+        .chain(files.keys())
+        .find(|key| !plain_key(key))
+    {
+        Some(format!("{key:?} is not a plain relative path"))
+    } else if let Some(key) = files.keys().find(|key| dirs.contains_key(*key)) {
+        Some(format!("{key} is both a file and a folder"))
+    } else {
+        dirs.keys()
+            .filter(|key| !key.is_empty())
+            .chain(files.keys())
+            .find(|key| !dirs.contains_key(&parent(key)))
+            .map(|key| format!("{key} has no listed parent folder"))
     };
-    fs::create_dir(root).map_err(io("create", root))?;
-    for relative in dirs.keys().filter(|relative| !relative.is_empty()) {
-        let dir = join(relative);
-        fs::create_dir_all(&dir).map_err(io("create", &dir))?;
+    match problem {
+        Some(problem) => Err(Error::InvalidContent {
+            message: format!("a tree {problem}"),
+        }),
+        None => Ok(()),
     }
-    for (relative, planned) in files {
-        let path = join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(io("create", parent))?;
-        }
-        write_file(&path, planned)?;
-    }
-    #[cfg(unix)]
-    for (relative, mode) in dirs.iter().rev() {
-        if let Some(mode) = mode {
-            set_dir_mode(&join(relative), *mode)?;
-        }
+}
+
+/// Applies the folders' final modes, deepest first, then makes their entries durable.
+fn finish_tree(modes: &[(PathBuf, u32)]) -> Result<(), Error> {
+    for (dir, mode) in modes {
+        #[cfg(unix)]
+        chmod_dir(dir, *mode)?;
+        #[cfg(not(unix))]
+        let _ = mode;
+        sync_dir(dir)?;
     }
     Ok(())
 }
 
+fn create_private_dir(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    let created =
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(path);
+    #[cfg(not(unix))]
+    let created = fs::create_dir(path);
+    created.map_err(io("create", path))
+}
+
 #[cfg(unix)]
-fn set_dir_mode(path: &Path, mode: u32) -> Result<(), Error> {
+fn chmod_dir(path: &Path, mode: u32) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
         .map_err(io("set the mode of", path))
 }
 
-/// Makes a rename in `path`'s folder durable. Windows has no folder fsync; its rename is the
-/// boundary there.
-fn sync_parent(path: &Path) -> Result<(), Error> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
+/// Makes the entries of `dir` durable. Windows has no folder fsync; its renames are the
+/// durability boundary there.
+fn sync_dir(dir: &Path) -> Result<(), Error> {
     if cfg!(unix) {
-        File::open(parent)
+        File::open(dir)
             .and_then(|dir| dir.sync_all())
-            .map_err(io("sync", parent))?;
+            .map_err(io("sync", dir))?;
     }
     Ok(())
 }
 
+fn sync_parent(path: &Path) -> Result<(), Error> {
+    match path.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
+}
+
 /// Writes one of loadout's own files (state, journal) atomically, readable only by the user.
+/// Its folder must already have passed `internal_dir`.
 pub(super) fn save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let temp = path.with_extension("tmp");
     remove_scratch(&temp)?;
@@ -397,17 +517,72 @@ pub(super) fn save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     sync_parent(path)
 }
 
-/// Creates one of loadout's own folders, private to the user on Unix.
-pub(super) fn private_dir(path: &Path) -> Result<(), Error> {
+/// The canonical state dir, created `0o700` if missing. The configured path may itself be a
+/// link; everything loadout writes below it is checked against this canonical form.
+pub(super) fn state_root(context: &Context) -> Result<PathBuf, Error> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path).map_err(io("create", path))
+    builder
+        .create(&context.state)
+        .map_err(io("create", &context.state))?;
+    let root = context
+        .state
+        .canonicalize()
+        .map_err(io("resolve", &context.state))?;
+    if !fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(Error::Invalid {
+            path: context.state.clone(),
+            message: "must be a folder".to_owned(),
+        });
+    }
+    Ok(root)
 }
 
-/// Reads one of loadout's own files, only after checking that it resolves to a regular file
-/// inside `within`, so a link planted in the state dir can't make loadout read anything else.
+/// A folder of loadout's own below the canonical state dir. Each part must be a real folder,
+/// never a link, junction, or special file, so no internal write can be redirected outside the
+/// state dir. With `create`, missing parts are made `0o700` and their entries fsynced.
+pub(super) fn internal_dir(root: &Path, parts: &[&str], create: bool) -> Result<PathBuf, Error> {
+    let mut path = root.to_path_buf();
+    for part in parts {
+        if !plain_key(part) || part.contains('/') {
+            return Err(Error::Invalid {
+                path: path.join(part),
+                message: "is not a plain folder name".to_owned(),
+            });
+        }
+        path.push(part);
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                create_private_dir(&path)?;
+                sync_parent(&path)?;
+                fs::symlink_metadata(&path).map_err(io("inspect", &path))?
+            }
+            Err(error) => return Err(io("inspect", &path)(error)),
+            Ok(metadata) => metadata,
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::Invalid {
+                path,
+                message: "must be a real folder inside the state dir, not a link or a file"
+                    .to_owned(),
+            });
+        }
+    }
+    let canonical = path.canonicalize().map_err(io("resolve", &path))?;
+    if canonical != path {
+        return Err(Error::Invalid {
+            path,
+            message: format!("resolves to {}, outside the state dir", canonical.display()),
+        });
+    }
+    Ok(path)
+}
+
+/// Reads one of loadout's own files, only after checking that it is a regular file (not a link)
+/// that resolves inside `within`, so nothing planted in the state dir can make loadout read
+/// anything else.
 pub(super) fn read_internal(path: &Path, within: &Path) -> Result<Option<Vec<u8>>, Error> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -455,5 +630,122 @@ mod tests {
         for bad in ["", "/etc/passwd", "../x", "a/../b", "./a"] {
             assert!(tree_key(Path::new(bad)).is_err(), "{bad:?}");
         }
+        for bad in ["../../.codex", "a//b", "a/", "/abs", "a/./b"] {
+            assert!(!plain_key(bad), "{bad:?}");
+        }
+        for drive in ["C:x", "C:/x", "a\\b"] {
+            assert_eq!(plain_key(drive), !cfg!(windows), "{drive:?}");
+        }
+        assert!(plain_key("bin/run.sh"));
+    }
+
+    #[test]
+    fn a_tree_key_that_climbs_out_is_refused_before_anything_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("stage");
+        let dirs = BTreeMap::from([
+            (String::new(), None),
+            ("../../escape".to_owned(), Some(0o777)),
+        ]);
+        let error = write_tree(&root, &dirs, &BTreeMap::new()).unwrap_err();
+        assert!(matches!(error, Error::InvalidContent { .. }), "{error}");
+        assert!(!root.exists(), "nothing was created");
+        assert!(!dir.path().join("escape").exists());
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn put_never_reuses_a_scratch_name_that_is_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("target");
+        let temp = scratch(&real, "t", "tmp").unwrap();
+        fs::write(&temp, "someone else's").unwrap();
+        let content = Put::File(Planned {
+            bytes: b"new".to_vec(),
+            mode: Mode::Executable {
+                base: None,
+                executable: false,
+            },
+        });
+        assert!(put(&real, &content, "t", || Ok(())).is_err());
+        assert_eq!(fs::read_to_string(&temp).unwrap(), "someone else's");
+        assert!(!real.exists());
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_bytes_are_private_until_the_final_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".scratch");
+        let planned = Planned {
+            bytes: b"secret-ish".to_vec(),
+            mode: Mode::Exact(0o644),
+        };
+        let (file, bits) = stage_file(&path, &planned).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"secret-ish",
+            "the bytes are on disk"
+        );
+        assert_eq!(mode(&path), 0o600, "while the bytes are on disk");
+        assert_eq!(bits, 0o644);
+        chmod_file(&file, &path, bits).unwrap();
+        assert_eq!(mode(&path), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_folders_are_private_until_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".stage");
+        let dirs = BTreeMap::from([(String::new(), Some(0o755)), ("bin".to_owned(), None)]);
+        let files = BTreeMap::from([(
+            "bin/run.sh".to_owned(),
+            Planned {
+                bytes: b"#!/bin/sh\n".to_vec(),
+                mode: Mode::Exact(0o755),
+            },
+        )]);
+        let modes = stage_tree(&root, &dirs, &files).unwrap();
+        assert_eq!(fs::read(root.join("bin/run.sh")).unwrap(), b"#!/bin/sh\n");
+        assert_eq!(mode(&root), 0o700, "root while files are written");
+        assert_eq!(
+            mode(&root.join("bin")),
+            0o700,
+            "subfolder while files are written"
+        );
+        finish_tree(&modes).unwrap();
+        let probe = dir.path().join("probe");
+        fs::create_dir(&probe).unwrap();
+        assert_eq!(mode(&root), 0o755);
+        assert_eq!(mode(&root.join("bin/run.sh")), 0o755);
+        assert_eq!(
+            mode(&root.join("bin")),
+            mode(&probe),
+            "the process default folder mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_folders_refuse_links_out_of_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("runs")).unwrap();
+        assert!(internal_dir(&root, &["runs"], true).is_err());
+        assert!(internal_dir(&root, &["..", "x"], true).is_err());
+        assert!(internal_dir(&root, &["other", "deep"], true).is_ok());
+        assert_eq!(mode(&root.join("other")), 0o700);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 }

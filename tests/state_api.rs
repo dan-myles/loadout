@@ -24,16 +24,9 @@ impl Machine {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
-        let state = root.join("state");
-        let loadout = root.join("checkout");
-        fs::create_dir_all(&home).unwrap();
+        let loadout = home.join("checkout");
         fs::create_dir_all(&loadout).unwrap();
-        let vars = BTreeMap::from([
-            ("LOADOUT_HOME", home.clone().into_os_string()),
-            ("LOADOUT_STATE_DIR", state.into_os_string()),
-        ]);
-        let context =
-            Context::resolve(Os::current().unwrap(), |name| vars.get(name).cloned(), None).unwrap();
+        let context = isolated(&home, &home.join(".local/state/loadout"));
         Self {
             _dir: dir,
             home,
@@ -44,6 +37,18 @@ impl Machine {
 
     fn path(&self, relative: &str) -> PathBuf {
         self.home.join(relative)
+    }
+
+    fn run_dir(&self, run: &str) -> PathBuf {
+        self.context.state.join("runs").join(run)
+    }
+
+    fn edit_journal(&self, run: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = self.run_dir(run).join("journal.json");
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut journal);
+        fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
     }
 
     fn observe(&self, path: &Path) -> Observed {
@@ -110,6 +115,30 @@ impl Machine {
 
     fn rollback(&self, run: Option<&str>) -> Result<state::RolledBack, Error> {
         state::rollback(&self.context, run)
+    }
+}
+
+fn isolated(home: &Path, state: &Path) -> Context {
+    let vars = BTreeMap::from([
+        ("LOADOUT_HOME", home.as_os_str().to_owned()),
+        ("LOADOUT_STATE_DIR", state.as_os_str().to_owned()),
+    ]);
+    Context::resolve(Os::current().unwrap(), |name| vars.get(name).cloned(), None).unwrap()
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap()
+}
+
+/// Writes the skill that `skill(script)` describes directly to disk, with the same modes.
+fn write_skill(dir: &Path, script: &str) {
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    fs::write(dir.join("SKILL.md"), "# s\n").unwrap();
+    fs::write(dir.join("bin/run.sh"), script).unwrap();
+    #[cfg(unix)]
+    {
+        set_mode(&dir.join("SKILL.md"), 0o644);
+        set_mode(&dir.join("bin/run.sh"), 0o755);
     }
 }
 
@@ -772,4 +801,399 @@ fn the_journal_lists_every_writing_action_before_the_first_write() {
     assert_eq!(entries[0]["backup"]["path"], "backups/0");
     assert_eq!(entries[0]["prior"]["sha256"], sha(&action.prior));
     assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+}
+
+fn two_target_run(machine: &Machine) -> (PathBuf, PathBuf, String) {
+    let a = machine.path(".a");
+    let b = machine.path(".b");
+    fs::write(&a, "a-before").unwrap();
+    fs::write(&b, "b-before").unwrap();
+    let contents = [file("a-after", false), file("b-after", false)];
+    let actions = vec![
+        machine.action(&a, contents[0].clone()),
+        machine.action(&b, contents[1].clone()),
+    ];
+    let mut run = machine.begin(actions.clone());
+    for (action, content) in actions.iter().zip(&contents) {
+        run.write(action, content).unwrap();
+    }
+    let id = run.id().to_owned();
+    let mut state = machine.state();
+    run.finish(&mut state).unwrap();
+    (a, b, id)
+}
+
+#[test]
+fn rollback_checks_every_backup_before_restoring_anything() {
+    let machine = Machine::new();
+    let (a, b, id) = two_target_run(&machine);
+    fs::write(machine.run_dir(&id).join("backups/0"), "tampered").unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::BackupCorrupt { .. }), "{error}");
+    assert_eq!(read(&a), "a-after");
+    assert_eq!(
+        read(&b),
+        "b-after",
+        "B comes first in rollback order and stays untouched"
+    );
+}
+
+#[test]
+fn rollback_reads_the_state_file_before_restoring_anything() {
+    let machine = Machine::new();
+    let (a, b, _) = two_target_run(&machine);
+    fs::write(machine.context.state.join("state.json"), "not json").unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert_eq!(
+        (read(&a), read(&b)),
+        ("a-after".to_owned(), "b-after".to_owned())
+    );
+}
+
+#[test]
+fn a_rollback_that_stopped_halfway_finishes_on_the_next_try() {
+    let machine = Machine::new();
+    let (a, b, _) = two_target_run(&machine);
+    fs::write(&b, "b-before").unwrap();
+    let rolled = machine.rollback(None).unwrap();
+    assert_eq!(rolled.restored, vec![target(&a)]);
+    assert_eq!(
+        (read(&a), read(&b)),
+        ("a-before".to_owned(), "b-before".to_owned())
+    );
+}
+
+/// Recreates the moment between the two renames of a folder swap: the run moved the old tree
+/// to its `.old` scratch name and stopped before moving the new one in.
+fn stopped_swap(machine: &Machine, step: &str) -> (PathBuf, PathBuf, String) {
+    let dir = machine.path(".agents/skills/review");
+    machine.apply(&dir, &skill("#!/bin/sh\necho one\n"));
+    let run = machine.apply(&dir, &skill("#!/bin/sh\necho two\n"));
+    let old = dir.with_file_name(format!(".review.loadout-{run}-0.old"));
+    fs::remove_dir_all(&dir).unwrap();
+    write_skill(&old, "#!/bin/sh\necho one\n");
+    machine.edit_journal(&run, |journal| {
+        journal["status"] = json!("running");
+        journal["entries"][0]["step"] = json!(step);
+    });
+    (dir, old, run)
+}
+
+#[test]
+fn a_folder_swap_that_stopped_between_renames_is_rolled_back() {
+    for step in ["started", "failed"] {
+        let machine = Machine::new();
+        let (dir, old, _) = stopped_swap(&machine, step);
+        let rolled = machine.rollback(None).unwrap();
+        assert_eq!(rolled.restored, vec![target(&dir)], "{step}");
+        assert_eq!(
+            read(&dir.join("bin/run.sh")),
+            "#!/bin/sh\necho one\n",
+            "{step}"
+        );
+        assert!(!old.exists(), "the verified scratch is cleaned up ({step})");
+        assert!(rolled.leftovers.is_empty());
+    }
+}
+
+#[test]
+fn a_forged_scratch_folder_never_counts_as_the_run_s_own() {
+    let machine = Machine::new();
+    let (dir, old, _) = stopped_swap(&machine, "started");
+    fs::write(old.join("bin/run.sh"), "forged").unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
+    assert!(!dir.exists());
+    assert_eq!(
+        read(&old.join("bin/run.sh")),
+        "forged",
+        "never deleted on a guess"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_scratch_name_never_counts_as_the_run_s_own() {
+    let machine = Machine::new();
+    let (dir, old, _) = stopped_swap(&machine, "started");
+    let elsewhere = machine.path("elsewhere");
+    fs::rename(&old, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &old).unwrap();
+    assert!(matches!(
+        machine.rollback(None),
+        Err(Error::RollbackBlocked { .. })
+    ));
+    assert!(!dir.exists());
+    assert!(elsewhere.join("SKILL.md").exists());
+}
+
+#[test]
+fn unverifiable_scratch_is_reported_and_left_in_place() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    let run = machine.apply(&path, &file("x", false));
+    let stray = path.with_file_name(format!("..gitconfig.loadout-{run}-0.tmp"));
+    fs::write(&stray, "not the run's content").unwrap();
+    let rolled = machine.rollback(None).unwrap();
+    assert!(!path.exists());
+    assert_eq!(rolled.leftovers, vec![stray.clone()]);
+    assert_eq!(read(&stray), "not the run's content");
+}
+
+fn tree_run(machine: &Machine) -> (PathBuf, String) {
+    let dir = machine.path(".agents/skills/review");
+    write_skill(&dir, "#!/bin/sh\necho mine\n");
+    let run = machine.apply(&dir, &skill("#!/bin/sh\necho loadout\n"));
+    (dir, run)
+}
+
+#[test]
+fn a_journal_folder_key_that_climbs_out_is_refused_before_any_write() {
+    let machine = Machine::new();
+    let (dir, run) = tree_run(&machine);
+    machine.edit_journal(&run, |journal| {
+        journal["entries"][0]["backup"]["dirs"]["../../escape"] = json!(0o777);
+    });
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert!(!machine.path(".agents/escape").exists());
+    assert!(!machine.path("escape").exists());
+    assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho loadout\n");
+}
+
+#[test]
+fn journal_created_folders_must_lead_to_their_target() {
+    let machine = Machine::new();
+    let keep = machine.path("keep-me");
+    fs::create_dir(&keep).unwrap();
+    let path = machine.path(".config/tool/config");
+    let run = machine.apply(&path, &file("x", false));
+    machine.edit_journal(&run, |journal| {
+        journal["entries"][0]["created"] = json!([keep]);
+    });
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert!(keep.is_dir(), "an unrelated empty folder survives");
+    assert!(path.exists());
+}
+
+#[test]
+fn a_backup_must_come_from_its_own_slot_in_its_own_run() {
+    let machine = Machine::new();
+    let (dir, run) = tree_run(&machine);
+    let other = machine.apply(&machine.path(".other"), &file("o", false));
+    for path in [
+        "backups/1".to_owned(),
+        format!("../{other}/backups/0"),
+        "/etc/passwd".to_owned(),
+    ] {
+        machine.edit_journal(&run, |journal| {
+            journal["entries"][0]["backup"]["path"] = json!(path);
+        });
+        let error = machine.rollback(Some(&run)).unwrap_err();
+        assert!(matches!(error, Error::Invalid { .. }), "{path}: {error}");
+        assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho loadout\n");
+    }
+}
+
+#[test]
+fn journal_targets_outside_the_target_roots_are_refused() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    let run = machine.apply(&path, &file("x", false));
+    let outside = machine.home.parent().unwrap().join("outside");
+    fs::write(&outside, "x").unwrap();
+    machine.edit_journal(&run, |journal| {
+        journal["entries"][0]["target"]["path"] = json!(outside);
+    });
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::OutsideRoots { .. }), "{error}");
+    assert_eq!(
+        read(&outside),
+        "x",
+        "a file matching the run's result is still not deleted"
+    );
+}
+
+#[test]
+fn a_relative_checkout_or_target_in_the_journal_is_invalid() {
+    let machine = Machine::new();
+    let run = machine.apply(&machine.path(".gitconfig"), &file("x", false));
+    machine.edit_journal(&run, |journal| {
+        journal["loadout"] = json!("relative/checkout");
+    });
+    assert!(matches!(machine.rollback(None), Err(Error::Invalid { .. })));
+    machine.edit_journal(&run, |journal| {
+        journal["loadout"] = json!(machine.loadout);
+        journal["entries"][0]["target"]["path"] = json!("relative/.gitconfig");
+    });
+    assert!(matches!(machine.rollback(None), Err(Error::Invalid { .. })));
+}
+
+#[test]
+fn a_state_file_target_must_be_absolute_and_clean() {
+    let machine = Machine::new();
+    machine.apply(&machine.path(".gitconfig"), &file("x", false));
+    let path = machine.context.state.join("state.json");
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    file["records"][0]["target"]["path"] = json!("../escape");
+    fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    assert!(matches!(
+        State::load(&machine.context),
+        Err(Error::Invalid { .. })
+    ));
+}
+
+#[test]
+fn agent_dir_overrides_outside_home_are_supported_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let codex = root.join("opt/codex");
+    fs::create_dir_all(&home).unwrap();
+    let vars = BTreeMap::from([
+        ("CODEX_HOME", codex.as_os_str().to_owned()),
+        ("LOADOUT_STATE_DIR", home.join(".state").into_os_string()),
+    ]);
+    let context = Context::resolve(
+        Os::current().unwrap(),
+        |name| vars.get(name).cloned(),
+        Some(home.clone()),
+    )
+    .unwrap();
+    let checkout = home.join(".state/loadout");
+    let inside = target(&codex.join("AGENTS.md"));
+    let body = file("instructions", false);
+    let action = Action {
+        item: item(),
+        target: inside.clone(),
+        change: Change::Create,
+        prior: state::observe(&context, &checkout, &inside).unwrap(),
+        content: Some(body.clone()),
+    };
+    let lock = state::lock(&context).unwrap();
+    let mut state = State::load(&context).unwrap();
+    let plan = Plan {
+        actions: vec![action.clone()],
+    };
+    let mut run = Run::begin(&context, &checkout, lock, &state, &plan).unwrap();
+    run.write(&action, &body).unwrap();
+    run.finish(&mut state).unwrap();
+    assert_eq!(read(&codex.join("AGENTS.md")), "instructions");
+    state::rollback(&context, None).unwrap();
+    assert!(!codex.join("AGENTS.md").exists());
+
+    let outside = target(&root.join("opt/other/AGENTS.md"));
+    assert!(matches!(
+        state::observe(&context, &checkout, &outside),
+        Err(Error::OutsideRoots { .. })
+    ));
+}
+
+#[test]
+fn a_lock_only_admits_runs_on_its_own_state_dir() {
+    let a = Machine::new();
+    let b = Machine::new();
+    let held = state::lock(&b.context).unwrap();
+    let wrong = state::lock(&a.context).unwrap();
+    let error =
+        Run::begin(&b.context, &b.loadout, wrong, &b.state(), &Plan::default()).unwrap_err();
+    assert!(matches!(error, Error::WrongLock { .. }), "{error}");
+    assert!(!b.context.state.join("runs").exists());
+    drop(held);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lock_taken_through_an_alias_of_the_same_state_dir_is_accepted() {
+    let machine = Machine::new();
+    fs::create_dir_all(&machine.context.state).unwrap();
+    let alias = machine.path("state-alias");
+    std::os::unix::fs::symlink(&machine.context.state, &alias).unwrap();
+    let lock = state::lock(&isolated(&machine.home, &alias)).unwrap();
+    let run = Run::begin(
+        &machine.context,
+        &machine.loadout,
+        lock,
+        &machine.state(),
+        &Plan::default(),
+    );
+    assert!(run.is_ok(), "{:?}", run.err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_planted_runs_link_never_receives_a_journal() {
+    let machine = Machine::new();
+    fs::create_dir_all(&machine.context.state).unwrap();
+    let outside = machine.home.parent().unwrap().join("outside-runs");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, machine.context.state.join("runs")).unwrap();
+    let lock = state::lock(&machine.context).unwrap();
+    let error = Run::begin(
+        &machine.context,
+        &machine.loadout,
+        lock,
+        &machine.state(),
+        &Plan::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[test]
+fn an_xdg_config_home_outside_home_is_a_supported_target_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let xdg = root.join("xdg");
+    fs::create_dir_all(&home).unwrap();
+    let vars = BTreeMap::from([
+        ("XDG_CONFIG_HOME", xdg.as_os_str().to_owned()),
+        ("LOADOUT_STATE_DIR", home.join(".state").into_os_string()),
+    ]);
+    let context = Context::resolve(
+        Os::current().unwrap(),
+        |name| vars.get(name).cloned(),
+        Some(home.clone()),
+    )
+    .unwrap();
+    assert_eq!(context.xdg_config, xdg);
+    let checkout = home.join(".state/loadout");
+    let inside = target(&xdg.join("opencode/AGENTS.md"));
+    let body = file("rules", false);
+    let action = Action {
+        item: item(),
+        target: inside.clone(),
+        change: Change::Create,
+        prior: state::observe(&context, &checkout, &inside).unwrap(),
+        content: Some(body.clone()),
+    };
+    let lock = state::lock(&context).unwrap();
+    let mut state = State::load(&context).unwrap();
+    let plan = Plan {
+        actions: vec![action.clone()],
+    };
+    let mut run = Run::begin(&context, &checkout, lock, &state, &plan).unwrap();
+    run.write(&action, &body).unwrap();
+    run.finish(&mut state).unwrap();
+    assert_eq!(read(&xdg.join("opencode/AGENTS.md")), "rules");
+    state::rollback(&context, None).unwrap();
+    assert!(!xdg.join("opencode").exists());
+}
+
+#[test]
+fn a_backup_mode_changed_in_the_journal_alone_is_refused() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    fs::write(&path, "mine").unwrap();
+    let run = machine.apply(&path, &file("loadout's", false));
+    machine.edit_journal(&run, |journal| {
+        journal["entries"][0]["backup"]["modes"][""] = json!(0o666);
+    });
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert_eq!(read(&path), "loadout's");
 }
