@@ -133,24 +133,33 @@ script prints `rustc -vV` at the top of every build log. Two things are not pinn
 
 Verified locally on 2026-10-24 with a disposable std-only `loadout` fixture crate (not the real CLI):
 
-- `actionlint` 1.7.12 with shellcheck 0.11.0: 0 errors on both workflows.
-- Packaging unit tests: 5/5 pass (deterministic tar.gz and zip, fixed metadata, checksum format).
-- `x86_64-unknown-linux-musl`: built from two different checkout paths, giving the same binary SHA256
-  (`a996164…`) and the same archive SHA256 (`e4583e2…`).
+- `actionlint` 1.7.12 with shellcheck 0.11.0: 0 errors on both workflows and on `publish.sh`. The
+  new runner labels are accepted, and actionlint rejects unknown labels.
+- Release-script unit tests: 22/22 pass on Python 3.8.20, 3.9.25 and 3.10.12. They cover:
+  - deterministic tar.gz and zip, fixed metadata, checksum bytes
+  - the exact `--version` token and `--require-smoke`
+  - symlinked README/LICENSE rejection
+  - `publish.sh` against a fake `gh`: prerelease and stable create, draft reclassify, published
+    refusal
+
+  Each regression test was confirmed to fail against the code it fixes.
+- `x86_64-unknown-linux-musl`: built from two checkout paths, one containing spaces, with
+  `--require-smoke`. Same binary SHA256 (`a9961644…`) and same archive SHA256 (`6764a121…`).
 - Path remapping, checked with a `regex-syntax` dependency: a plain `cargo build` embeds 4 `~/.cargo`
-  paths. The script's build embeds none (they become `/cargo/registry/...`).
-- Linux VM (Ubuntu 24.04.5 x86_64, no Rust installed): `sha256sum -c` passed, the archive unpacked, the
-  static binary ran `--version`, and a tampered archive was rejected.
-- `aarch64-unknown-linux-musl`: cross-built with `rust-lld` and confirmed as a static AArch64 ELF.
-  Not executed.
-- Error paths: a tag/version mismatch, a missing `loadout` package, and a missing `Cargo.toml` each
-  exit 1 with a clear message.
+  paths. The script's build embeds none.
+- A `0.1.0-beta.1` fixture packages with `--expect-version 0.1.0-beta.1`, and `publish.sh` creates it
+  with `--prerelease --latest=false`. The `gh` binary was faked; no real release was created.
+- Linux VM slot 3 (Ubuntu 24.04.5 x86_64, no Rust installed): `sha256sum --check --strict` passed, the
+  archive unpacked, the static binary ran `--version`, and a tampered archive was rejected.
+- Error paths: a tag/version mismatch, a missing `loadout` package, a missing `Cargo.toml`, a
+  symlinked README, and `--require-smoke` on a target the host can't run each exit 1 with a clear
+  message.
 
 Pending until the real crate is merged and Actions runs:
 
-- Every job on real GitHub runners: macOS and Windows builds, `/Brepro` behaviour, and the Windows
-  zip and smoke test.
-- Clippy, tests, and the `--version` smoke test against the real CLI.
-- The tag-push draft release path. It needs a tag, which is the maintainer's call.
-- Executing the aarch64 Linux, aarch64 Windows, and x86_64 macOS binaries. That needs native
-  hardware or VMs.
+- Every Rust job on the six real runners: clippy, tests, native builds, `/Brepro`, the Windows zip,
+  and the `--version` smoke test against the real CLI. The 3.8 packaging-test job's first real run
+  is also pending.
+- The tag-push draft release path against real GitHub. It needs a tag, which is the maintainer's call.
+- VM execution of the real archive. Only Linux x86_64 VMs are available here. The other five
+  platforms are exercised only by the smoke step on GitHub's native runners.
