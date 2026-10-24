@@ -176,7 +176,7 @@ impl Run {
         let result = disk::put(&real, &put, &tag, || {
             unchanged(&real, &prior, &action.target)
         });
-        self.settle(index, result)
+        self.settle(index, &real, result)
     }
 
     /// Deletes an owned target the loadout no longer declares, after backing it up. A target
@@ -208,7 +208,7 @@ impl Run {
         let tag = tag(&self.journal.run, index);
         let result =
             unchanged(&real, &prior, &action.target).and_then(|()| disk::remove(&real, &tag));
-        self.settle(index, result).map(|()| Removal::Removed)
+        self.settle(index, &real, result).map(|()| Removal::Removed)
     }
 
     /// Takes the backup and records the planned result before the target is touched.
@@ -235,12 +235,31 @@ impl Run {
         self.journal.save(&self.dir)
     }
 
-    fn settle(&mut self, index: usize, result: Result<(), Error>) -> Result<(), Error> {
+    /// Marks the action from what the target actually holds, so a step that failed after the
+    /// target changed (such as removing the moved-aside old folder) is still journaled as done,
+    /// recorded, and undone by rollback.
+    fn settle(
+        &mut self,
+        index: usize,
+        real: &Path,
+        result: Result<(), Error>,
+    ) -> Result<(), Error> {
+        let landed = || {
+            let entry = &self.journal.entries[index];
+            disk::read(real).is_ok_and(|now| Some(observed(now.as_ref())) == entry.after)
+        };
+        let reached = result.is_ok() || landed();
         let entry = &mut self.journal.entries[index];
         match result {
             Ok(()) => {
                 entry.step = Step::Done;
                 self.journal.save(&self.dir)
+            }
+            Err(error) if reached => {
+                entry.step = Step::Done;
+                entry.error = Some(error.to_string());
+                self.journal.save(&self.dir)?;
+                Err(error)
             }
             Err(error) => {
                 entry.step = Step::Failed;

@@ -253,26 +253,32 @@ pub(super) fn put(
         remove_scratch(&temp)?;
         return Err(error);
     }
+    if let Err(error) = swap(real, &temp, content, tag) {
+        remove_scratch(&temp)?;
+        return Err(error);
+    }
+    sync_parent(real)
+}
+
+fn swap(real: &Path, temp: &Path, content: &Put, tag: &str) -> Result<(), Error> {
     let existing = fs::symlink_metadata(real).ok();
     let simple =
         matches!(content, Put::File(_)) && existing.as_ref().is_none_or(fs::Metadata::is_file);
     if simple {
-        fs::rename(&temp, real).map_err(io("replace", real))?;
-    } else {
-        let old = scratch(real, tag, "old")?;
-        remove_scratch(&old)?;
-        if existing.is_some() {
-            fs::rename(real, &old).map_err(io("move aside", real))?;
-        }
-        if let Err(error) = fs::rename(&temp, real) {
-            if existing.is_some() {
-                fs::rename(&old, real).map_err(io("move back", real))?;
-            }
-            return Err(io("replace", real)(error));
-        }
-        remove_scratch(&old)?;
+        return fs::rename(temp, real).map_err(io("replace", real));
     }
-    sync_parent(real)
+    let old = scratch(real, tag, "old")?;
+    remove_scratch(&old)?;
+    if existing.is_some() {
+        fs::rename(real, &old).map_err(io("move aside", real))?;
+    }
+    if let Err(error) = fs::rename(temp, real) {
+        if existing.is_some() {
+            fs::rename(&old, real).map_err(io("move back", real))?;
+        }
+        return Err(io("replace", real)(error));
+    }
+    remove_scratch(&old)
 }
 
 /// Deletes the target with one rename out of the way, so it never stays half removed.
