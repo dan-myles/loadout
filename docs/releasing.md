@@ -95,10 +95,17 @@ Prerequisites per host:
 
 - All: rustup, git, Python 3.8+. Release jobs install Python 3.13 with `actions/setup-python`, the
   oldest line it ships as binaries for every runner above, Windows ARM64 included.
-- Linux cross to aarch64: `export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`. No apt
-  packages needed while the crate has no C dependencies. If one is added, install `musl-tools` and
-  `gcc-aarch64-linux-gnu` and point the linker at the latter.
-- macOS: Xcode Command Line Tools. Both architectures build from either kind of Mac.
+- Linux: nothing beyond rustup while the crate is pure Rust. Rust's musl targets bring their own
+  C runtime. Cross-linking aarch64 from an x86_64 host also works for pure Rust, with
+  `export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`.
+- Linux with a C dependency (anything built through the `cc` crate) needs a C compiler that targets
+  musl, for the target architecture. Natively, that's Ubuntu's `musl-tools` (`musl-gcc`). For an
+  x86_64-to-aarch64 cross build, it's an `aarch64-linux-musl` cross toolchain with
+  `CC_aarch64_unknown_linux_musl` and the linker pointed at it. Ubuntu's `gcc-aarch64-linux-gnu` is
+  not enough: it builds against glibc. None of this is set up in CI or tested. Validate it against
+  the real dependency graph when the first C dependency lands.
+- macOS: Xcode Command Line Tools. To build the other architecture locally, `rustup target add` it.
+  This path isn't exercised in CI, where each target builds natively.
 - Windows: Visual Studio Build Tools with the MSVC x64 (and ARM64, for that target) components.
 
 ## Reproducibility
