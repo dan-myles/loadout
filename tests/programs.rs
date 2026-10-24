@@ -207,7 +207,10 @@ esac; exit 64"#,
         (
             "npm",
             r#"case "$1" in install) mark npm; exit 0;;
-ls) if [ -e "$S/npm" ]; then printf '{"name":"lib","dependencies":{"%s":{"version":"1.0.0"}}}\n' "$5"; exit 0; fi
+prefix) printf '%s\n' "$FAKE_NPM_PREFIX"; exit "${FAKE_NPM_PREFIX_CODE:-0}";;
+ls) if [ -n "$FAKE_NPM_ENOENT" ]; then
+  printf '{"error":{"code":"ENOENT","summary":"ENOENT: no such file or directory, lstat \047%s\047"}}\n' "$FAKE_NPM_ENOENT"; exit 254; fi
+  if [ -e "$S/npm" ]; then printf '{"name":"lib","dependencies":{"%s":{"version":"1.0.0"}}}\n' "$5"; exit 0; fi
   printf '{\n  "name": "lib"\n}\n'; exit 1;;
 esac; exit 64"#,
         ),
@@ -731,6 +734,52 @@ esac; exit 64"#,
             run.commands(&bench.bin()),
             ["npm ls --global --depth=0 --json cowsay"]
         );
+    }
+
+    #[test]
+    fn a_configured_npm_prefix_that_does_not_exist_yet_is_missing_only_when_npm_confirms_it() {
+        let prefix = "/tmp/loadout-fresh-npm-prefix";
+        let cowsay = request("linux", false, false, &[("cowsay", "npm", "cowsay")]);
+        let bench = Bench::new(&fake_tools());
+        let run = bench.probe(
+            &cowsay,
+            &[("FAKE_NPM_ENOENT", prefix), ("FAKE_NPM_PREFIX", prefix)],
+        );
+        assert_eq!(run.step("cowsay")["state"], "missing", "{}", run.result);
+        assert_eq!(
+            run.commands(&bench.bin()),
+            [
+                "npm ls --global --depth=0 --json cowsay",
+                "npm prefix --global"
+            ]
+        );
+        let nested = format!("{prefix}/lib/node_modules");
+        for (enoent, configured, code) in [
+            (prefix, "/tmp/some-other-prefix", "0"),
+            (nested.as_str(), prefix, "0"),
+            (prefix, prefix, "1"),
+            (prefix, "", "0"),
+        ] {
+            let bench = Bench::new(&fake_tools());
+            let run = bench.probe(
+                &cowsay,
+                &[
+                    ("FAKE_NPM_ENOENT", enoent),
+                    ("FAKE_NPM_PREFIX", configured),
+                    ("FAKE_NPM_PREFIX_CODE", code),
+                ],
+            );
+            let error = run.result["error"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "{enoent} vs {configured:?} (exit {code}) must be an error: {}",
+                    run.result
+                )
+            });
+            assert!(
+                error.contains("cannot tell whether npm package \"cowsay\" is installed"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

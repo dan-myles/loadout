@@ -81,10 +81,15 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
             &query(program, ["list", "--exact", package, "--limit-output"])?,
             package,
         ),
-        Manager::Npm => npm(
+        Manager::Npm => match npm(
             &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
             package,
-        ),
+        )? {
+            Npm::Answered(installed) => Ok(installed),
+            Npm::AbsentPath(path) => {
+                npm_prefix_absent(&query(program, ["prefix", "--global"])?, &path).map(|()| false)
+            }
+        },
         Manager::Pnpm => pnpm(
             &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
             package,
@@ -363,13 +368,29 @@ fn dependency(root: &Map<String, Value>, package: &str) -> Result<Option<bool>, 
     }
 }
 
+/// What `npm ls` said: a verdict, or that a path it needed doesn't exist.
+#[derive(Debug, PartialEq, Eq)]
+enum Npm {
+    Answered(bool),
+    AbsentPath(String),
+}
+
+const NPM_ERROR_EXIT: i32 = 254;
+const NPM_LSTAT_ENOENT: &str = "ENOENT: no such file or directory, lstat '";
+
 /// `npm ls --global --json P` prints the global root, `{"name": …, "dependencies": {…}}`, and
 /// exits 1 when the filter matches nothing; it prints `{"name":"lib"}` then (sampled on npm 9 and
 /// 11). An installed package at exit 1 means npm found problems in the tree, which is an error.
-fn npm(output: &Captured, package: &str) -> Result<bool, String> {
+///
+/// When the configured global prefix doesn't exist yet, npm 9 exits 254 with
+/// `{"error":{"code":"ENOENT","summary":"ENOENT: no such file or directory, lstat '<path>'"}}`
+/// (sampled). That alone isn't absence: the caller must confirm `<path>` is npm's own global
+/// prefix. Any other error stays an error.
+fn npm(output: &Captured, package: &str) -> Result<Npm, String> {
     let exited_one = match output.code {
         Some(0) => false,
         Some(1) => true,
+        Some(NPM_ERROR_EXIT) => return npm_absent_path(output).map(Npm::AbsentPath),
         _ => return Err(output.unexpected()),
     };
     let tree = json(&output.stdout).map_err(|error| format!("{error}{}", output.tail()))?;
@@ -387,8 +408,62 @@ fn npm(output: &Captured, package: &str) -> Result<bool, String> {
             "npm ls lists {package} but exited 1, so npm found problems in the global tree{}",
             output.tail()
         )),
-        Some(installed) => Ok(installed),
-        None => Ok(false),
+        Some(installed) => Ok(Npm::Answered(installed)),
+        None => Ok(Npm::Answered(false)),
+    }
+}
+
+/// The one path an exit-254 `ENOENT … lstat '<path>'` names, read only from that exact summary.
+fn npm_absent_path(output: &Captured) -> Result<String, String> {
+    let error = json(&output.stdout)
+        .ok()
+        .and_then(|tree| tree.get("error").cloned())
+        .ok_or_else(|| output.unexpected())?;
+    if error.get("code").and_then(Value::as_str) != Some("ENOENT") {
+        return Err(format!("npm ls failed: {error}"));
+    }
+    error
+        .get("summary")
+        .and_then(Value::as_str)
+        .and_then(|summary| summary.strip_prefix(NPM_LSTAT_ENOENT))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .filter(|path| !path.is_empty() && !path.contains('\''))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!("npm ls failed with a missing file it doesn't name clearly: {error}")
+        })
+}
+
+/// Confirms, with `npm prefix --global` from the same npm, that the path `npm ls` couldn't find is
+/// exactly npm's configured global prefix. Then nothing is installed there yet.
+fn npm_prefix_absent(prefix: &Captured, missing: &str) -> Result<(), String> {
+    if !prefix.success() {
+        return Err(format!(
+            "npm ls can't find {missing:?}, and npm prefix --global failed: {}",
+            prefix.unexpected()
+        ));
+    }
+    let mut lines = prefix
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let configured = match (lines.next(), lines.next()) {
+        (Some(configured), None) if Path::new(configured).is_absolute() => configured,
+        _ => {
+            return Err(format!(
+                "npm ls can't find {missing:?}, and npm prefix --global printed no single absolute path{}",
+                prefix.tail()
+            ));
+        }
+    };
+    if Path::new(configured) == Path::new(missing) {
+        Ok(())
+    } else {
+        Err(format!(
+            "npm ls can't find {missing:?}, which is not npm's global prefix {configured:?}; \
+             check npm's configuration or reinstall npm"
+        ))
     }
 }
 
@@ -824,16 +899,22 @@ mod tests {
     #[test]
     fn npm_needs_its_global_root_and_a_versioned_entry() {
         let installed = r#"{"name":"lib","dependencies":{"@withgraphite/graphite-cli":{"version":"1.8.6","overridden":false},"cowsay":{"version":"1.6.0","overridden":false}}}"#;
-        assert_eq!(npm(&out(0, installed, ""), "cowsay"), Ok(true));
+        assert_eq!(
+            npm(&out(0, installed, ""), "cowsay"),
+            Ok(Npm::Answered(true))
+        );
         assert_eq!(
             npm(&out(0, installed, ""), "@withgraphite/graphite-cli"),
-            Ok(true)
+            Ok(Npm::Answered(true))
         );
         assert_eq!(
             npm(&out(1, "{\n  \"name\": \"lib\"\n}\n", ""), "cowsay"),
-            Ok(false)
+            Ok(Npm::Answered(false))
         );
-        assert_eq!(npm(&out(0, installed, ""), "figlet"), Ok(false));
+        assert_eq!(
+            npm(&out(0, installed, ""), "figlet"),
+            Ok(Npm::Answered(false))
+        );
         assert_eq!(
             npm(
                 &out(
@@ -843,7 +924,7 @@ mod tests {
                 ),
                 "cowsay"
             ),
-            Ok(false)
+            Ok(Npm::Answered(false))
         );
         for (code, malformed) in [
             (0, r#"{"name":"lib","dependencies":{"cowsay":null}}"#),
@@ -863,6 +944,100 @@ mod tests {
                 "{code} {malformed}"
             );
         }
+    }
+
+    /// npm 9.2's real answer when its configured global prefix doesn't exist yet (Linux slot 7,
+    /// `npm_config_prefix=/tmp/fresh-npm-prefix`).
+    const NPM_ABSENT_PREFIX: &str = "{\n  \"error\": {\n    \"code\": \"ENOENT\",\n    \"summary\": \"ENOENT: no such file or directory, lstat '/tmp/fresh-npm-prefix'\",\n    \"detail\": \"This is related to npm not being able to find a file.\\n\"\n  }\n}\n";
+
+    #[test]
+    fn npm_reads_a_missing_global_prefix_only_from_its_exact_enoent_answer() {
+        assert_eq!(
+            npm(&out(254, NPM_ABSENT_PREFIX, ""), "cowsay"),
+            Ok(Npm::AbsentPath("/tmp/fresh-npm-prefix".to_owned()))
+        );
+        let enoent = |summary: &str| {
+            out(
+                254,
+                &format!(
+                    r#"{{"error":{{"code":"ENOENT","summary":{}}}}}"#,
+                    serde_json::to_string(summary).unwrap()
+                ),
+                "",
+            )
+        };
+        assert_eq!(
+            npm(
+                &enoent("ENOENT: no such file or directory, lstat '/tmp/p/lib/node_modules'"),
+                "cowsay"
+            ),
+            Ok(Npm::AbsentPath("/tmp/p/lib/node_modules".to_owned())),
+            "a nested path is reported as itself; only the prefix check can accept it"
+        );
+        for ambiguous in [
+            "ENOENT: no such file or directory, lstat '/a' and '/b'",
+            "ENOENT: no such file or directory, open '/tmp/p'",
+            "ENOENT: no such file or directory, lstat ''",
+            "ENOENT: no such file or directory, lstat '/tmp/p",
+            "something else",
+        ] {
+            assert!(npm(&enoent(ambiguous), "cowsay").is_err(), "{ambiguous}");
+        }
+        assert!(npm(&out(254, r#"{"error":{"code":"ENOENT"}}"#, ""), "cowsay").is_err());
+        let eacces = NPM_ABSENT_PREFIX.replace("ENOENT\",", "EACCES\",");
+        assert!(npm(&out(254, &eacces, ""), "cowsay").is_err());
+        for code in [1, 2, 255] {
+            assert!(
+                !matches!(
+                    npm(&out(code, NPM_ABSENT_PREFIX, ""), "cowsay"),
+                    Ok(Npm::AbsentPath(_))
+                ),
+                "exit {code}"
+            );
+        }
+        assert!(npm(&out(254, "not json", ""), "cowsay").is_err());
+        assert!(npm(&out(254, r#"{"name":"lib"}"#, ""), "cowsay").is_err());
+    }
+
+    #[test]
+    fn a_missing_path_is_absence_only_when_it_is_npms_own_global_prefix() {
+        let abs = |path: &str| {
+            if cfg!(windows) {
+                format!("C:{path}")
+            } else {
+                path.to_owned()
+            }
+        };
+        let missing = abs("/tmp/fresh-npm-prefix");
+        let answer = |path: &str| format!("{path}\n");
+        assert_eq!(
+            npm_prefix_absent(&out(0, &answer(&missing), ""), &missing),
+            Ok(())
+        );
+        for (code, printed) in [
+            (0, answer(&abs("/tmp/other-prefix"))),
+            (0, answer(&abs("/tmp/fresh-npm-prefix/lib"))),
+            (0, answer(&abs("/tmp"))),
+            (0, String::new()),
+            (0, "relative/prefix\n".to_owned()),
+            (
+                0,
+                format!("{}{}", answer(&missing), answer(&abs("/tmp/second"))),
+            ),
+            (1, answer(&missing)),
+            (254, String::new()),
+        ] {
+            assert!(
+                npm_prefix_absent(&out(code, &printed, ""), &missing).is_err(),
+                "{code} {printed:?}"
+            );
+        }
+        let nested = npm_prefix_absent(
+            &out(0, &answer(&abs("/tmp/p")), ""),
+            &abs("/tmp/p/lib/node_modules"),
+        )
+        .unwrap_err();
+        assert!(nested.contains("is not npm's global prefix"), "{nested}");
     }
 
     #[test]

@@ -748,7 +748,7 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
 | `winget` | winget | `winget list --id P --exact --source winget` | `0x8A150014` | `winget install --id P --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade --scope user\|machine` |
 | `scoop` | scoop | `scoop prefix APP` (`APP` is `P` after any `bucket/`) | exit 1 with "Could not find app path" | `scoop install P` |
 | `choco` | choco (2.x) | `choco list --exact P --limit-output` | no `P\|version` line, or exit 2 | `choco install P -y --no-progress`; 1641 and 3010 are success |
-| `npm` | npm | `npm ls --global --depth=0 --json P` | the root `{"name": …}` has no `dependencies.P`, or it is `missing: true` (exit 0 or 1) | `npm install --global P` |
+| `npm` | npm | `npm ls --global --depth=0 --json P` (and `npm prefix --global` after an exit 254) | the root `{"name": …}` has no `dependencies.P`, or it is `missing: true` (exit 0 or 1); or exit 254 with `ENOENT … lstat '<path>'` where `<path>` is exactly the prefix `npm prefix --global` prints | `npm install --global P` |
 | `pnpm` | pnpm | `pnpm ls --global --depth=0 --json P` | no project in the list `[{"path": …, "dependencies": {…}}]` has `P` (exit 0) | `pnpm add --global P` |
 | `bun` | bun | `bun pm ls --global` | no `── P@…` line | `bun add --global P` |
 | `cargo` | cargo | `cargo install --list` | no `P v…:` line | `cargo install P` |
@@ -765,7 +765,15 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   `dependencies` table is an object whose entry for `P` is an object with a string `version` (or
   `missing: true`); every pipx venv names its main package; a brew entry must answer for `P`, and
   its `installed` is a list of `{ "version": … }` records (formula) or a version string or `null`
-  (cask). npm listing `P` while exiting 1 means npm found problems in the tree, and is an error.
+  (cask). npm listing `P` while exiting 1 means npm found problems in the tree, and is an error. A
+  configured global prefix that doesn't exist yet makes npm exit 254 with
+  `{"error":{"code":"ENOENT","summary":"ENOENT: no such file or directory, lstat '<path>'"}}`
+  (sampled on npm 9.2). That reads as missing only when the summary has exactly that form, the
+  path holds no quote, and the same npm's `npm prefix --global` (under the same query deadline and
+  cap) prints that one absolute path. Loadout creates no directory to find out. Any other error
+  code, summary, exit code, or prefix answer, including a path below the prefix, is
+  `Error::Detect`, with a message naming the path and npm's prefix. There is no general rule that
+  `ENOENT` means missing.
   Anything else, such as `null`, a non-object entry, or an empty pnpm list, is `Error::Detect`, so a
   malformed answer never authorizes an install. The npm and pnpm empty shapes and the npm installed
   shape were sampled from real managers. The pnpm installed entry, the pipx entry, and brew's
