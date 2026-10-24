@@ -170,9 +170,11 @@ tags = ["work", "laptop"]
 
 A machine name the loadout doesn't list gets the global and OS layers only. These are errors: a
 `machines/<name>.toml` with no `[machines.<name>]` entry, a listed tag that isn't an id, a tag
-listed twice, and a listed tag with no `tags/<tag>.toml` layer. The match is exact and
-case-sensitive against the loaded tag layers, never a path probe, so `../x` or `Work` can't pass on
-any file system. A tag file that no machine lists is a warning.
+listed twice, and a listed tag with no valid `tags/<tag>.toml` layer. The match is exact and
+case-sensitive against the tag layers the confined loader actually loaded. It is never a path probe
+or a second directory read, so `../x`, `Work`, or a tag file reached only through a rejected
+outside `tags/` link can't satisfy it. A tag whose file failed to parse gets both errors: the
+parse error and "no valid layer file". A tag file that no machine lists is a warning.
 
 ### Layer tables (allowed in every layer file)
 

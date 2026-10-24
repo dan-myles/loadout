@@ -134,8 +134,9 @@ fn invalid_fixture_reports_each_mistake() {
         "os/beos.toml: error: unknown OS layer",
         "tags/work.toml: error: TOML parse error",
         "unknown field `sorce`",
-        "tag \"missing-tag\" has no layer file",
+        "tag \"missing-tag\" has no valid layer file",
         "tag \"work\" is listed twice",
+        "machines.box.tags: tag \"work\" has no valid layer file tags/work.toml",
         "machines/ghost.toml: error: machine \"ghost\" has a layer file but no [machines.ghost] entry",
         "variables.machine: `machine` is reserved",
         "update.interval_minutes: must be at least 15",
@@ -685,6 +686,36 @@ fn a_root_manifest_that_is_not_a_regular_file_is_invalid_not_a_hang() {
     .unwrap();
     let output = Sandbox::new().run(&["validate", regular.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn tag_references_never_consult_a_rejected_outside_tags_folder() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside-tags");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("work.toml"), "").unwrap();
+    let root = scratch.path().join("loadout");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[machines.box]\ntags = [\"work\"]\n",
+    )
+    .unwrap();
+    symlink(&outside, root.join("tags")).unwrap();
+    let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(3), "{text}");
+    assert!(
+        text.contains("tags: error: resolves outside the loadout"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tag \"work\" has no valid layer file tags/work.toml"),
+        "the outside work.toml must not satisfy the reference: {text}"
+    );
 }
 
 #[test]

@@ -98,12 +98,6 @@ impl Checker {
                 _ => None,
             })
             .collect();
-        let listed: BTreeSet<String> = fs::read_dir(loadout.root.join("tags"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
         let mut used = BTreeSet::new();
         for (name, entry) in &loadout.machines {
             let key = format!("machines.{name}");
@@ -122,11 +116,10 @@ impl Checker {
                         format!("{key}.tags"),
                         format!("tag {tag:?} is listed twice"),
                     );
-                } else if !loaded.contains(tag.as_str()) && !listed.contains(&format!("{tag}.toml"))
-                {
+                } else if !loaded.contains(tag.as_str()) {
                     self.error(
                         format!("{key}.tags"),
-                        format!("tag {tag:?} has no layer file tags/{tag}.toml"),
+                        format!("tag {tag:?} has no valid layer file tags/{tag}.toml"),
                     );
                 }
                 used.insert(tag.as_str());
