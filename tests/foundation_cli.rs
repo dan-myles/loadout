@@ -321,6 +321,7 @@ fn windows_path_rules_apply_only_where_windows_is_reached() {
             "[files.device]\nsource = \"f\"\ntarget = \"~/Documents/NUL.txt\"\n",
         ),
     ]);
+    let text = text.replace('\\', "/");
     assert_eq!(code, 3, "{text}");
     assert!(
         text.contains("error: agents.custom.dv.skills.windows: \"D:\" contains ':'"),
@@ -1653,6 +1654,7 @@ fn empty_home_override_is_not_reported_as_isolation() {
     let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
         .arg("doctor")
         .env("HOME", &sandbox.home)
+        .env("USERPROFILE", &sandbox.home)
         .env("LOADOUT_HOME", "")
         .env("LOADOUT_STATE_DIR", &sandbox.state)
         .output()
