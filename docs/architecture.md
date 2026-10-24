@@ -467,6 +467,38 @@ inside the canonical state dir, the same rule as `machine.toml`. A link planted 
 is never opened. A corrupt or unknown-version `state.json` is an error (exit 1), never an empty
 machine.
 
+Writes are checked the same way. The configured state dir may itself be a link, so loadout
+canonicalizes it once. Every folder it then writes into, such as `runs/`, a run folder, or
+`backups/`, must be a real folder below that canonical root, never a link, a junction, or a file.
+A planted `runs` link is therefore an error before anything is written. The lock records the
+canonical state dir it holds, and `Run::begin` refuses a lock taken for another state dir
+(`Error::WrongLock`). A lock taken through an alias of the same dir is accepted.
+
+**Trust boundary.** The state dir is private to its owner (`0700`), and its contents are trusted
+no further than that. Nothing in it is signed, because its owner can rewrite any of it, a checksum
+included. Loadout instead validates the shape of everything it reads back before it acts on it:
+
+- `state.json` targets must be absolute and clean, with valid hashes and run ids.
+- A journal must name its own folder, and each entry's step must fit its change and result.
+- Each backup must sit in its own slot (`backups/<n>` of the same run) with a plain tree layout.
+- `created` folders must form one chain ending at the target's parent.
+- Every target must lie under a target root (below).
+
+The `--loadout DIR` checkout a run used is known only from its journal. Rollback reserves that
+recorded checkout and the default `<state>/loadout` both. The state dir itself is always reserved.
+
+**Target roots.** A file or tree target must be absolute, clean, and lexically under one of the
+bases targets are built from:
+
+- `Context.home` and `Context.config`, the bases of `~/` and `{config}/`
+- `Context.xdg_config`
+- each agent dir override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and so on), which may lie outside home
+
+`observe`, `Run::begin`, and rollback enforce this (`Error::OutsideRoots`). A symlink below a
+root may still lead elsewhere, and the write follows it. One limit follows: a rollback must run
+with the same agent dir overrides the run had, or its targets under an override that is no longer
+set are refused.
+
 - `state.json`: `{ "version": 1, "records": [Record] }`. A `Record` is `{ target, item, sha256, run }`:
   the `Target` and `ItemRef` (serialized exactly as in `plan --json`), the hash of what loadout last
   wrote, and the id of the run that wrote it. There is one record per target, and an MCP entry is
@@ -477,8 +509,9 @@ machine.
   (`{ path, kind, modes, dirs }`), `step` (`pending`, `started`, `done`, `released`, `failed`),
   `after` (the hash the action leaves), and `created` (the folders it made). No file content is in
   a journal.
-- `runs/<run-id>/backups/<n>`: the prior file, or a copy of the prior folder, of entry `n`. Its
-  Unix modes are in the journal, not on the copy, which is `0600` (folders `0700`).
+- `runs/<run-id>/backups/<n>`: the prior file, or a copy of the prior folder, of entry `n`. The
+  copy keeps the original Unix modes, which stay private because `backups/` is `0700`. The journal
+  records the same modes, and rollback restores only when the two agree.
 - A run id is the UTC start time with nanoseconds, `YYYYMMDDTHHMMSS.nnnnnnnnnZ`, so byte order is
   time order and the newest run is the greatest id. Rollback accepts only a name that matches a run
   folder exactly, so a run argument can't name a path.
@@ -567,35 +600,83 @@ delegated defaults.
      `update`.
   5. Marks the action done in the journal.
 
-  As built (U3): the target goes through `reserved::check_path(context, loadout, path, Use::Write)`
-  before it is read, backed up, or written, and a conflict is `state::Error::Reserved`. The
-  re-observation and the backup come from one read, so the backup is exactly the observed `prior`.
-  The backup is taken, and the journal marks the action `started` with its `after` hash and the
-  folders it will create, before the target changes. The target is observed once more just before
-  the rename, and any difference aborts with `Changed`. A file over a file is one rename. When a
-  folder is involved, the old target is renamed aside to `.<name>.loadout-<run>-<n>.old`, the new
-  one is renamed in, and the old one is deleted. If the second rename fails, the old one is moved
-  back. Through a symlink, the link's real target is written (a dangling link is created at its
-  destination). Unix modes for a tree come from the existing file at the same relative path.
-  Setuid, setgid, and sticky bits are dropped. An action whose target already equals its content
-  (`adopt`) is recorded without a write or a backup. A write that fails is marked `failed`, and
-  the empty folders it made are removed. `Run::finish` records ownership for every action that
-  reached the disk and must run even when some actions failed. A `Run` dropped without `finish`
-  leaves an interrupted run.
+  As built (U3):
+
+  1. The target is checked against the target roots and then
+     `reserved::check_path(context, loadout, path, Use::Write)` before it is read, backed up, or
+     written. A conflict is `state::Error::Reserved`.
+  2. The re-observation and the backup come from one read, so the backup is exactly the observed
+     `prior`.
+  3. The backup is taken, and the journal marks the action `started` with its `after` hash and the
+     folders it will create, before the target changes.
+  4. The new content is staged privately in `.<name>.loadout-<run>-<n>.tmp`:
+     - Each file is created empty with mode `0o666`, so the kernel applies the umask and its mode
+       reveals the process default. It is set to `0600` before the first byte, and given its
+       final mode only after its bytes are written and fsynced.
+     - A staged tree's folders are `0700` until every file is written. They then get their final
+       modes, deepest first.
+     - Final modes never widen past the rule above.
+  5. The target is observed once more just before the rename, and any difference aborts with
+     `Changed`.
+  6. A file over a file is one rename. When a folder is involved, the old target is renamed aside
+     to `.<name>.loadout-<run>-<n>.old`, the new one is renamed in, and the old one is deleted. If
+     the second rename fails, the old one is moved back.
+  7. A scratch name that already exists is never deleted or overwritten. It belongs to something
+     loadout can't vouch for, so the write fails instead.
+
+  Other rules:
+  - Through a symlink, the link's real target is written. A dangling link is created at its
+    destination.
+  - Unix modes for a tree come from the existing file at the same relative path. Setuid, setgid,
+    and sticky bits are dropped.
+  - An action whose target already equals its content (`adopt`) is recorded without a write or a
+    backup.
+  - A write that fails is marked `failed`, and the empty folders it made are removed. A step that
+    fails after the new content is already in place is marked `done`.
+  - `Run::finish` records ownership for every action that reached the disk, and must run even
+    when some actions failed. A `Run` dropped without `finish` leaves an interrupted run.
+
+  **Durability.** On Unix, every staged file is fsynced, and so is every staged folder. Every
+  folder whose entries change is fsynced after the change: the target's parent after each rename
+  and move-aside, each folder loadout creates, and the state, run, and backup folders.
+
+  Windows has no folder fsync, so there the renames are the boundary. The recovery loadout proves
+  covers a process that stops at any point: rollback and the journal handle it, and the tests and
+  VM runs exercise it. Power loss is not proven, and loadout doesn't claim it.
 - **Rollback.** `loadout rollback [RUN]` restores a run's backups and deletes the files that run
   created; the default is the latest run. `status` reports an interrupted run, and the same command
   rolls it back.
-  - Every `started` or `done` target must hold either the run's `after` (it is restored) or its
-    `prior` (nothing to do). Anything else, such as a later run's write or a user edit, blocks the
-    whole rollback with exit 4, and nothing is restored. A reserved target blocks the same way.
-  - A backup is restored only if it still hashes to `prior`, with its exact recorded modes.
-    Otherwise it is an error, and nothing is overwritten.
-  - Each target is re-observed just before it is restored.
-  - Folders the run created are removed when they are empty again.
+  - **Preflight before any change.** Rollback validates everything it will need before it touches
+    a target. A problem found there leaves every target untouched. The preflight covers:
+    - the journal (trust boundary, section 4) and `state.json`
+    - every target's roots and reserved check
+    - every created folder (the ancestor chain, plus a reserved `WriteInto` check)
+    - every needed backup: its slot, its type, its layout against the journal, and its hash
+      against `prior`
+    - every scratch name
+
+    An I/O error during the restore itself can still stop a rollback halfway. Running it again
+    skips the targets it already restored.
+  - Every `started`, `done`, or `failed` target must hold the run's `after` (it is restored) or its
+    `prior` (nothing to do). Anything else blocks the whole rollback with exit 4, and nothing is
+    restored. That includes a later run's write, a user edit, or a later user deletion. A `failed`
+    target that holds neither is left alone, because the run never changed it. A reserved target
+    blocks the same way.
+  - **A folder swap that stopped between its two renames.** Here the target is absent, and its
+    `.old` scratch holds the prior tree. That `.old` counts as evidence only if it is a real file
+    or folder (not a link) whose content hashes to `prior`. Then the backup is restored. A
+    missing, linked, or mismatched `.old` blocks instead.
+  - **Scratch handling.** A scratch name is deleted only when it verifies as the run's own: `.tmp`
+    must hash to `after`, and `.old` to `prior`. Rollback's own scratch, `…-rollback.tmp` and
+    `.old`, is verified the same way, so a rollback that stopped can be rerun. Anything else is
+    left in place and reported (`RolledBack.leftovers`, printed as a warning). A rollback scratch
+    that was only partly written fails the retry until it is removed by hand.
+  - A backup is restored with its exact recorded modes. Each target is re-observed just before it
+    is restored.
+  - Folders the run created are removed when they are empty again, and only along the validated
+    ancestor chain.
   - The records of every touched or released target go back to the journaled pre-run record.
-  - Rolling back a run that is already rolled back is an error (exit 1). A rollback that stops
-    halfway can be run again, and the targets it already restored are skipped.
-  - The reserved check uses the journal's recorded checkout.
+  - Rolling back a run that is already rolled back is an error (exit 1).
 - **Concurrency.** `<state>/lock` (`std::fs::File::try_lock`) keeps a background update and a manual
   apply from overlapping. The second one exits 1 with a clear message. `state::lock` returns the
   `Lock`, and `Run::begin` takes it by value, so a run can't start without holding it. `rollback`
@@ -950,13 +1031,15 @@ impl Run {
     pub fn finish(self, state: &mut State) -> Result<(), state::Error>;
 }
 // Run::write and Run::remove re-observe and return Error::Changed { target } when the result != prior
-pub fn rollback(context: &Context, run: Option<&str>) -> Result<RolledBack, state::Error>; // RolledBack { run, restored: Vec<Target> }
+pub fn rollback(context: &Context, run: Option<&str>) -> Result<RolledBack, state::Error>; // RolledBack { run, restored: Vec<Target>, leftovers: Vec<PathBuf> }
 pub fn audit<'a>(context: &Context, loadout: &Path, state: &'a State) -> Vec<(&'a Record, Health)>;
 pub fn runs(context: &Context) -> Result<Vec<RunSummary>, state::Error>;
 // U3 changes to the frozen signatures (Decisions made here): observe and Run::begin take the
 // active checkout so the reserved check happens inside state before any read, backup, or write;
-// Run::begin takes the Lock by value and the pre-run State for the journaled records; Run::remove
-// is new; rollback returns the run id with the targets. plan types gained Deserialize.
+// Run::begin takes the Lock by value (refused with Error::WrongLock unless it holds the same
+// canonical state dir) and the pre-run State for the journaled records; Run::remove is new;
+// rollback returns the run id, the restored targets, and unverified scratch left in place;
+// targets must lie under the target roots (Error::OutsideRoots). plan types gained Deserialize.
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
