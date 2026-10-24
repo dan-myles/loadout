@@ -626,8 +626,13 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   It checks `{config}/` under all three OS meanings. A conflict is an error naming the reserved path
   and its kind.
 - **U1, U4, and U5 (runtime, frozen).** Before any read of a target, any backup, and any write, each
-  expanded target goes through `reserved::check_path(context, path, use)`, called once. That one
-  API owns normalization, and callers never canonicalize for it.
+  expanded target goes through `reserved::check_path(context, loadout, path, use)`, called once.
+  That one API owns normalization, and callers never canonicalize for it.
+  - **The active loadout checkout is reserved.** `loadout` is the root the run reads: the default
+    `<state>/loadout` clone, or the `--loadout DIR` checkout. It is a required argument and is
+    treated as `loadout-state`. No target may equal it, sit inside it, or (for `Write`) be its
+    ancestor, through any alias. U4 passes it before observing, backing up, or writing anything, so
+    the one-way rule (section 5) holds for any checkout.
   - **Both sides are normalized.** The target is compared in its lexical and its normalized form.
     Every reserved entry is compared at every root it can live under: the override root (such as
     `CODEX_HOME`) and the default home root, `xdg_config` and `~/.config`, and `Context.state` and
@@ -777,7 +782,7 @@ pub enum Kind { Auth, SharedConfig, LoadoutState, Private }
 pub enum Use<'a> { Write, WriteInto, KeyMerge(Merge<'a>) }   // Merge { map, format, shape } as ids
 // Entry { anchor, path, kind, merge: Option<Merge<'static>> }: shared-config entries carry their known MCP map
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
-pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; normalizes target and every reserved root itself
+pub fn check_path(context: &Context, loadout: &Path, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; `loadout` = active checkout root; normalizes both sides itself
 pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only
 pub enum Conflict { Reserved { entry: Entry, reserved: String }, Unverifiable { path: PathBuf, error: String } }
 

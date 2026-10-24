@@ -308,7 +308,14 @@ pub fn check_literal(path: &str, how: Use<'_>) -> Option<Conflict> {
     })
 }
 
-pub fn check_path(context: &Context, path: &Path, how: Use<'_>) -> Option<Conflict> {
+const ACTIVE_LOADOUT: Entry = entry(Anchor::Home, "", Kind::LoadoutState);
+
+pub fn check_path(
+    context: &Context,
+    loadout: &Path,
+    path: &Path,
+    how: Use<'_>,
+) -> Option<Conflict> {
     let unverifiable = |path: &Path, error: io::Error| Conflict::Unverifiable {
         path: path.to_path_buf(),
         error: error.to_string(),
@@ -317,23 +324,28 @@ pub fn check_path(context: &Context, path: &Path, how: Use<'_>) -> Option<Confli
         Ok(real) => [path_parts(path), path_parts(&real)],
         Err(error) => return Some(unverifiable(path, error)),
     };
-    for entry in TABLE {
-        for root in entry.anchor.roots(context) {
-            let reserved = join(&root, entry.path);
-            let real = match normalize(&reserved) {
-                Ok(real) => real,
-                Err(error) => return Some(unverifiable(&reserved, error)),
-            };
-            let forms = [path_parts(&reserved), path_parts(&real)];
-            let hit = targets
-                .iter()
-                .any(|target| forms.iter().any(|form| conflicts(target, form, entry, how)));
-            if hit {
-                return Some(Conflict::Reserved {
-                    entry: *entry,
-                    reserved: reserved.display().to_string(),
-                });
-            }
+    let active = (&ACTIVE_LOADOUT, loadout.to_path_buf());
+    let table = TABLE.iter().flat_map(|entry| {
+        entry
+            .anchor
+            .roots(context)
+            .into_iter()
+            .map(move |root| (entry, join(&root, entry.path)))
+    });
+    for (entry, reserved) in table.chain([active]) {
+        let real = match normalize(&reserved) {
+            Ok(real) => real,
+            Err(error) => return Some(unverifiable(&reserved, error)),
+        };
+        let forms = [path_parts(&reserved), path_parts(&real)];
+        let hit = targets
+            .iter()
+            .any(|target| forms.iter().any(|form| conflicts(target, form, entry, how)));
+        if hit {
+            return Some(Conflict::Reserved {
+                entry: *entry,
+                reserved: reserved.display().to_string(),
+            });
         }
     }
     None
@@ -449,6 +461,8 @@ mod tests {
 
     use super::*;
     use crate::platform::Os;
+
+    const NO_LOADOUT: &str = "/nonexistent/loadout-checkout";
 
     const CLAUDE_MCP: Use<'static> = Use::KeyMerge(Merge {
         map: "/mcpServers",
@@ -584,7 +598,8 @@ mod tests {
         };
         let context = Context::resolve(Os::Linux, vars, Some("/h".into())).unwrap();
         let kind = |path: &str| {
-            check_path(&context, Path::new(path), Use::Write).and_then(|conflict| conflict.kind())
+            check_path(&context, Path::new(NO_LOADOUT), Path::new(path), Use::Write)
+                .and_then(|conflict| conflict.kind())
         };
         assert_eq!(kind("/alt/codex/auth.json"), Some(Kind::Auth));
         assert_eq!(kind("/alt/claude/.claude.json"), Some(Kind::SharedConfig));
@@ -631,7 +646,8 @@ mod tests {
         };
         let context = Context::resolve(Os::Linux, vars, Some(at("home"))).unwrap();
         let kind = |relative: &str| {
-            check_path(&context, &at(relative), Use::Write).and_then(|conflict| conflict.kind())
+            check_path(&context, Path::new(NO_LOADOUT), &at(relative), Use::Write)
+                .and_then(|conflict| conflict.kind())
         };
 
         assert_eq!(
@@ -655,6 +671,7 @@ mod tests {
         assert_eq!(
             check_path(
                 &context,
+                Path::new(NO_LOADOUT),
                 &at("home/ordinary-alias/codex/skills"),
                 Use::WriteInto
             ),
@@ -673,7 +690,12 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let context =
             Context::resolve(Os::Linux, |_| None, Some(scratch.path().join("home"))).unwrap();
-        let result = check_path(&context, &locked.join("inner/file"), Use::Write);
+        let result = check_path(
+            &context,
+            Path::new(NO_LOADOUT),
+            &locked.join("inner/file"),
+            Use::Write,
+        );
         let readable = fs::read_dir(&locked).is_ok();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         if readable {
@@ -685,7 +707,13 @@ mod tests {
             "{result:?}"
         );
         assert!(
-            check_path(&context, Path::new("relative/x"), Use::Write).is_some(),
+            check_path(
+                &context,
+                Path::new(NO_LOADOUT),
+                Path::new("relative/x"),
+                Use::Write
+            )
+            .is_some(),
             "unclean paths fail closed"
         );
     }
@@ -708,6 +736,45 @@ mod tests {
         assert_eq!(
             prefix_name(Prefix::VerbatimUNC("Srv".as_ref(), "Share".as_ref())),
             prefix_name(Prefix::UNC("srv".as_ref(), "share".as_ref()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_active_loadout_checkout_is_reserved_wherever_it_lives() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let checkout = root.join("src/my-loadout");
+        fs::create_dir_all(checkout.join("files")).unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        symlink(&checkout, root.join("home/alias")).unwrap();
+        let context = Context::resolve(Os::Linux, |_| None, Some(root.join("home"))).unwrap();
+        let kind = |path: PathBuf, how: Use<'_>| {
+            check_path(&context, &checkout, &path, how).and_then(|conflict| conflict.kind())
+        };
+        for path in [
+            checkout.join("loadout.toml"),
+            checkout.join("files/new"),
+            root.join("src"),
+            root.join("home/alias/loadout.toml"),
+        ] {
+            assert_eq!(
+                kind(path.clone(), Use::Write),
+                Some(Kind::LoadoutState),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            kind(checkout.clone(), Use::WriteInto),
+            Some(Kind::LoadoutState)
+        );
+        assert_eq!(kind(root.join("src"), Use::WriteInto), None);
+        assert_eq!(kind(root.join("src/other-project/x"), Use::Write), None);
+        assert_eq!(
+            kind(checkout.join("mcp.json"), CLAUDE_MCP),
+            Some(Kind::LoadoutState)
         );
     }
 }
