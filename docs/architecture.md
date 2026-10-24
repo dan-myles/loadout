@@ -491,11 +491,19 @@ delegated defaults.
   uninstalled in v1.
 - **Hashing** (`state::observe`, U3) is defined once. It is domain-separated by kind, so a file can
   never hash equal to a tree or an MCP entry. `Observed::Present.sha256` is the lowercase hex of:
-  - a file: `SHA-256("loadout:file:v1\n" ‖ bytes)`
+  - a file: `SHA-256("loadout:file:v1\n" ‖ X ‖ 0x00 ‖ u64 big-endian length ‖ bytes)`. `X` is
+    the byte `x` when the file is executable and `-` otherwise. It is always `-` on Windows, and
+    always `-` for any target whose execute bits loadout doesn't manage. A mode-only change
+    therefore changes the hash.
   - a tree: `SHA-256("loadout:tree:v1\n" ‖ for each file in byte-sorted `/`-separated relative-path
     order: path ‖ 0x00 ‖ (`x` or `-`) ‖ 0x00 ‖ u64 big-endian length ‖ bytes)`
   - an MCP entry: `SHA-256("loadout:mcp-entry:v1\n" ‖ canonical JSON of that one key's value)`.
-    Canonical means object keys sorted, no insignificant whitespace.
+    The canonical JSON is produced by one helper, never by ad hoc formatting. It rebuilds the
+    `serde_json::Value` with every object's keys sorted by byte order, recursively through arrays
+    and nested objects. It then serializes with `serde_json::to_vec`: compact, no whitespace, and
+    serde_json's own escaping and number formatting. The sort is explicit because U6 may enable
+    serde_json's `preserve_order`, under which `Map` keeps insertion order. A value read from TOML
+    is first converted to `serde_json::Value`, so both formats hash the same way.
 
   Plan, journal, and records all use this definition.
 - **Safe write.** Before the first write, the run's `journal.json` lists every action with its
@@ -624,9 +632,10 @@ overridable anchor protects both its override root and its default root. They ex
   | Muse `settings.json` | `/mcp_servers` | json | `muse-json` |
   | Antigravity `mcp_config.json` | `/mcpServers` | json | `antigravity-json` |
 
-  A path alone never authorizes a merge. `/oauthAccount` or `/projects` in `~/.claude.json`, or
+  `KeyMerge` is blocked in every other reserved kind (`auth`, `loadout-state`, `private`, and the
+  active checkout), whatever the map. A path alone never authorizes a merge. `/oauthAccount` or `/projects` in `~/.claude.json`, or
   `/projects` in Codex `config.toml`, is blocked. A custom MCP file that isn't reserved keeps any
-  valid map.
+  valid map, subject to the pointer, format, and shape rules in section 3.
 
 Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocked on every OS.
 
