@@ -170,7 +170,10 @@ fn an_auth_store_alias_is_refused_even_when_the_checkout_sits_in_a_private_folde
     let sandbox = sandbox();
     let checkout = sandbox.home.join(".t3/worktrees/loadout");
     put(&checkout.join("loadout.toml"), NOTES);
-    let auth = put(&checkout.join("codex/auth.json"), "AUTH-SENTINEL {% if %}\n");
+    let auth = put(
+        &checkout.join("codex/auth.json"),
+        "AUTH-SENTINEL {% if %}\n",
+    );
     fs::create_dir_all(checkout.join("files")).unwrap();
     std::os::unix::fs::symlink(&auth, checkout.join("files/notes.tmpl")).unwrap();
 
@@ -230,9 +233,8 @@ fn an_ordinary_template_alias_inside_the_checkout_is_read_and_checked() {
 fn resolver_and_template_problems_are_both_reported_resolver_first() {
     let sandbox = sandbox();
     let checkout = sandbox.home.join("work/loadout");
-    let text = format!(
-        "{NOTES}\n[files.colon]\nsource = \"files/plain\"\ntarget = \"~/notes:today\"\n"
-    );
+    let text =
+        format!("{NOTES}\n[files.colon]\nsource = \"files/plain\"\ntarget = \"~/notes:today\"\n");
     put(&checkout.join("loadout.toml"), &text);
     put(&checkout.join("files/notes.tmpl"), "{% if %}\n");
     put(&checkout.join("files/plain"), "plain\n");
@@ -273,7 +275,10 @@ fn a_template_changed_into_an_auth_alias_after_loading_is_refused_by_its_own_che
     let [message] = messages[..] else {
         panic!("{messages:?}");
     };
-    assert!(message.starts_with("files/notes.tmpl overlaps "), "{message}");
+    assert!(
+        message.starts_with("files/notes.tmpl overlaps "),
+        "{message}"
+    );
     assert!(message.contains(AUTH), "{message}");
     assert!(!message.contains("SENTINEL"), "{message}");
 }
