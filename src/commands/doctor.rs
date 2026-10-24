@@ -23,24 +23,7 @@ struct Report<'a> {
 }
 
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
-    let checks = vec![
-        Check::new(
-            "version",
-            CheckStatus::Info,
-            format!("loadout {}", env!("CARGO_PKG_VERSION")),
-        ),
-        platform(),
-        home(context),
-        Check::new(
-            "config dir",
-            CheckStatus::Info,
-            context.config.display().to_string(),
-        ),
-        state(context),
-        machine_name(context),
-        git(),
-        managers(context.os),
-    ];
+    let checks: Vec<Check> = [foundation(context)].concat();
 
     let healthy = checks.iter().all(|check| check.status != CheckStatus::Fail);
     if args.json {
@@ -66,6 +49,27 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     } else {
         Exit::Unhealthy
     })
+}
+
+fn foundation(context: &Context) -> Vec<Check> {
+    vec![
+        Check::new(
+            "version",
+            CheckStatus::Info,
+            format!("loadout {}", env!("CARGO_PKG_VERSION")),
+        ),
+        platform(),
+        home(context),
+        Check::new(
+            "config dir",
+            CheckStatus::Info,
+            context.config.display().to_string(),
+        ),
+        state(context),
+        machine_name(context),
+        git(),
+        managers(context.os),
+    ]
 }
 
 fn platform() -> Check {

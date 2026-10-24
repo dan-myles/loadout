@@ -126,7 +126,7 @@ else, so merges stay mechanical.
 | `src/lib.rs` | `pub mod <subject>;` |
 | `src/cli.rs` | one `Command` variant and its dispatch arm |
 | `src/commands/mod.rs` | `pub mod <command>;` |
-| `src/commands/doctor.rs` | one `checks.extend(<subject>::checks(context));` line |
+| `src/commands/doctor.rs` | one `<subject>::checks(context),` element appended to the `[foundation(context), …]` list that `run` concatenates; no `mut`, no suppression |
 | `Cargo.toml`, `Cargo.lock` | the unit's dependencies. Regenerate the lock; never hand-merge it |
 | `docs/architecture.md` | move its rows from **frozen** to **foundation/built**, and record any contract change |
 
@@ -304,9 +304,20 @@ What validate enforces today, before any machine is known:
 - Targets and custom-agent paths never touch a reserved destination (section 6).
 - Every agent named anywhere is built in or declared.
 
-U1 adds the checks that need a machine: an added item that turns out incomplete, a server left with
-mixed or missing transports, cross-layer target collisions, one instructions item per agent, and
-`windows_problem` on every target that resolves for Windows.
+U1 adds the checks that need a machine:
+
+- an added item that turns out incomplete
+- a server left with mixed or missing transports
+- cross-layer target collisions
+- one instructions item per agent
+- `windows_problem` on every target that resolves for Windows
+- `reserved::check_path` on every expanded target
+
+Collisions compare **expanded** paths (`~/.config/x` and `{config}/x` collide on Linux) under the
+target file system's real case behaviour. By default that is case-insensitive on macOS and Windows
+and case-sensitive on Linux. U4 confirms it at plan time by probing the nearest existing ancestor,
+so a case-insensitive volume on Linux, or a case-sensitive APFS volume, is handled. Never assume it
+from the OS alone.
 
 ### Conditions
 
@@ -393,8 +404,14 @@ absolute when set; an empty value counts as unset.
   `true`. Every path is then derived from that home and nothing else: `{config}`, `xdg_config`, and
   the default state dir. The ambient `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are ignored, and so are
   the agent dir variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `PI_CODING_AGENT_DIR`),
-  so `Context.agent_dirs` is empty. Nothing a run reads or writes can fall outside the isolated
-  home, except an explicit `LOADOUT_STATE_DIR`.
+  so `Context.agent_dirs` is empty. Every path that **Loadout itself** reads or writes (targets,
+  agent dirs, state) stays inside the isolated home, except an explicit `LOADOUT_STATE_DIR`.
+  Isolation does not cover what a subprocess does with the real environment:
+  - `git` (U8) runs against the state dir clone only.
+  - **Package managers (U7) are never run under isolation.** Every program step becomes
+    `blocked("programs are not installed under LOADOUT_HOME isolation")`, because brew, npm,
+    cargo, uv, pipx, and flatpak write to the real `HOME` whatever `Context` says.
+  - Real package installs in E2E use a disposable VM guest's actual `HOME`, without `LOADOUT_HOME`.
 - **`LOADOUT_STATE_DIR`.** Replaces the state dir, isolated or not.
 - **Without `LOADOUT_HOME`.** Ordinary overrides apply: an absolute `XDG_CONFIG_HOME` and
   `XDG_STATE_HOME`, and the absolute agent dir variables, which are collected into
@@ -457,10 +474,13 @@ delegated defaults.
 - **Removal.** An owned target that hasn't changed since loadout wrote it is backed up, then removed.
   A drifted one is released from ownership and left in place, with a warning. Programs are never
   uninstalled in v1.
-- **Hashing** (`state::observe`, U3) is defined once:
-  - a file: SHA-256 of its bytes
-  - a tree: SHA-256 over its sorted relative paths, each with its executable bit and bytes
-  - an entry: SHA-256 of the canonical JSON of that one key
+- **Hashing** (`state::observe`, U3) is defined once. It is domain-separated by kind, so a file can
+  never hash equal to a tree or an MCP entry. `Observed::Present.sha256` is the lowercase hex of:
+  - a file: `SHA-256("loadout:file:v1\n" ‖ bytes)`
+  - a tree: `SHA-256("loadout:tree:v1\n" ‖ for each file in byte-sorted `/`-separated relative-path
+    order: path ‖ 0x00 ‖ (`x` or `-`) ‖ 0x00 ‖ u64 big-endian length ‖ bytes)`
+  - an MCP entry: `SHA-256("loadout:mcp-entry:v1\n" ‖ canonical JSON of that one key's value)`.
+    Canonical means object keys sorted, no insignificant whitespace.
 
   Plan, journal, and records all use this definition.
 - **Safe write.** Before the first write, the run's `journal.json` lists every action with its
@@ -470,10 +490,17 @@ delegated defaults.
      plan (even an unowned file planned for `replace`) is never overwritten.
   2. Resolves a symlinked target and writes the real file, so the user's links survive.
   3. Writes a temp file in the same directory, `fsync`s it, and renames it over the target.
-  4. Sets modes. An existing file keeps its permission bits and is never widened (for example, it
-     keeps `0600`); only its execute bits follow `FileContent.executable`. A new file gets the
-     default mode, plus execute bits when `executable` is set. Execute bits mean nothing on Windows
-     and are ignored there.
+  4. Sets modes, on Unix only. Start from the existing file's mode, or for a new file from the
+     process default (`0o666 & !umask`). Keep every read and write bit as it is. Then, for each
+     class (user, group, other):
+     - when `FileContent.executable` is `true`, set that class's `x` bit only if the class has its
+       `r` bit;
+     - when it is `false`, clear that class's `x` bit.
+
+     So `0644` becomes `0755`, `0600` becomes `0700`, and `0755` without `executable` becomes
+     `0644`. Nothing is ever widened beyond the existing read bits. Windows ignores `executable`
+     and execute bits entirely. Content hashes include the bit, so a mode-only change is an
+     `update`.
   5. Marks the action done in the journal.
 - **Rollback.** `loadout rollback [RUN]` restores a run's backups and deletes the files that run
   created; the default is the latest run. `status` reports an interrupted run, and the same command
@@ -600,6 +627,9 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   `pacman`, `zypper`, `snap`, `choco`, and machine-scoped winget installers are `blocked` unless
   `apply --elevated` is passed. With it, they run through `sudo` on Unix, or the installer raises
   UAC on Windows. The background service never elevates.
+- **Isolation.** Under `LOADOUT_HOME` (`Context.isolated`), every program step is
+  `blocked("programs are not installed under LOADOUT_HOME isolation")` and no manager is run.
+  Real installs are tested only in a disposable VM guest's actual `HOME` (section 4).
 - No direct downloads and no install scripts in v1. Loadout never installs a package manager itself;
   doctor names what is missing.
 
@@ -673,9 +703,30 @@ pub fn detect(context: &Context) -> Result<Facts, machine::Error>;
 pub fn name(context: &Context) -> Result<Name, machine::Error>;
 
 // context (foundation)
-pub struct Context { pub os: Os, pub home: PathBuf, pub config: PathBuf, pub state: PathBuf }
-impl Context { pub fn from_env() -> Result<Self, context::Error>; pub fn expand(&self, path: &str) -> Option<PathBuf>; }
-pub fn which(program: &str) -> Option<PathBuf>;
+pub struct Context {
+    pub os: Os, pub home: PathBuf, pub isolated: bool, pub config: PathBuf, pub xdg_config: PathBuf,
+    pub state: PathBuf, pub agent_dirs: BTreeMap<&'static str, PathBuf>,
+}
+impl Context {
+    pub fn from_env() -> Result<Self, context::Error>;
+    pub fn resolve(os: Os, var: impl Fn(&str) -> Option<OsString>, default_home: Option<PathBuf>) -> Result<Self, context::Error>;
+    pub fn expand(&self, path: &str) -> Option<PathBuf>;       // None for unclean paths, and Windows-unsafe parts on Windows
+    pub fn agent_dir(&self, var: &str) -> Option<&Path>;        // always None under isolation
+    pub fn machine_file(&self) -> PathBuf;
+}
+pub const AGENT_DIR_VARS: [&str; 4];                            // CLAUDE_CONFIG_DIR, CODEX_HOME, GROK_HOME, PI_CODING_AGENT_DIR
+pub fn split_base(path: &str) -> Option<(Base, &str)>;          // Base::{Home, Config}
+pub fn windows_problem(rest: &str) -> Option<String>;
+pub fn which(program: &str) -> Option<PathBuf>;                 // executable files only on Unix
+
+// reserved (foundation)
+pub const TABLE: &[Entry];                                      // Entry { anchor: Anchor, path, kind: Kind }
+pub enum Kind { Auth, SharedConfig, LoadoutState, Private }
+pub enum Use { Write, WriteInto, KeyMerge }
+pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
+pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5, expanded and canonical
+
+// commands::doctor (foundation): units extend `[foundation(context), <subject>::checks(context), …].concat()`
 
 // diagnostic (foundation)
 pub struct Diagnostic { pub severity: Severity, pub file: Option<PathBuf>, pub key: Option<String>, pub message: String }
@@ -705,7 +756,7 @@ pub fn materialize(resolved: &Resolved, facts: &Facts, context: &Context) -> Res
 pub fn checks(context: &Context) -> Vec<Check>;
 
 // programs (U7)
-pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts) -> Result<Vec<Step>, programs::Error>;
+pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts, context: &Context) -> Result<Vec<Step>, programs::Error>; // every step blocked when context.isolated
 pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;
 pub fn checks(context: &Context) -> Vec<Check>;
 
