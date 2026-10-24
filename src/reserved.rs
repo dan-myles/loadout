@@ -1216,16 +1216,16 @@ mod tests {
 
     #[test]
     fn unverifiable_sources_and_anchors_refuse() {
-        let (_dir, home) = source_home();
+        let (dir, home) = source_home();
         let context = native(&home, &[]);
         let file = made(home.join("skills").join("review.md"));
         let relative = Path::new("skills").join("review.md");
         assert_eq!(source(&context, &home, &relative), Found::Unverifiable);
 
-        let broken = native(
-            &home,
-            &[("CODEX_HOME", home.join("missing").join("..").join("codex"))],
-        );
+        // Built from the non-canonical temp path: in a Windows verbatim (\\?\) path, `..` is
+        // a literal name rather than a parent step, so it would not exercise this refusal.
+        let unclean = dir.path().join("missing").join("..").join("codex");
+        let broken = native(&home, &[("CODEX_HOME", unclean)]);
         assert_eq!(source(&broken, &home, &file), Found::Unverifiable);
     }
 
