@@ -1,0 +1,6 @@
+[files.git-ignore]
+remove = true
+
+[files.powershell-profile]
+source = "files/profile.ps1"
+target = "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"

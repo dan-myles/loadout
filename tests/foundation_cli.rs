@@ -1,0 +1,1705 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/foundation")
+        .join(name)
+}
+
+fn loadout(args: &[&str], home: &Path, state: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .args(args)
+        .env("LOADOUT_HOME", home)
+        .env("LOADOUT_STATE_DIR", state)
+        .output()
+        .unwrap()
+}
+
+struct Sandbox {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    state: PathBuf,
+}
+
+impl Sandbox {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("state");
+        fs::create_dir(&home).unwrap();
+        Self {
+            _dir: dir,
+            home,
+            state,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        loadout(args, &self.home, &self.state)
+    }
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+fn validate_text(text: &str) -> (i32, String) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loadout.toml"), text).unwrap();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["validate", dir.path().to_str().unwrap()]);
+    (output.status.code().unwrap(), stdout(&output))
+}
+
+#[test]
+fn help_lists_only_working_commands() {
+    let output = Sandbox::new().run(&["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let help = stdout(&output);
+    assert!(help.contains("doctor"), "{help}");
+    assert!(help.contains("validate"), "{help}");
+    for future in [
+        "apply", "plan", "status", "rollback", "update", "service", "init",
+    ] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(future)),
+            "{future} must not be advertised before it works:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn version_prints_package_version() {
+    let output = Sandbox::new().run(&["--version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("loadout {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn unknown_command_is_a_usage_error() {
+    let output = Sandbox::new().run(&["apply"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn complete_fixture_is_valid() {
+    let output = Sandbox::new().run(&["validate", fixture("complete").to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    assert!(stdout(&output).contains("valid:"));
+}
+
+#[test]
+fn complete_fixture_json_lists_every_layer() {
+    let output = Sandbox::new().run(&["validate", fixture("complete").to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["valid"], true);
+    let layers: Vec<String> = report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["file"].as_str().unwrap().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        layers,
+        [
+            "loadout.toml",
+            "os/linux.toml",
+            "os/macos.toml",
+            "os/windows.toml",
+            "tags/gaming.toml",
+            "tags/laptop.toml",
+            "tags/work.toml",
+            "machines/work-laptop.toml",
+        ]
+    );
+    assert_eq!(report["diagnostics"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn invalid_fixture_reports_each_mistake() {
+    let output = Sandbox::new().run(&["validate", fixture("invalid").to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    let text = stdout(&output).replace('\\', "/");
+    for expected in [
+        "os/beos.toml: error: unknown OS layer",
+        "tags/work.toml: error: TOML parse error",
+        "unknown field `sorce`",
+        "tag \"missing-tag\" has no valid layer file",
+        "tag \"work\" is listed twice",
+        "machines.box.tags: tag \"work\" has no valid layer file tags/work.toml",
+        "machines/ghost.toml: error: machine \"ghost\" has a layer file but no [machines.ghost] entry",
+        "variables.machine: `machine` is reserved",
+        "update.interval_minutes: must be at least 15",
+        "agents.enabled: unknown agent \"nobody\"",
+        "agents.custom.acme.mcp.linux: \"/etc/acme.json\" must start with ~/",
+        "agents.custom.acme.mcp.format: shape codex-toml needs format toml",
+        "agents.custom.acme.mcp.map: must be a pointer",
+        "agents.custom.claude: claude is a built-in agent",
+        "agents.custom.claude.evidence: say where these paths come from",
+        "files.escape.source: \"../outside\" must be a relative path",
+        "files.escape.target: \"/etc/passwd\" must start with ~/",
+        "files.half: missing source",
+        "skills.empty.source: skills/empty has no SKILL.md",
+        "mcp.both: a server has either command (stdio) or url (remote), not both",
+        "warning: mcp.leak.headers.Authorization: looks like a credential",
+        "programs.nothing: the global layer has nothing to remove",
+        "invalid:",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn invalid_fixture_json_carries_file_and_key() {
+    let output = Sandbox::new().run(&["validate", fixture("invalid").to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["valid"], false);
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["severity"] == "error"
+            && diagnostic["file"] == "loadout.toml"
+            && diagnostic["key"] == "files.half"
+            && diagnostic["message"] == "missing source"
+    }));
+}
+
+#[test]
+fn missing_directory_and_root_file_are_invalid() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["validate", sandbox.home.join("nope").to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stdout(&output).contains("is not a directory"));
+
+    let output = sandbox.run(&["validate", sandbox.home.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stdout(&output).contains("loadout.toml: error: cannot read"));
+}
+
+#[test]
+fn header_is_required_and_versioned() {
+    let (code, text) = validate_text("[variables]\na = \"b\"\n");
+    assert_eq!(code, 3);
+    assert!(text.contains("missing [loadout] table"), "{text}");
+
+    let (code, text) = validate_text("[loadout]\nversion = 2\n");
+    assert_eq!(code, 3);
+    assert!(text.contains("loadout.version is 2"), "{text}");
+
+    let (code, text) = validate_text("[loadout]\nversion = 1\n");
+    assert_eq!(code, 0, "{text}");
+}
+
+#[test]
+fn global_layer_cannot_edit_or_remove() {
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n[agents]\nenabled = { add = [\"claude\"] }\n[files.a]\nremove = true\n",
+    );
+    assert_eq!(code, 3);
+    assert!(
+        text.contains("agents.enabled: the global layer has no inherited list to edit"),
+        "{text}"
+    );
+    assert!(
+        text.contains("files.a: the global layer has nothing to remove"),
+        "{text}"
+    );
+}
+
+#[test]
+fn remove_stands_alone_and_replace_must_be_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("loadout.toml"),
+        "[loadout]\nversion = 1\n[machines.box]\ntags = [\"t\"]\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("tags")).unwrap();
+    fs::write(
+        dir.path().join("tags/t.toml"),
+        "[files.a]\nremove = true\ntarget = \"~/.a\"\n[programs.p]\nreplace = true\n[mcp.m]\nreplace = true\n",
+    )
+    .unwrap();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap()]);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        text.contains("files.a: remove = true stands alone"),
+        "{text}"
+    );
+    assert!(
+        text.contains("programs.p: a program needs at least one manager"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mcp.m: missing command (stdio server) or url"),
+        "{text}"
+    );
+}
+
+#[test]
+fn unknown_keys_and_wrong_types_are_rejected() {
+    let (code, text) = validate_text("[loadout]\nversion = 1\nfoo = 1\n");
+    assert_eq!(code, 3);
+    assert!(text.contains("unknown field `foo`"), "{text}");
+
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n[programs.x]\nbrew = \"x\"\nwhen = { os = \"beos\" }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n[agents.custom.x]\nevidence = \"e\"\nskills = { linux = \"~/x\" }\nmcp = { linux = \"~/x.json\", format = \"json\", map = \"/m\", shape = \"made-up\", env_syntax = \"none\" }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("made-up"), "{text}");
+}
+
+fn validate_tree(files: &[(&str, &str)]) -> (i32, String) {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, text) in files {
+        let path = dir.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap()]);
+    (output.status.code().unwrap(), stdout(&output))
+}
+
+#[test]
+fn nul_in_a_target_is_rejected_everywhere() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[files.x]\nsource = \"f\"\ntarget = \"~/a\\u0000b\"\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("files.x.target"), "{text}");
+}
+
+#[test]
+fn windows_path_rules_apply_only_where_windows_is_reached() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[files.anywhere]\nsource = \"f\"\ntarget = \"~/C:/Windows/x\"\n[files.unix]\nsource = \"f\"\ntarget = \"~/notes:2026\"\nwhen = { os = [\"linux\", \"macos\"] }\n",
+        ),
+        ("f", "x"),
+        (
+            "os/linux.toml",
+            "[files.colon]\nsource = \"f\"\ntarget = \"~/.local/share/a:b\"\n",
+        ),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("warning: files.anywhere.target: \"C:\" contains ':'"),
+        "{text}"
+    );
+    assert!(!text.contains("files.unix"), "{text}");
+    assert!(!text.contains("files.colon"), "{text}");
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[agents.custom.dv]\nevidence = \"e\"\nskills = { windows = \"{config}/D:/evil\", linux = \"~/dv:skills\" }\n",
+        ),
+        ("f", "x"),
+        (
+            "os/windows.toml",
+            "[files.device]\nsource = \"f\"\ntarget = \"~/Documents/NUL.txt\"\n",
+        ),
+    ]);
+    let text = text.replace('\\', "/");
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("error: agents.custom.dv.skills.windows: \"D:\" contains ':'"),
+        "{text}"
+    );
+    assert!(!text.contains("skills.linux"), "{text}");
+    assert!(
+        text.contains(
+            "os/windows.toml: error: files.device.target: \"NUL.txt\" is a Windows device name"
+        ),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_source_cannot_escape_the_loadout() {
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret"), "x").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+    fs::write(
+        dir.path().join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.a]\nsource = \"link\"\ntarget = \"~/.a\"\n",
+    )
+    .unwrap();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stdout(&output).contains("link resolves outside the loadout"));
+}
+
+#[cfg(unix)]
+fn skill_case(build: impl FnOnce(&Path, &Path)) -> (i32, String) {
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside");
+    let root = scratch.path().join("loadout");
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    fs::write(outside.join("key"), "synthetic outside file").unwrap();
+    fs::create_dir_all(root.join("skill")).unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[skills.x]\nsource = \"skill\"\n",
+    )
+    .unwrap();
+    build(&root, &outside);
+    let output = Sandbox::new().run(&["validate", root.to_str().unwrap(), "--json"]);
+    (output.status.code().unwrap(), stdout(&output))
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_contents_cannot_escape_through_links() {
+    use std::os::unix::fs::symlink;
+
+    let (code, text) = skill_case(|root, outside| {
+        symlink(outside.join("key"), root.join("skill/SKILL.md")).unwrap();
+    });
+    assert_eq!(code, 3, "escaping SKILL.md: {text}");
+    assert!(
+        text.contains("skill/SKILL.md links outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = skill_case(|root, outside| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        fs::create_dir(root.join("skill/scripts")).unwrap();
+        symlink(outside.join("key"), root.join("skill/scripts/leak")).unwrap();
+    });
+    assert_eq!(code, 3, "nested escaping file: {text}");
+    assert!(
+        text.contains("skill/scripts/leak links outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = skill_case(|root, outside| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(outside.join("dir"), root.join("skill/dir")).unwrap();
+    });
+    assert_eq!(code, 3, "escaping folder: {text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(root.join("skill"), root.join("skill/loop")).unwrap();
+    });
+    assert_eq!(code, 3, "self loop: {text}");
+    assert!(text.contains("skill/loop links to a folder"), "{text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        symlink(root.join("missing"), root.join("skill/broken")).unwrap();
+    });
+    assert_eq!(code, 3, "broken link: {text}");
+    assert!(text.contains("skill/broken is a broken link"), "{text}");
+
+    let (code, text) = skill_case(|root, _| {
+        fs::write(root.join("shared.md"), "x").unwrap();
+        symlink(root.join("shared.md"), root.join("skill/SKILL.md")).unwrap();
+    });
+    assert_eq!(code, 0, "in-loadout file link stays valid: {text}");
+}
+
+const MINIMAL: &str = "[loadout]\nversion = 1\n";
+#[cfg(unix)]
+const BAD_LAYER: &str = "[nonsense]\nx = 1\n";
+
+#[test]
+fn a_layer_path_that_is_not_a_folder_is_an_error() {
+    for dir in ["os", "tags", "machines"] {
+        let (code, text) = validate_tree(&[("loadout.toml", MINIMAL), (dir, "not a folder")]);
+        assert_eq!(code, 3, "{dir}: {text}");
+        assert!(
+            text.contains(&format!(
+                "{dir}: error: must be a folder of <name>.toml layer files"
+            )),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn only_known_folder_metadata_is_ignored() {
+    let (code, text) = validate_tree(&[
+        ("loadout.toml", MINIMAL),
+        ("os/.DS_Store", "finder"),
+        ("tags/.gitkeep", ""),
+        ("machines/.gitkeep", ""),
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let (code, text) = validate_tree(&[("loadout.toml", MINIMAL), ("os/.hidden.toml", "")]);
+    assert_eq!(code, 3, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_layer_folder_is_an_error_not_an_absent_layer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loadout.toml"), MINIMAL).unwrap();
+    fs::create_dir(dir.path().join("os")).unwrap();
+    fs::write(dir.path().join("os/linux.toml"), BAD_LAYER).unwrap();
+    fs::set_permissions(dir.path().join("os"), fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(dir.path().join("os")).is_ok();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap(), "--json"]);
+    fs::set_permissions(dir.path().join("os"), fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        eprintln!("running with permission to read a 000 folder (root?); skipped");
+        return;
+    }
+    assert_eq!(output.status.code(), Some(3), "{}", stdout(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["valid"], false);
+    assert!(stdout(&output).contains("cannot read"));
+}
+
+#[cfg(unix)]
+#[test]
+fn manifests_and_layer_folders_cannot_live_outside_the_loadout() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside");
+    fs::create_dir_all(outside.join("os")).unwrap();
+    fs::write(outside.join("linux.toml"), "").unwrap();
+    fs::write(outside.join("loadout.toml"), MINIMAL).unwrap();
+
+    let case = |name: &str, build: &dyn Fn(&Path)| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        build(&root);
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let (code, text) = case("layer-file", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        fs::create_dir(root.join("os")).unwrap();
+        symlink(outside.join("linux.toml"), root.join("os/linux.toml")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("os/linux.toml: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("layer-dir", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        symlink(outside.join("os"), root.join("os")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("os: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("root-file", &|root| {
+        symlink(outside.join("loadout.toml"), root.join("loadout.toml")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("loadout.toml: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("inside-link", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        fs::create_dir_all(root.join("shared")).unwrap();
+        fs::write(root.join("shared/linux.toml"), "").unwrap();
+        fs::create_dir(root.join("os")).unwrap();
+        symlink(root.join("shared/linux.toml"), root.join("os/linux.toml")).unwrap();
+    });
+    assert_eq!(code, 0, "a link inside the loadout stays valid: {text}");
+}
+
+#[test]
+fn machine_tags_must_be_ids_that_name_a_loaded_layer() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[machines.box]\ntags = [\"../other\", \"Work\", \"../loadout\"]\n",
+        ),
+        ("other.toml", ""),
+        ("tags/work.toml", ""),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    for tag in ["../other", "Work", "../loadout"] {
+        assert!(
+            text.contains(&format!(
+                "machines.box.tags: tag {tag:?} must be lowercase letters"
+            )),
+            "{tag}: {text}"
+        );
+    }
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[machines.box]\ntags = [\"work\"]\n",
+        ),
+        ("tags/work.toml", ""),
+    ]);
+    assert_eq!(code, 0, "{text}");
+}
+
+#[test]
+fn remote_urls_and_map_pointers_must_be_well_formed() {
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n[mcp.x]\nurl = \"https://\"\n[agents.custom.c]\nevidence = \"e\"\nmcp = { linux = \"~/c.json\", format = \"json\", map = \"/mcp~2servers\", shape = \"cursor-json\", env_syntax = \"none\" }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("mcp.x.url: needs a host name"), "{text}");
+    assert!(
+        text.contains("agents.custom.c.mcp.map: must be a pointer"),
+        "{text}"
+    );
+}
+
+fn validate_url(url: &str) -> (i32, String, Value) {
+    let text = format!("[loadout]\nversion = 1\n[mcp.x]\nurl = \"{url}\"\n");
+    let (code, human) = validate_text(&text);
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loadout.toml"), &text).unwrap();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap(), "--json"]);
+    assert_eq!(
+        output.status.code().unwrap(),
+        code,
+        "{url}: human and JSON exits differ"
+    );
+    (code, human, serde_json::from_slice(&output.stdout).unwrap())
+}
+
+#[test]
+fn bracketed_hosts_must_be_real_ipv6_addresses() {
+    for bad in [
+        "https://[::::]/mcp",
+        "https://[abcd]/mcp",
+        "https://[abc]/mcp",
+        "https://[1:2:3]/mcp",
+        "https://[::1::2]/mcp",
+        "https://[12345::]/mcp",
+        "https://[127.0.0.1]/mcp",
+    ] {
+        let (code, human, json) = validate_url(bad);
+        assert_eq!(code, 3, "{bad}: {human}");
+        assert!(human.contains("mcp.x.url: host ["), "{bad}: {human}");
+        assert_eq!(json["valid"], false, "{bad}");
+        assert_eq!(json["diagnostics"][0]["key"], "mcp.x.url", "{bad}");
+    }
+    for good in [
+        "https://[2001:db8::1]:65535/mcp",
+        "https://[::ffff:192.0.2.1]/mcp",
+        "https://example.com./mcp",
+    ] {
+        let (code, human, json) = validate_url(good);
+        assert_eq!(code, 0, "{good}: {human}");
+        assert_eq!(json["valid"], true, "{good}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_manifest_that_is_not_a_regular_file_is_invalid_not_a_hang() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
+
+    let mkfifo = |path: &Path| {
+        let status = Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(status.success());
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let fifo = scratch.path().join("fifo");
+    fs::create_dir(&fifo).unwrap();
+    mkfifo(&fifo.join("loadout.toml"));
+    let linked = scratch.path().join("linked");
+    fs::create_dir(&linked).unwrap();
+    mkfifo(&linked.join("pipe"));
+    symlink(linked.join("pipe"), linked.join("loadout.toml")).unwrap();
+    let dir = scratch.path().join("dir");
+    fs::create_dir_all(dir.join("loadout.toml")).unwrap();
+
+    for root in [&fifo, &linked, &dir] {
+        for json in [false, true] {
+            let mut args = vec!["validate", root.to_str().unwrap()];
+            if json {
+                args.push("--json");
+            }
+            let sandbox = Sandbox::new();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_loadout"))
+                .args(&args)
+                .env("LOADOUT_HOME", &sandbox.home)
+                .env("LOADOUT_STATE_DIR", &sandbox.state)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    panic!("validate {args:?} hung on a non-regular loadout.toml");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(status.code(), Some(3), "{args:?}");
+            assert!(
+                stdout(&output).contains("must be a regular file"),
+                "{args:?}: {}",
+                stdout(&output)
+            );
+        }
+    }
+
+    let regular = scratch.path().join("regular");
+    fs::create_dir_all(regular.join("shared")).unwrap();
+    fs::write(regular.join("shared/root.toml"), MINIMAL).unwrap();
+    symlink(
+        regular.join("shared/root.toml"),
+        regular.join("loadout.toml"),
+    )
+    .unwrap();
+    let output = Sandbox::new().run(&["validate", regular.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn tag_references_never_consult_a_rejected_outside_tags_folder() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside-tags");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("work.toml"), "").unwrap();
+    let root = scratch.path().join("loadout");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[machines.box]\ntags = [\"work\"]\n",
+    )
+    .unwrap();
+    symlink(&outside, root.join("tags")).unwrap();
+    let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(3), "{text}");
+    assert!(
+        text.contains("tags: error: resolves outside the loadout"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tag \"work\" has no valid layer file tags/work.toml"),
+        "the outside work.toml must not satisfy the reference: {text}"
+    );
+}
+
+#[test]
+fn reserved_destinations_are_rejected_but_siblings_and_key_merges_pass() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n\
+             [files.a]\nsource = \"f\"\ntarget = \"~/.codex/auth.json\"\n\
+             [files.b]\nsource = \"f\"\ntarget = \"~/.claude.json\"\n\
+             [files.c]\nsource = \"f\"\ntarget = \"~/.claude/.credentials.json\"\n\
+             [files.d]\nsource = \"f\"\ntarget = \"{config}/loadout/machine.toml\"\n\
+             [files.e]\nsource = \"f\"\ntarget = \"~/.local/state/loadout/state.json\"\n\
+             [files.f]\nsource = \"f\"\ntarget = \"~/.codex\"\n\
+             [agents.custom.x]\nevidence = \"e\"\ninstructions = { linux = \"~/.claude.json\" }\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    for (key, reason) in [
+        ("files.a.target", "auth or OAuth store"),
+        ("files.b.target", "shared config"),
+        ("files.c.target", "auth or OAuth store"),
+        ("files.d.target", "loadout's own state"),
+        ("files.e.target", "loadout's own state"),
+        ("files.f.target", "auth or OAuth store"),
+        ("agents.custom.x.instructions.linux", "shared config"),
+    ] {
+        assert!(
+            text.lines()
+                .any(|line| line.contains(key) && line.contains(reason)),
+            "{key}: {text}"
+        );
+    }
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n\
+             [files.a]\nsource = \"f\"\ntarget = \"~/.claude/CLAUDE.md\"\n\
+             [agents.custom.x]\nevidence = \"e\"\nskills = { linux = \"~/.claude/skills\" }\n\
+             mcp = { linux = \"~/.cursor/mcp.json\", format = \"json\", map = \"/mcpServers\", shape = \"cursor-json\", env_syntax = \"${env:VAR}\" }\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_metadata_is_never_loadout_content() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let case = |name: &str, manifest: &str, build: &dyn Fn(&Path)| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(
+            root.join(".git/config"),
+            "[remote]\nurl = https://user:token@x\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        build(&root);
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let skill = |root: &Path| {
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    };
+
+    let (code, text) = case(
+        "direct",
+        "[files.a]\nsource = \".git/config\"\ntarget = \"~/.a\"\n",
+        &|_| {},
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains(".git/config is Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "file-link",
+        "[files.a]\nsource = \"cfg\"\ntarget = \"~/.a\"\n",
+        &|root| symlink(root.join(".git/config"), root.join("cfg")).unwrap(),
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("cfg is Git metadata"), "{text}");
+
+    let (code, text) = case("skill-link", "[skills.s]\nsource = \"skill\"\n", &|root| {
+        skill(root);
+        symlink(root.join(".git/config"), root.join("skill/cfg")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("skill/cfg links into Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "skill-worktree-file",
+        "[skills.s]\nsource = \"skill\"\n",
+        &|root| {
+            skill(root);
+            fs::write(root.join("skill/.git"), "gitdir: ../.git/worktrees/x\n").unwrap();
+        },
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("skill/.git is Git metadata"), "{text}");
+
+    let (code, text) = case(
+        "skill-nested-repo",
+        "[skills.s]\nsource = \"skill\"\n",
+        &|root| {
+            skill(root);
+            fs::create_dir_all(root.join("skill/vendor/.GIT")).unwrap();
+        },
+    );
+    assert_eq!(code, 3, "{text}");
+
+    let (code, text) = case("clean", "[skills.s]\nsource = \"skill\"\n", &skill);
+    assert_eq!(
+        code, 0,
+        "a loadout's own .git beside a skill is fine: {text}"
+    );
+}
+
+#[test]
+fn shared_configs_accept_only_their_own_mcp_map_from_custom_agents() {
+    let custom = |file: &str, map: &str, format: &str, shape: &str| {
+        format!(
+            "[loadout]\nversion = 1\n[agents]\nenabled = [\"test\"]\n[agents.custom.test]\nevidence = \"e\"\nmcp = {{ linux = \"{file}\", format = \"{format}\", map = \"{map}\", shape = \"{shape}\", env_syntax = \"none\" }}\n[mcp.x]\ncommand = \"c\"\n"
+        )
+    };
+    for (file, map, format, shape) in [
+        ("~/.claude.json", "/oauthAccount", "json", "claude-json"),
+        ("~/.claude.json", "/projects", "json", "claude-json"),
+        ("~/.codex/config.toml", "/projects", "toml", "codex-toml"),
+        ("~/.claude.json", "/mcpServers", "json", "cursor-json"),
+    ] {
+        let (code, text) = validate_text(&custom(file, map, format, shape));
+        assert_eq!(code, 3, "{file} {map} {shape}: {text}");
+        assert!(text.contains("agents.custom.test.mcp.linux"), "{text}");
+        assert!(text.contains("shared config"), "{text}");
+    }
+    for (file, map, format, shape) in [
+        ("~/.claude.json", "/mcpServers", "json", "claude-json"),
+        ("~/.codex/config.toml", "/mcp_servers", "toml", "codex-toml"),
+        ("~/.test/mcp.json", "/customMap", "json", "cursor-json"),
+    ] {
+        let (code, text) = validate_text(&custom(file, map, format, shape));
+        assert_eq!(code, 0, "{file} {map}: {text}");
+    }
+}
+
+#[cfg(unix)]
+fn git(scratch: &Path, dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", scratch)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_metadata_is_found_behind_links_gitfiles_and_separate_dirs() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let validate = |root: &Path, manifest: &str| {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap(), "--json"]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let file = |source: &str| format!("[files.a]\nsource = \"{source}\"\ntarget = \"~/.a\"\n");
+    let skill = "[skills.s]\nsource = \"skill\"\n";
+    let make_skill = |root: &Path| {
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    };
+
+    let linked = scratch.join("linked");
+    fs::create_dir_all(linked.join("meta")).unwrap();
+    fs::write(linked.join("meta/config"), "synthetic").unwrap();
+    symlink(linked.join("meta"), linked.join(".git")).unwrap();
+    for source in [".git/config", "meta/config"] {
+        let (code, text) = validate(&linked, &file(source));
+        assert_eq!(code, 3, "{source}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    let separate = scratch.join("separate");
+    fs::create_dir_all(&separate).unwrap();
+    git(
+        scratch,
+        &separate,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            separate.join("metadata").to_str().unwrap(),
+        ],
+    );
+    symlink(separate.join("metadata/config"), separate.join("alias")).unwrap();
+    make_skill(&separate);
+    symlink(
+        separate.join("metadata/config"),
+        separate.join("skill/config"),
+    )
+    .unwrap();
+    for manifest in [
+        file("metadata/config"),
+        file("alias"),
+        file(".git"),
+        skill.to_owned(),
+    ] {
+        let (code, text) = validate(&separate, &manifest);
+        assert_eq!(code, 3, "{manifest}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    let pointer = scratch.join("pointer");
+    fs::create_dir_all(pointer.join("metadata")).unwrap();
+    fs::write(pointer.join("metadata/config"), "synthetic").unwrap();
+    fs::write(pointer.join("metadata-pointer"), "gitdir: metadata\n").unwrap();
+    symlink(pointer.join("metadata-pointer"), pointer.join(".git")).unwrap();
+    for source in ["metadata-pointer", "metadata/config"] {
+        let (code, text) = validate(&pointer, &file(source));
+        assert_eq!(code, 3, "{source}: {text}");
+    }
+
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let worktree = scratch.join("worktree");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::create_dir_all(worktree.join("files")).unwrap();
+    symlink(main.join(".git/config"), worktree.join("files/common")).unwrap();
+    let (code, text) = validate(&worktree, &file("files/common"));
+    assert_eq!(code, 3, "worktree commondir: {text}");
+
+    let broken = scratch.join("broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join(".git"), "not a pointer\n").unwrap();
+    let (code, text) = validate(&broken, "");
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("unsupported Git metadata layout"), "{text}");
+
+    let clean = scratch.join("clean");
+    fs::create_dir_all(&clean).unwrap();
+    git(scratch, &clean, &["init", "-q"]);
+    fs::write(clean.join(".gitconfig"), "[user]\n").unwrap();
+    make_skill(&clean);
+    let (code, text) = validate(&clean, &format!("{}{skill}", file(".gitconfig")));
+    assert_eq!(
+        code, 0,
+        ".gitconfig and a skill beside a repo stay valid: {text}"
+    );
+}
+
+#[test]
+fn well_known_credential_files_are_reserved_targets() {
+    let manifest = |target: &str| {
+        format!("[loadout]\nversion = 1\n[files.a]\nsource = \"f\"\ntarget = \"{target}\"\n")
+    };
+    for target in [
+        "~/.ssh/id_ed25519",
+        "~/.aws/credentials",
+        "~/.netrc",
+        "{config}/gh/hosts.yml",
+    ] {
+        let (code, text) = validate_tree(&[("loadout.toml", &manifest(target)), ("f", "x")]);
+        assert_eq!(code, 3, "{target}: {text}");
+        assert!(text.contains("auth or OAuth store"), "{text}");
+    }
+    for target in ["~/.aws/config", "~/.gitconfig"] {
+        let (code, text) = validate_tree(&[("loadout.toml", &manifest(target)), ("f", "x")]);
+        assert_eq!(code, 0, "{target}: {text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_skill_folder_holding_the_real_git_metadata_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let manifest = "[loadout]\nversion = 1\n[skills.x]\nsource = \"skill\"\n";
+    let setup = |name: &str| {
+        let root = scratch.join(name);
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        fs::write(root.join("loadout.toml"), manifest).unwrap();
+        root
+    };
+    let run = |root: &Path, json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let gitfile = setup("gitfile");
+    let metadata = gitfile.join("skill/metadata");
+    git(
+        scratch,
+        &gitfile,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let linked = setup("linked");
+    git(
+        scratch,
+        &linked,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            linked.join("skill/metadata").to_str().unwrap(),
+        ],
+    );
+    fs::remove_file(linked.join(".git")).unwrap();
+    symlink(linked.join("skill/metadata"), linked.join(".git")).unwrap();
+    for root in [&gitfile, &linked] {
+        for json in [false, true] {
+            let (code, text) = run(root, json);
+            assert_eq!(code, 3, "{root:?} json={json}: {text}");
+            assert!(text.contains("the loadout's Git metadata"), "{text}");
+        }
+    }
+
+    let clean = setup("clean");
+    git(scratch, &clean, &["init", "-q"]);
+    fs::write(clean.join("skill/.gitconfig"), "[user]\n").unwrap();
+    for json in [false, true] {
+        assert_eq!(
+            run(&clean, json).0,
+            0,
+            "clean skill with .gitconfig stays valid"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worktree_admin_dir_reserves_its_common_dir_in_every_form() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let root = scratch.join("case");
+    let main = root.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    git(
+        scratch,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            scratch.join("wt").to_str().unwrap(),
+        ],
+    );
+    fs::rename(main.join(".git"), root.join("common")).unwrap();
+    let admin = fs::read_dir(root.join("common/worktrees"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.a]\nsource = \"common/config\"\ntarget = \"~/.a\"\n",
+    )
+    .unwrap();
+    let run = |json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    symlink(&admin, root.join(".git")).unwrap();
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(code, 3, "directory-form .git json={json}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    fs::remove_file(root.join(".git")).unwrap();
+    fs::write(root.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    for json in [false, true] {
+        assert_eq!(run(json).0, 3, "gitfile-form .git json={json}");
+    }
+
+    fs::write(admin.join("commondir"), "garbage-not-a-dir\n").unwrap();
+    let (code, text) = run(false);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("unsupported Git metadata layout"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_pointers_outside_the_loadout_are_refused_without_being_opened() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let outside = scratch.join("home/.codex");
+    fs::create_dir_all(&outside).unwrap();
+    let fifo = outside.join("auth.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let validate = |root: &Path| {
+        let sandbox = Sandbox::new();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+        command
+            .args(["validate", root.to_str().unwrap()])
+            .env("LOADOUT_HOME", &sandbox.home)
+            .env("LOADOUT_STATE_DIR", &sandbox.state);
+        let output = run_with_deadline(command);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let case = |name: &str| {
+        let root = scratch.join(name);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+        root
+    };
+
+    let dot = case("dot-link");
+    symlink(&fifo, dot.join(".git")).unwrap();
+    let (code, text) = validate(&dot);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("resolves outside the loadout, which loadout never reads"),
+        "{text}"
+    );
+
+    let common = case("commondir-link");
+    fs::create_dir(common.join("admin")).unwrap();
+    fs::write(common.join(".git"), "gitdir: admin\n").unwrap();
+    symlink(&fifo, common.join("admin/commondir")).unwrap();
+    let (code, text) = validate(&common);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("resolves outside the loadout, which loadout never reads"),
+        "{text}"
+    );
+
+    let pointer_dir = scratch.join("outside-meta");
+    fs::create_dir_all(&pointer_dir).unwrap();
+    fs::write(
+        scratch.join("outside-pointer"),
+        format!("gitdir: {}\n", pointer_dir.display()),
+    )
+    .unwrap();
+    let generic = case("generic-outside-pointer");
+    symlink(scratch.join("outside-pointer"), generic.join(".git")).unwrap();
+    let (code, text) = validate(&generic);
+    assert_eq!(
+        code, 3,
+        "a valid-looking outside pointer is still never read: {text}"
+    );
+
+    let inside = case("inside-pointer-link");
+    fs::create_dir(inside.join("meta")).unwrap();
+    fs::write(inside.join("pointer"), "gitdir: meta\n").unwrap();
+    symlink(inside.join("pointer"), inside.join(".git")).unwrap();
+    let (code, text) = validate(&inside);
+    assert_eq!(
+        code, 0,
+        "a pointer link inside the loadout stays readable: {text}"
+    );
+
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let worktree = scratch.join("worktree");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::write(worktree.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+    let (code, text) = validate(&worktree);
+    assert_eq!(code, 0, "an ordinary worktree checkout stays valid: {text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unresolvable_commondir_fails_validation_instead_of_counting_as_absent() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let case = |name: &str| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(root.join("meta")).unwrap();
+        fs::write(root.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+        fs::write(root.join(".git"), "gitdir: meta\n").unwrap();
+        root
+    };
+    let run = |root: &Path, json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let dangling = case("dangling");
+    symlink(
+        dangling.join("meta/missing"),
+        dangling.join("meta/commondir"),
+    )
+    .unwrap();
+    let denied = case("denied");
+    fs::create_dir_all(denied.join("locked/x")).unwrap();
+    symlink(
+        denied.join("locked/x/target"),
+        denied.join("meta/commondir"),
+    )
+    .unwrap();
+    fs::set_permissions(denied.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let enforced = fs::read_dir(denied.join("locked")).is_err();
+
+    for json in [false, true] {
+        let (code, text) = run(&dangling, json);
+        assert_eq!(code, 3, "dangling commondir json={json}: {text}");
+        if enforced {
+            let (code, text) = run(&denied, json);
+            assert_eq!(code, 3, "denied commondir json={json}: {text}");
+        }
+    }
+    fs::set_permissions(denied.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_git_pointers_resolve_from_git_logical_base_not_the_link_target() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let root = scratch.join("checkout");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", root.to_str().unwrap()],
+    );
+    fs::remove_file(root.join(".git")).unwrap();
+    fs::rename(main.join(".git"), root.join("common")).unwrap();
+    let admin = root.join("common/worktrees/checkout");
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", root.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(root.join(".git"), "gitdir: common/worktrees/checkout\n").unwrap();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.x]\nsource = \"common/config\"\ntarget = \"~/.x\"\n",
+    )
+    .unwrap();
+    let run = |json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(code, 3, "regular commondir json={json}: {text}");
+    }
+
+    let pointer = root.join("alt/level/three/pointer");
+    fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+    fs::write(&pointer, "../..\n").unwrap();
+    fs::remove_file(admin.join("commondir")).unwrap();
+    symlink(&pointer, admin.join("commondir")).unwrap();
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(
+            code, 3,
+            "linked commondir keeps Git's base json={json}: {text}"
+        );
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    fs::create_dir_all(root.join("skill")).unwrap();
+    fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    fs::rename(&pointer, root.join("skill/pointer")).unwrap();
+    fs::remove_file(admin.join("commondir")).unwrap();
+    symlink(root.join("skill/pointer"), admin.join("commondir")).unwrap();
+    for manifest in [
+        "[files.x]\nsource = \"skill/pointer\"\ntarget = \"~/.x\"\n",
+        "[skills.s]\nsource = \"skill\"\n",
+    ] {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        for json in [false, true] {
+            let (code, text) = run(json);
+            assert_eq!(
+                code, 3,
+                "active linked commondir file is metadata json={json}: {text}"
+            );
+        }
+    }
+    fs::remove_file(admin.join("commondir")).unwrap();
+    fs::write(admin.join("commondir"), "../..\n").unwrap();
+    for manifest in [
+        "[files.x]\nsource = \"skill/pointer\"\ntarget = \"~/.x\"\n",
+        "[skills.s]\nsource = \"skill\"\n",
+    ] {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        assert_eq!(
+            run(false).0,
+            0,
+            "a detached copy of the pointer bytes is ordinary content"
+        );
+    }
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.x]\nsource = \"common/config\"\ntarget = \"~/.x\"\n",
+    )
+    .unwrap();
+
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("gitfile"), "gitdir: common/worktrees/checkout\n").unwrap();
+    fs::remove_file(root.join(".git")).unwrap();
+    symlink(sub.join("gitfile"), root.join(".git")).unwrap();
+    assert_eq!(
+        run(false).0,
+        3,
+        "a linked gitfile resolves gitdir from the checkout root"
+    );
+}
+
+#[test]
+fn doctor_passes_in_an_isolated_home() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["doctor", "--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let check = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} check"))
+            .clone()
+    };
+    assert_eq!(check("home")["status"], "pass");
+    assert!(
+        check("home")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("LOADOUT_HOME")
+    );
+    assert_eq!(check("platform")["status"], "pass");
+    assert!(
+        check("state dir")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not created yet")
+    );
+    assert!(
+        check("machine name")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("from the hostname")
+    );
+    let git_ok = check("git")["status"] == "pass";
+    assert_eq!(report["healthy"], git_ok);
+    assert_eq!(output.status.code(), Some(if git_ok { 0 } else { 4 }));
+    assert!(
+        !sandbox.state.exists(),
+        "doctor must not create the state dir"
+    );
+}
+
+#[test]
+fn doctor_reads_a_saved_machine_name() {
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    fs::write(
+        sandbox.state.join("machine.toml"),
+        "name = \"work-laptop\"\n",
+    )
+    .unwrap();
+    let text = stdout(&sandbox.run(&["doctor"]));
+    assert!(text.contains("work-laptop (saved in"), "{text}");
+}
+
+#[cfg(unix)]
+fn run_with_deadline(mut command: Command) -> Output {
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            panic!("{command:?} hung");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_non_regular_machine_file_instead_of_hanging() {
+    use std::os::unix::fs::symlink;
+
+    let mkfifo =
+        |path: &Path| assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
+    for layout in ["fifo", "link-to-fifo", "dir"] {
+        let sandbox = Sandbox::new();
+        fs::create_dir(&sandbox.state).unwrap();
+        let file = sandbox.state.join("machine.toml");
+        match layout {
+            "fifo" => mkfifo(&file),
+            "link-to-fifo" => {
+                mkfifo(&sandbox.state.join("pipe"));
+                symlink(sandbox.state.join("pipe"), &file).unwrap();
+            }
+            _ => fs::create_dir(&file).unwrap(),
+        }
+        for json in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+            command
+                .arg("doctor")
+                .args(json.then_some("--json"))
+                .env("LOADOUT_HOME", &sandbox.home)
+                .env("LOADOUT_STATE_DIR", &sandbox.state);
+            let output = run_with_deadline(command);
+            assert_eq!(output.status.code(), Some(4), "{layout} json={json}");
+            assert!(
+                stdout(&output).contains("must be a regular file"),
+                "{layout}"
+            );
+        }
+    }
+
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    fs::write(sandbox.state.join("saved.toml"), "name = \"linked-box\"\n").unwrap();
+    symlink(
+        sandbox.state.join("saved.toml"),
+        sandbox.state.join("machine.toml"),
+    )
+    .unwrap();
+    let text = stdout(&sandbox.run(&["doctor"]));
+    assert!(text.contains("linked-box (saved in"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_never_reads_a_saved_identity_linked_outside_the_state_dir() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    let outside = sandbox.home.join(".codex");
+    fs::create_dir_all(&outside).unwrap();
+    let fifo = outside.join("auth.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    symlink(&fifo, sandbox.state.join("machine.toml")).unwrap();
+    for json in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+        command
+            .arg("doctor")
+            .args(json.then_some("--json"))
+            .env("LOADOUT_HOME", &sandbox.home)
+            .env("LOADOUT_STATE_DIR", &sandbox.state);
+        let output = run_with_deadline(command);
+        assert_eq!(output.status.code(), Some(4), "json={json}");
+        assert!(
+            stdout(&output).contains("resolves outside the state dir"),
+            "{}",
+            stdout(&output)
+        );
+    }
+
+    let regular = sandbox.home.join("name.toml");
+    fs::write(&regular, "name = \"outside-name\"\n").unwrap();
+    fs::remove_file(sandbox.state.join("machine.toml")).unwrap();
+    symlink(&regular, sandbox.state.join("machine.toml")).unwrap();
+    let output = sandbox.run(&["doctor"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        !stdout(&output).contains("outside-name"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn doctor_fails_on_a_broken_machine_file_or_missing_home() {
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    fs::write(sandbox.state.join("machine.toml"), "name = \"Not Valid\"\n").unwrap();
+    let output = sandbox.run(&["doctor"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(stdout(&output).contains("FAIL  machine name"));
+
+    let missing = sandbox.home.join("missing");
+    let output = loadout(&["doctor"], &missing, &sandbox.state);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(stdout(&output).contains("FAIL  home"));
+}
+
+#[test]
+fn isolated_home_ignores_ambient_xdg_dirs() {
+    let sandbox = Sandbox::new();
+    let real = tempfile::tempdir().unwrap();
+    let saved = real.path().join("state/loadout");
+    fs::create_dir_all(&saved).unwrap();
+    fs::write(
+        saved.join("machine.toml"),
+        "name = \"outside-isolated-home\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .args(["doctor", "--json"])
+        .env("LOADOUT_HOME", &sandbox.home)
+        .env_remove("LOADOUT_STATE_DIR")
+        .env("XDG_CONFIG_HOME", real.path().join("config"))
+        .env("XDG_STATE_HOME", real.path().join("state"))
+        .env("CODEX_HOME", real.path().join("codex"))
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    assert!(!text.contains("outside-isolated-home"), "{text}");
+    assert!(!text.contains(real.path().to_str().unwrap()), "{text}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let detail = |name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(detail("config dir").starts_with(sandbox.home.to_str().unwrap()));
+    assert!(detail("state dir").starts_with(sandbox.home.to_str().unwrap()));
+}
+
+#[test]
+fn empty_home_override_is_not_reported_as_isolation() {
+    let sandbox = Sandbox::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .arg("doctor")
+        .env("HOME", &sandbox.home)
+        .env("USERPROFILE", &sandbox.home)
+        .env("LOADOUT_HOME", "")
+        .env("LOADOUT_STATE_DIR", &sandbox.state)
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    assert!(text.contains(sandbox.home.to_str().unwrap()), "{text}");
+    assert!(!text.contains("from LOADOUT_HOME"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_lists_only_executable_managers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let bin = tempfile::tempdir().unwrap();
+    for (name, mode) in [("npm", 0o644), ("cargo", 0o755)] {
+        let path = bin.path().join(name);
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .args(["doctor", "--json"])
+        .env("PATH", bin.path())
+        .env("LOADOUT_HOME", &sandbox.home)
+        .env("LOADOUT_STATE_DIR", &sandbox.state)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let managers = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "managers")
+        .unwrap()["detail"]
+        .clone();
+    assert_eq!(managers, "cargo");
+}
+
+#[test]
+fn relative_home_override_is_a_runtime_error() {
+    let sandbox = Sandbox::new();
+    let output = loadout(&["doctor"], Path::new("relative"), &sandbox.state);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("LOADOUT_HOME must be an absolute path")
+    );
+}

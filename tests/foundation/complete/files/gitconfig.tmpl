@@ -1,0 +1,7 @@
+[user]
+	name = {{ name }}
+	email = {{ email }}
+{% if machine.os == "windows" %}
+[core]
+	autocrlf = true
+{% endif %}

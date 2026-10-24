@@ -1,0 +1,4 @@
+[programs.steam]
+cask = "steam"
+winget = "Valve.Steam"
+flatpak = "com.valvesoftware.Steam"
