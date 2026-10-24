@@ -155,15 +155,12 @@ pub(super) fn eligibility(
 }
 
 /// Portable packages, bare or nested in a zip (shown as "portable (zip)"), install into the
-/// user's WinGet Packages folder; seen natively with `BurntSushi.ripgrep.MSVC`. Other types,
+/// user's `WinGet\Packages` folder; seen natively with `BurntSushi.ripgrep.MSVC`. Other types,
 /// including other installers nested in a zip, may install machine-wide or raise UAC whatever
 /// scope was asked for.
 fn per_user_installer(kind: &str) -> bool {
     matches!(kind, "portable" | "portable (zip)")
 }
-
-const WINGET_NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
-const WINGET_NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
 
 /// The installer type winget would use for the requested scope, or `None` when it says none
 /// applies. `winget show` exits 0 even then (seen on winget 1.6), so the answer is the line under
@@ -219,7 +216,7 @@ fn brew(output: &Captured, package: &str, cask: bool) -> Result<bool, String> {
     } else {
         (&["name", "full_name"][..], &["aliases", "oldnames"][..])
     };
-    let named = names
+    let answers_for_package = names
         .iter()
         .any(|field| entry.get(*field).and_then(Value::as_str) == Some(package))
         || aliases.iter().any(|field| {
@@ -228,7 +225,7 @@ fn brew(output: &Captured, package: &str, cask: bool) -> Result<bool, String> {
                 .and_then(Value::as_array)
                 .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(package)))
         });
-    if !named {
+    if !answers_for_package {
         return Err(format!(
             "brew info answered for a different {}",
             if cask { "cask" } else { "formula" }

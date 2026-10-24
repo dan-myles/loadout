@@ -15,7 +15,7 @@ use super::manager::Invocation;
 
 /// How long one installed-query (or doctor's query) may run, including any process it starts
 /// that keeps its output open. Generous: a query can refresh a source index or fetch an API.
-pub(super) const QUERY_DEADLINE: Duration = Duration::from_secs(10 * 60);
+pub(super) const QUERY_DEADLINE: Duration = Duration::from_mins(10);
 /// A query that prints more than this on stdout or stderr is refused, never parsed truncated.
 pub(super) const QUERY_OUTPUT_CAP: usize = 8 * 1024 * 1024;
 /// How much of each install output stream an error keeps.
@@ -25,6 +25,7 @@ pub(super) const INSTALL_TAIL: usize = 64 * 1024;
 const INSTALL_DRAIN: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 
+#[derive(Debug)]
 pub(super) struct Captured {
     pub(super) code: Option<i32>,
     pub(super) stdout: String,
