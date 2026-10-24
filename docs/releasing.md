@@ -13,8 +13,9 @@ Runs on pushes to `main`, every pull request, and manual dispatch.
 | clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked` |
 | release packaging tests | ubuntu-24.04, Python 3.8 and 3.12 | `python -m unittest discover -s scripts/release -v` |
 
-Every job installs the latest stable Rust through rustup. If the repo adds `rust-toolchain.toml`,
-rustup uses that toolchain instead, with no change to the workflow. `--locked` means a stale
+Every job runs `rustup toolchain install --no-self-update`, which installs the exact toolchain
+and components pinned in `rust-toolchain.toml`. Bump that file to move CI and releases to a new
+Rust. `--locked` means a stale
 `Cargo.lock` fails the job instead of being rewritten silently. Only the CI jobs cache Cargo
 downloads and `target/`. Release builds start clean so a poisoned cache can't reach a shipped binary.
 
@@ -121,11 +122,9 @@ The script pins everything it controls:
   PDB path.
 
 The same commit built with the same `rustc` gives the same binary, wherever it's checked out. The
-script prints `rustc -vV` at the top of every build log. Two things are not pinned:
+script prints `rustc -vV` at the top of every build log. `rust-toolchain.toml` pins the toolchain,
+so rebuilding a tag on the same target uses the same `rustc`. One thing is not pinned:
 
-- **The toolchain.** CI uses whatever `stable` is on the day. For bit-for-bit rebuilds of an old
-  tag, pin a release in `rust-toolchain.toml` (for example `channel = "1.98.1"`) and use the
-  `rustc` shown in that tag's build log.
 - **Python's zlib.** It can compress the archive differently across Python builds. The binary
   inside stays byte-identical.
 

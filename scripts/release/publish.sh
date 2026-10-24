@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: publish.sh <tag> <asset>...
-# Creates or refreshes the draft GitHub release for <tag>. Needs GH_TOKEN and GH_REPO.
+# Requires GH_TOKEN and GH_REPO in the environment.
 set -euo pipefail
 
 tag=${1:?usage: publish.sh <tag> <asset>...}
