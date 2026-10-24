@@ -839,14 +839,35 @@ esac; exit 64"#,
 
     #[test]
     fn doctor_names_available_and_missing_managers_and_what_elevation_needs() {
-        let bench = Bench::new(&["apt-get", "dpkg-query", "flatpak", "pipx", "npm", "sudo"]);
+        let bench = Bench::new(&[
+            "apt-get",
+            "dpkg-query",
+            "flatpak",
+            "brew",
+            "pipx",
+            "npm",
+            "sudo",
+        ]);
         let checks = doctor(&bench, &[]);
         let programs = check(&checks, "programs").unwrap();
         assert_eq!(programs["status"], "info");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                programs["detail"],
+                "per user: brew, cask, pipx, npm; not on PATH: cargo, uv, pnpm, bun, go"
+            );
+            assert!(
+                check(&checks, "elevation").is_none(),
+                "macOS has no system-scope manager"
+            );
+            assert!(check(&checks, "flatpak").is_none());
+            assert!(bench.log().is_empty(), "{:#?}", bench.log());
+            return;
+        }
         assert_eq!(
             programs["detail"],
-            "per user: flatpak, pipx, npm; with --elevated: apt; \
-             not on PATH: dnf, pacman, zypper, snap, brew, cargo, uv, pnpm, bun, go"
+            "per user: flatpak, brew, pipx, npm; with --elevated: apt; \
+             not on PATH: dnf, pacman, zypper, snap, cargo, uv, pnpm, bun, go"
         );
         if !running_as_root() {
             assert_eq!(
@@ -875,7 +896,7 @@ esac; exit 64"#,
     fn doctor_warns_without_any_manager_or_sudo() {
         let bench = Bench::new(&["apt-get", "dpkg-query"]);
         let checks = doctor(&bench, &[]);
-        if !running_as_root() {
+        if cfg!(target_os = "linux") && !running_as_root() {
             let elevation = check(&checks, "elevation").unwrap();
             assert_eq!(elevation["status"], "warn");
             assert_eq!(
@@ -894,10 +915,14 @@ esac; exit 64"#,
         let bench = Bench::new(&["flatpak", "pipx"]);
         let home = bench.dir.path().join("home");
         let checks = doctor(&bench, &[("LOADOUT_HOME", home.to_str().unwrap())]);
+        let expected = if cfg!(target_os = "macos") {
+            "per user: pipx; not on PATH: brew, cask, cargo, uv, npm, pnpm, bun, go"
+        } else {
+            "per user: flatpak, pipx; not on PATH: apt, dnf, pacman, zypper, snap, brew, cargo, uv, npm, pnpm, bun, go"
+        };
         assert_eq!(
             check(&checks, "programs").unwrap()["detail"],
-            "per user: flatpak, pipx; not on PATH: apt, dnf, pacman, zypper, snap, brew, cargo, uv, npm, pnpm, bun, go; \
-             programs are not installed under LOADOUT_HOME isolation"
+            format!("{expected}; programs are not installed under LOADOUT_HOME isolation")
         );
         assert!(check(&checks, "flatpak").is_none());
         assert!(bench.log().is_empty(), "{:#?}", bench.log());
