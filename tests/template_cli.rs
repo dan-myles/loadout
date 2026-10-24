@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
 
 use serde_json::Value;
 
@@ -242,6 +241,9 @@ fn a_template_outside_the_loadout_is_refused_without_reading_it() {
 #[cfg(unix)]
 #[test]
 fn a_fifo_template_is_refused_without_blocking() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let case = Case::new(&[("loadout.toml", &root(GITCONFIG))]);
     fs::create_dir_all(case.loadout.join("files")).unwrap();
     let status = Command::new("mkfifo")
