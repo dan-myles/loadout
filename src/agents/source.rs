@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::context::Context;
 use crate::manifest;
 use crate::plan::FileContent;
-use crate::reserved::{self, Kind, Use};
+use crate::reserved;
 
 const SKILL_FILE: &str = "SKILL.md";
 const GIT_DIR: &str = ".git";
@@ -120,13 +120,14 @@ impl<'a> Sources<'a> {
         Ok(real)
     }
 
-    /// A loadout checked out inside an agent's folder could hold that agent's auth store, so
-    /// every source file passes the reserved table before it is opened. Only the checkout's own
-    /// reservation is expected.
+    /// A checkout can hold an auth store or another reserved file, such as a checkout at the
+    /// home folder, so both the path as reached and the file it lands on pass the source policy
+    /// before anything is opened.
     fn read(&self, shown: &Path, real: &Path) -> Result<FileContent, String> {
-        if let Some(conflict) = reserved::check_path(self.context, &self.root, real, Use::Write)
-            && conflict.kind() != Some(Kind::LoadoutState)
-        {
+        let conflict = [shown, real]
+            .into_iter()
+            .find_map(|path| reserved::check_source(self.context, &self.root, path));
+        if let Some(conflict) = conflict {
             return Err(format!("{} {}", self.shown(shown), conflict.message()));
         }
         let not_a_file = || format!("{} is not a regular file", self.shown(shown));

@@ -637,10 +637,9 @@ or corrects them.
     and each file a skill walk reaches, must canonicalize inside the checkout and outside its Git
     metadata (`manifest::git_metadata`, the same identification validate uses). A skill may hold
     only regular files, folders, and links to files inside the loadout; a link to a folder, a
-    special file, or a `.git` entry is refused. A skill needs `SKILL.md`. Every source file also
-    passes `reserved::check_path` before it is opened, and any conflict other than the checkout's
-    own reservation refuses it, so a checkout placed inside an agent folder can't copy an auth
-    store.
+    special file, or a `.git` entry is refused. A skill needs `SKILL.md`. Every source file then
+    passes `reserved::check_source` (below), both as reached and as the file it lands on, before
+    it is opened.
   - **Collisions** are errors. Every pair with at least one agent destination is compared: agent
     against user file target, and agent against agent, built-in or custom. Two writes collide when
     their paths are equal or one is inside the other, compared as written and with links resolved
@@ -817,6 +816,18 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
   - Static validate keeps its lexical default check (`check_literal`). Sibling paths stay allowed in
     both.
+  - **Sources** (U5, `reserved::check_source(context, loadout, path)`). A loadout source that the
+    caller already confined inside the canonical checkout (regular file, outside Git metadata) is
+    checked against **every** table entry, at every root and in both forms. There is no first
+    match, so table order can't hide a later entry. An `auth` entry that equals or holds the
+    source always refuses it, wherever the checkout lives, including through an override root
+    placed inside the checkout and inside a checkout kept in `~/.ssh`. Any other entry that equals
+    or holds the source refuses it unless that same entry also holds the canonical checkout. A user
+    may keep a checkout under `~/.t3/worktrees` or use the default `<state>/loadout` clone, but
+    a reserved file inside a larger checkout (`~/.t3/settings.json`, `.claude.json`, or the
+    state dir from a checkout at `~`) is still refused. The checkout itself is not a reservation
+    here. A path or anchor that can't be resolved refuses (`Unverifiable`). Destination checks are
+    unchanged: they still use `check_path`.
   - **U6 applies the same rule.** Every MCP write calls `check_path` with
     `Use::KeyMerge(Merge { map, format, shape })`, for built-in adapters and custom agents alike, on
     expanded, canonical, and override-alias paths. A shared config reached through an alias still
@@ -958,6 +969,7 @@ pub enum Use<'a> { Write, WriteInto, KeyMerge(Merge<'a>) }   // Merge { map, for
 // Entry { anchor, path, kind, merge: Option<Merge<'static>> }: shared-config entries carry their known MCP map
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
 pub fn check_path(context: &Context, loadout: &Path, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; `loadout` = active checkout root; normalizes both sides itself
+pub fn check_source(context: &Context, loadout: &Path, path: &Path) -> Option<Conflict>; // U5 sources: auth always; other kinds unless the same entry holds the checkout
 pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only
 pub enum Conflict { Reserved { entry: Entry, reserved: String }, Unverifiable { path: PathBuf, error: String } }
 

@@ -369,6 +369,59 @@ pub fn check_path(
     None
 }
 
+/// For a source file the caller already confined inside the canonical active checkout. Every
+/// entry is checked at every root and in both forms, so no match order can hide another. An auth
+/// store always conflicts. Any other reservation conflicts unless that same reservation also
+/// holds the checkout: a user may keep a checkout under `~/.t3`, but a reserved file inside a
+/// larger checkout is still that reserved file. The checkout itself is not a reservation here.
+pub fn check_source(context: &Context, loadout: &Path, path: &Path) -> Option<Conflict> {
+    let unverifiable = |path: &Path, error: io::Error| Conflict::Unverifiable {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    };
+    let targets = match normalize(path) {
+        Ok(real) => [path_parts(path), path_parts(&real)],
+        Err(error) => return Some(unverifiable(path, error)),
+    };
+    let checkout = match normalize(loadout) {
+        Ok(real) => [path_parts(loadout), path_parts(&real)],
+        Err(error) => return Some(unverifiable(loadout, error)),
+    };
+    let mut found = None;
+    for entry in TABLE {
+        for root in entry.anchor.roots(context) {
+            let reserved = join(&root, entry.path);
+            let real = match normalize(&reserved) {
+                Ok(real) => real,
+                Err(error) => return Some(unverifiable(&reserved, error)),
+            };
+            let forms = [path_parts(&reserved), path_parts(&real)];
+            let holds = |inner: &[String]| {
+                forms.iter().any(|form| {
+                    matches!(
+                        relation(inner, form),
+                        Some(Relation::Equal | Relation::Inside)
+                    )
+                })
+            };
+            if !targets.iter().any(|target| holds(target)) {
+                continue;
+            }
+            let conflict = Conflict::Reserved {
+                entry: *entry,
+                reserved: reserved.display().to_string(),
+            };
+            if entry.kind == Kind::Auth {
+                return Some(conflict);
+            }
+            if found.is_none() && !checkout.iter().any(|form| holds(form)) {
+                found = Some(conflict);
+            }
+        }
+    }
+    found
+}
+
 const MAX_LINKS: usize = 40;
 
 pub fn normalize(path: &Path) -> io::Result<PathBuf> {
@@ -990,5 +1043,151 @@ mod tests {
             None,
             "the lexically cancelled path is not the protected destination"
         );
+    }
+
+    fn source_home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap().join("home");
+        fs::create_dir_all(&home).unwrap();
+        (dir, home)
+    }
+
+    fn native(home: &Path, vars: &[(&str, PathBuf)]) -> Context {
+        let vars: Vec<(String, OsString)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone().into_os_string()))
+            .collect();
+        let var = move |name: &str| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        Context::resolve(Os::current().unwrap(), var, Some(home.to_path_buf())).unwrap()
+    }
+
+    fn made(path: PathBuf) -> PathBuf {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        path
+    }
+
+    fn source(context: &Context, checkout: &Path, path: &Path) -> Option<Option<Kind>> {
+        check_source(context, checkout, path).map(|conflict| conflict.kind())
+    }
+
+    #[test]
+    fn a_checkout_kept_under_a_private_or_state_folder_reads_its_own_files() {
+        let (_dir, home) = source_home();
+        let context = native(&home, &[]);
+        for checkout in [
+            home.join(".t3").join("worktrees").join("loadout"),
+            context.state.join("loadout"),
+            context.xdg_config.join("loadout"),
+            home.join(".T3").join("worktrees").join("upper"),
+        ] {
+            fs::create_dir_all(&checkout).unwrap();
+            let file = made(checkout.join("skills").join("review").join("SKILL.md"));
+            assert_eq!(source(&context, &checkout, &file), None, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_reserved_file_inside_a_larger_checkout_is_still_refused() {
+        let (_dir, home) = source_home();
+        let context = native(&home, &[]);
+        let cases = [
+            (home.join(".t3").join("settings.json"), Some(Kind::Private)),
+            (home.join(".claude.json"), Some(Kind::SharedConfig)),
+            (context.state.join("state.json"), Some(Kind::LoadoutState)),
+            (home.join(".codex").join("auth.json"), Some(Kind::Auth)),
+            (home.join(".ssh").join("id_ed25519"), Some(Kind::Auth)),
+            (home.join(".SSH").join("config"), Some(Kind::Auth)),
+            (home.join("skills").join("review.md"), None),
+        ];
+        for (path, kind) in cases {
+            let file = made(path);
+            let want = kind.map(Some);
+            assert_eq!(source(&context, &home, &file), want, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn auth_refuses_even_inside_a_checkout_its_private_ancestor_holds() {
+        let (_dir, home) = source_home();
+        let checkout = home.join(".t3").join("worktrees").join("loadout");
+        let context = native(
+            &home,
+            &[
+                ("CODEX_HOME", checkout.join("codex")),
+                ("CLAUDE_CONFIG_DIR", checkout.join("claude")),
+            ],
+        );
+        let auth = [
+            checkout.join("codex").join("auth.json"),
+            checkout.join("claude").join(".credentials.json"),
+        ];
+        for path in auth {
+            let file = made(path);
+            let found = source(&context, &checkout, &file);
+            assert_eq!(found, Some(Some(Kind::Auth)), "{}", file.display());
+        }
+        for path in [
+            checkout.join("codex").join("AGENTS.md"),
+            checkout.join("skills").join("review.md"),
+        ] {
+            let file = made(path);
+            assert_eq!(source(&context, &checkout, &file), None, "{}", file.display());
+        }
+
+        let inside_ssh = home.join(".ssh").join("loadout");
+        let file = made(inside_ssh.join("skills").join("review.md"));
+        assert_eq!(source(&context, &inside_ssh, &file), Some(Some(Kind::Auth)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_aliases_resolve_before_the_policy_applies() {
+        use std::os::unix::fs::symlink;
+
+        let (_dir, home) = source_home();
+        let context = native(&home, &[]);
+        let checkout = home.join(".t3").join("worktrees").join("loadout");
+        let file = made(checkout.join("skills").join("review.md"));
+        let alias = home.join("alias");
+        symlink(&checkout, &alias).unwrap();
+        let through = alias.join("skills").join("review.md");
+        assert_eq!(source(&context, &alias, &through), None);
+        assert_eq!(source(&context, &checkout, &file), None);
+
+        let auth = made(home.join(".codex").join("auth.json"));
+        let link = home.join("notes").join("token");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&auth, &link).unwrap();
+        assert_eq!(source(&context, &home, &link), Some(Some(Kind::Auth)));
+        let settings = made(home.join(".t3").join("settings.json"));
+        let link = home.join("notes").join("settings");
+        symlink(&settings, &link).unwrap();
+        assert_eq!(source(&context, &home, &link), Some(Some(Kind::Private)));
+    }
+
+    #[test]
+    fn unverifiable_sources_and_anchors_refuse() {
+        let (_dir, home) = source_home();
+        let context = native(&home, &[]);
+        let file = made(home.join("skills").join("review.md"));
+        let relative = Path::new("skills").join("review.md");
+        assert_eq!(source(&context, &home, &relative), Some(None));
+
+        let broken = native(&home, &[("CODEX_HOME", home.join("missing").join("..").join("codex"))]);
+        assert_eq!(source(&broken, &home, &file), Some(None));
+    }
+
+    #[test]
+    fn the_source_policy_leaves_destination_checks_unchanged() {
+        let (_dir, home) = source_home();
+        let context = native(&home, &[]);
+        let target = home.join(".t3").join("worktrees").join("loadout").join("skills");
+        let conflict = check_path(&context, &no_loadout(), &target, Use::Write);
+        assert_eq!(conflict.and_then(|conflict| conflict.kind()), Some(Kind::Private));
     }
 }

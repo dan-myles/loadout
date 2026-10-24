@@ -45,6 +45,13 @@ fn manifest(body: &str) -> String {
 }
 
 impl Sandbox {
+    fn relocated(mut self, to: PathBuf) -> Self {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(&self.loadout, &to).unwrap();
+        self.loadout = to;
+        self
+    }
+
     fn source(&self, path: &str, text: &str) {
         let path = self.loadout.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -526,12 +533,7 @@ fn a_destination_inside_the_active_checkout_is_unsupported_and_its_source_is_nev
         agents_line(r#"["devin", "codex"]"#)
     ));
     let checkout = sandbox.home.join("checkout");
-    fs::rename(&sandbox.loadout, &checkout).unwrap();
-    let moved = Sandbox {
-        _dir: tempfile::tempdir().unwrap(),
-        home: sandbox.home.clone(),
-        loadout: checkout,
-    };
+    let moved = sandbox.relocated(checkout);
     let context = moved.isolated(Os::Linux);
     let (desired, unsupported) = moved.ok(&text, &context);
     let devin = refused(&unsupported, ItemKind::Skill, "review", "devin");
@@ -795,4 +797,111 @@ fn doctor_warns_about_double_loading_and_shadowing_files() {
     assert_eq!(check(&report, "codex override").unwrap()["status"], "warn");
     assert_eq!(check(&report, "grok instructions").unwrap()["status"], "warn");
     assert_eq!(check(&report, "opencode config").unwrap()["status"], "warn");
+}
+
+#[test]
+fn a_checkout_kept_under_t3_worktrees_or_the_state_clone_is_read_normally() {
+    let text = manifest(&agents_line(r#"["claude", "codex"]"#));
+    let sandbox = sandbox();
+    let worktree = sandbox.home.join(".t3").join("worktrees").join("loadout");
+    let sandbox = sandbox.relocated(worktree);
+    let context = sandbox.isolated(Os::Linux);
+    let (desired, unsupported) = sandbox.ok(&text, &context);
+    assert_eq!(desired.len(), 2 + 2 + 4, "{unsupported:#?}");
+
+    let sandbox = self::sandbox();
+    let context = sandbox.isolated(Os::Linux);
+    let clone = context.state.join("loadout");
+    let sandbox = sandbox.relocated(clone);
+    let (desired, _) = sandbox.ok(&text, &context);
+    find(&desired, ItemKind::Skill, "review", "codex");
+}
+
+#[test]
+fn a_checkout_inside_a_credential_folder_is_refused() {
+    let sandbox = sandbox();
+    let inside = sandbox.home.join(".ssh").join("loadout");
+    let sandbox = sandbox.relocated(inside);
+    let context = sandbox.isolated(Os::Linux);
+    let errors = sandbox.invalid(&manifest(&agents_line(r#"["claude"]"#)), &context);
+    assert!(errors.contains("auth"), "{errors}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_home_checkout_cannot_copy_an_auth_store_or_private_settings_it_contains() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    let base = sandbox.home.parent().unwrap().to_path_buf();
+    let home = sandbox.home.clone();
+    fs::remove_dir(&home).unwrap();
+    let sandbox = sandbox.relocated(home.clone());
+    let context = sandbox.ambient(Os::Linux, &[("CLAUDE_CONFIG_DIR", base.join("claude"))]);
+    let text = manifest(&agents_line(r#"["claude"]"#));
+
+    let auth = sandbox.home_file(".codex/auth.json", "AUTH-SENTINEL");
+    let link = home.join("skills").join("review").join("token");
+    symlink(&auth, &link).unwrap();
+    let errors = sandbox.invalid(&text, &context);
+    assert!(errors.contains("auth"), "{errors}");
+    assert!(!errors.contains("AUTH-SENTINEL"), "{errors}");
+    fs::remove_file(&link).unwrap();
+
+    let settings = sandbox.home_file(".t3/settings.json", "PROVIDER-SENTINEL");
+    symlink(&settings, &link).unwrap();
+    let errors = sandbox.invalid(&text, &context);
+    assert!(errors.contains("private"), "{errors}");
+    assert!(!errors.contains("PROVIDER-SENTINEL"), "{errors}");
+    fs::remove_file(&link).unwrap();
+
+    let (desired, _) = sandbox.ok(&text, &context);
+    let skill = find(&desired, ItemKind::Skill, "review", "claude");
+    assert!(path_of(skill).starts_with(base.join("claude")));
+}
+
+#[cfg(unix)]
+#[test]
+fn git_metadata_named_by_a_gitfile_or_commondir_stays_refused_after_validation() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    sandbox.source(".git", "gitdir: meta/repo\n");
+    sandbox.source("meta/repo/config", "[remote] url = https://token@example.com\n");
+    sandbox.source("meta/repo/commondir", "../common\n");
+    sandbox.source("meta/common/HEAD", "ref: refs/heads/main\n");
+    sandbox.source("meta/notes.md", "plain\n");
+    let context = sandbox.isolated(Os::Linux);
+    let text = manifest(&agents_line(r#"["claude"]"#));
+    fs::write(sandbox.loadout.join("loadout.toml"), &text).unwrap();
+    let (loadout, _) = Loadout::load(&sandbox.loadout)
+        .unwrap_or_else(|diagnostics| panic!("fixture must validate: {diagnostics:?}"));
+    let facts = Facts {
+        name: "box".to_owned(),
+        os: Os::Linux,
+        distro: None,
+        arch: Arch::X86_64,
+        home: sandbox.home.clone(),
+    };
+    let (resolved, _) = resolve::resolve(&loadout, &facts).unwrap();
+    let link = sandbox.loadout.join("skills/review/extra");
+
+    for target in ["meta/repo/config", "meta/repo/commondir", "meta/common/HEAD"] {
+        symlink(sandbox.loadout.join(target), &link).unwrap();
+        let Err(Error::Invalid(errors)) = agents::materialize(&resolved, &context, &sandbox.loadout)
+        else {
+            panic!("a link to {target} must be refused");
+        };
+        let errors = format!("{errors:?}");
+        assert!(errors.contains("Git metadata"), "{target}: {errors}");
+        assert!(!errors.contains("token@"), "{errors}");
+        fs::remove_file(&link).unwrap();
+    }
+
+    symlink(sandbox.loadout.join("meta/notes.md"), &link).unwrap();
+    let (desired, _) = agents::materialize(&resolved, &context, &sandbox.loadout).unwrap();
+    let Content::Tree(tree) = &find(&desired, ItemKind::Skill, "review", "claude").content else {
+        panic!("a skill is a tree");
+    };
+    assert_eq!(tree[Path::new("extra")].bytes, b"plain\n");
 }
