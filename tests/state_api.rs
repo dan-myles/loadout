@@ -1216,3 +1216,35 @@ fn a_backup_mode_changed_in_the_journal_alone_is_refused() {
     assert!(matches!(error, Error::Invalid { .. }), "{error}");
     assert_eq!(read(&path), "loadout's");
 }
+
+#[test]
+fn a_leftover_old_beside_a_done_action_never_overrides_a_later_deletion() {
+    let machine = Machine::new();
+    let dir = machine.path(".agents/skills/review");
+    machine.apply(&dir, &skill("#!/bin/sh\necho one\n"));
+    let run = machine.apply(&dir, &skill("#!/bin/sh\necho two\n"));
+    let old = dir.with_file_name(format!(".review.loadout-{run}-0.old"));
+    write_skill(&old, "#!/bin/sh\necho one\n");
+    fs::remove_dir_all(&dir).unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
+    assert!(!dir.exists(), "the later deletion stands");
+    assert_eq!(read(&old.join("bin/run.sh")), "#!/bin/sh\necho one\n");
+}
+
+#[test]
+fn a_rollback_that_stopped_mid_swap_is_recovered_from_its_own_old() {
+    let machine = Machine::new();
+    let dir = machine.path(".agents/skills/review");
+    machine.apply(&dir, &skill("#!/bin/sh\necho one\n"));
+    let run = machine.apply(&dir, &skill("#!/bin/sh\necho two\n"));
+    let reold = dir.with_file_name(format!(".review.loadout-{run}-0-rollback.old"));
+    fs::rename(&dir, &reold).unwrap();
+    let rolled = machine.rollback(None).unwrap();
+    assert_eq!(rolled.restored, vec![target(&dir)]);
+    assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho one\n");
+    assert!(
+        !reold.exists(),
+        "the verified rollback scratch is cleaned up"
+    );
+}

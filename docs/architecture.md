@@ -697,8 +697,14 @@ delegated defaults.
     blocks the same way.
   - **A folder swap that stopped between its two renames.** Here the target is absent, and its
     `.old` scratch holds the prior tree. That `.old` counts as evidence only if it is a real file
-    or folder (not a link) whose content hashes to `prior`. Then the backup is restored. A
-    missing, linked, or mismatched `.old` blocks instead.
+    or folder (not a link) whose content hashes to `prior`, and only for a `started` or `failed`
+    action. Then the backup is restored.
+    - A missing, linked, or mismatched `.old` blocks instead.
+    - A `done` action already put its result in place. A `.old` left beside it, because its
+      removal failed, says nothing about a later deletion of the target, so the deletion blocks
+      like any other later change.
+    - Rollback's own `…-rollback.old` holding `after` proves an earlier rollback stopped
+      mid-swap, whatever the action's step.
   - **Scratch handling.** A scratch name is deleted only when it verifies as the run's own: `.tmp`
     must hash to `after`, and `.old` to `prior`. Rollback's own scratch, `…-rollback.tmp` and
     `.old`, is verified the same way, so a rollback that stopped can be rerun. Anything else is

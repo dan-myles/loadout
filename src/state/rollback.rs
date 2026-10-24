@@ -212,10 +212,16 @@ fn preflight<'a>(
         (disk::scratch(&real, &retag, "old")?, entry.after.clone()),
     ];
     let old_holds_prior = inspect(&scratch[1].0, scratch[1].1.as_ref())? == Scratch::Matches;
-    let reold_holds_after = inspect(&rescratch[1].0, rescratch[1].1.as_ref())? == Scratch::Matches;
+    let reold = inspect(&rescratch[1].0, rescratch[1].1.as_ref())?;
 
-    let swap_stopped =
-        now == Observed::Absent && prior.is_some() && (old_holds_prior || reold_holds_after);
+    // The run's own `.old` proves a swap that stopped between its renames only while the action
+    // never finished. A `done` action already put its result in place, so a `.old` left beside
+    // it (its removal failed) says nothing about a later deletion of the target. Rollback's own
+    // `.old` holding `after` proves an earlier rollback of this run stopped mid-swap.
+    let interrupted = matches!(entry.step, Step::Started | Step::Failed);
+    let swap_stopped = now == Observed::Absent
+        && prior.is_some()
+        && ((interrupted && old_holds_prior) || reold == Scratch::Matches);
     let fix = if now == entry.prior {
         Fix::Keep
     } else if Some(&now) == entry.after.as_ref() || swap_stopped {
