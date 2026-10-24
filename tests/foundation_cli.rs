@@ -619,6 +619,74 @@ fn bracketed_hosts_must_be_real_ipv6_addresses() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_root_manifest_that_is_not_a_regular_file_is_invalid_not_a_hang() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
+
+    let mkfifo = |path: &Path| {
+        let status = Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(status.success());
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let fifo = scratch.path().join("fifo");
+    fs::create_dir(&fifo).unwrap();
+    mkfifo(&fifo.join("loadout.toml"));
+    let linked = scratch.path().join("linked");
+    fs::create_dir(&linked).unwrap();
+    mkfifo(&linked.join("pipe"));
+    symlink(linked.join("pipe"), linked.join("loadout.toml")).unwrap();
+    let dir = scratch.path().join("dir");
+    fs::create_dir_all(dir.join("loadout.toml")).unwrap();
+
+    for root in [&fifo, &linked, &dir] {
+        for json in [false, true] {
+            let mut args = vec!["validate", root.to_str().unwrap()];
+            if json {
+                args.push("--json");
+            }
+            let sandbox = Sandbox::new();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_loadout"))
+                .args(&args)
+                .env("LOADOUT_HOME", &sandbox.home)
+                .env("LOADOUT_STATE_DIR", &sandbox.state)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    panic!("validate {args:?} hung on a non-regular loadout.toml");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(status.code(), Some(3), "{args:?}");
+            assert!(
+                stdout(&output).contains("must be a regular file"),
+                "{args:?}: {}",
+                stdout(&output)
+            );
+        }
+    }
+
+    let regular = scratch.path().join("regular");
+    fs::create_dir_all(regular.join("shared")).unwrap();
+    fs::write(regular.join("shared/root.toml"), MINIMAL).unwrap();
+    symlink(
+        regular.join("shared/root.toml"),
+        regular.join("loadout.toml"),
+    )
+    .unwrap();
+    let output = Sandbox::new().run(&["validate", regular.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

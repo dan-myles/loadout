@@ -298,6 +298,10 @@ fn parse<T: for<'de> Deserialize<'de>>(
             return None;
         }
     };
+    if !fs::metadata(&real).is_ok_and(|metadata| metadata.is_file()) {
+        problem("must be a regular file".to_owned());
+        return None;
+    }
     let text = match fs::read_to_string(real) {
         Ok(text) => text,
         Err(error) => {

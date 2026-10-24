@@ -148,6 +148,8 @@ sources, and validate ignores them. An unknown key anywhere is an error.
 
 - `loadout.toml` and every layer file and layer folder are canonicalized, and anything that resolves
   outside the root is an error. A link inside the loadout is fine.
+- Every manifest must resolve to a regular file before it is opened. A FIFO, device, or folder named
+  `loadout.toml` (or a layer file), or a link to one, is an error rather than a blocking read.
 - A missing `os/`, `tags/`, or `machines/` folder means "no layers of that kind". Every other
   discovery failure is an error with its path, so a layer is never silently dropped: a permission
   error, a file where the folder should be, or an unreadable entry.
