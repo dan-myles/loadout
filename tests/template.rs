@@ -304,3 +304,252 @@ fn a_home_that_is_not_utf8_is_an_error_not_a_lossy_path() {
     let error = render("plain", &facts).unwrap_err();
     assert!(matches!(error.problem, Problem::Home(_)), "{error:?}");
 }
+
+fn render_with_typo_absent(source: &str) -> Result<String, Error> {
+    assert!(!variables().contains_key("typo"));
+    render(source, &linux())
+}
+
+#[test]
+fn a_missing_variable_cannot_hide_inside_builtins_containers_or_comparisons() {
+    for source in [
+        "{{ typo | pprint }}",
+        "{% if typo is string %}yes{% else %}no{% endif %}",
+        "{{ [typo] }}",
+        "{{ {\"key\": typo} }}",
+        "{{ {typo: 1} }}",
+        "{{ [[1, typo]] }}",
+        "{{ {\"k\": [{\"j\": typo}]} | length }}",
+        "{{ (1, typo) | length }}",
+        "{% if typo == \"x\" %}x{% else %}y{% endif %}",
+        "{% if typo != \"x\" %}x{% endif %}",
+        "{{ typo in [\"a\"] }}",
+        "{{ \"a\" in [typo] }}",
+        "{% set alias = typo %}set",
+        "{% with alias = typo %}with{% endwith %}",
+        "{{ dict(key=typo) | length }}",
+        "{{ [1] | join(typo) }}",
+        "{{ 1 is sameas(typo) }}",
+        "{{ typo is none }}",
+        "{{ typo is divisibleby(2) }}",
+        "{{ typo.upper() }}",
+        "{% filter replace(\"a\", typo) %}a{% endfilter %}",
+        "{% set block | replace(\"a\", typo) %}a{% endset %}{{ block }}",
+        "{% for x in [1] if typo %}{% endfor %}",
+        "{{ [typo] | first is defined }}",
+        "{{ typo ~ \"\" }}",
+        "{{ \"%s\" | format(typo) }}",
+    ] {
+        match render_with_typo_absent(source) {
+            Err(Error {
+                line: Some(1),
+                problem: Problem::Missing(variable),
+                ..
+            }) => assert_eq!(variable, "typo", "{source:?}"),
+            other => panic!("{source:?} must fail on the missing `typo`, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_missing_attribute_or_item_is_named_in_full() {
+    for (source, missing) in [
+        ("{{ machine.typo | pprint }}", "machine.typo"),
+        ("{{ [machine.typo] }}", "machine.typo"),
+        ("{{ email.domain | pprint }}", "email.domain"),
+        ("{{ {\"a\": 1}.b | pprint }}", "{\"a\": 1}.b"),
+        ("{{ [1][5] | pprint }}", "[1][5]"),
+        ("{{ machine[\"typo\"] is string }}", "machine[\"typo\"]"),
+    ] {
+        match render_with_typo_absent(source) {
+            Err(Error {
+                line: Some(1),
+                problem: Problem::Missing(variable),
+                ..
+            }) => assert_eq!(variable, missing, "{source:?}"),
+            other => panic!("{source:?} must fail on {missing}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn an_undefined_builtin_result_is_an_error_too() {
+    match render_with_typo_absent("x\n{{ machine | attr(\"typo\") | pprint }}") {
+        Err(Error {
+            line: Some(2),
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(message, "`machine | attr(\"typo\")` is undefined"),
+        other => panic!("an undefined attr() result must fail, got {other:?}"),
+    }
+    assert!(matches!(
+        render_with_typo_absent("{{ [] | first | pprint }}"),
+        Err(Error {
+            problem: Problem::Render(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn default_and_is_defined_are_the_only_escapes() {
+    for (source, expected) in [
+        ("{{ typo is defined }}", "False"),
+        ("{{ typo is undefined }}", "True"),
+        ("{{ typo | default(\"fallback\") }}", "fallback"),
+        ("{{ typo | d(\"fallback\") }}", "fallback"),
+        ("{{ machine.typo is defined }}", "False"),
+        ("{{ machine.typo | default(machine.os) }}", "linux"),
+        ("{{ email.domain is defined }}", "False"),
+        ("{{ ([] | first) is defined }}", "False"),
+        ("{{ [] | first | default(\"empty\") }}", "empty"),
+        ("{{ name | default(\"unused\") }}", "Dan Myles"),
+        (
+            "{% if typo is defined and typo == \"x\" %}x{% else %}skipped{% endif %}",
+            "skipped",
+        ),
+        (
+            "{% if typo is defined %}{{ typo | pprint }}{% else %}absent{% endif %}",
+            "absent",
+        ),
+        (
+            "{% if work %}{{ [typo] }}{{ typo | pprint }}{% endif %}done",
+            "done",
+        ),
+        ("{{ \"shown\" if typo is undefined else typo }}", "shown"),
+    ] {
+        assert_eq!(
+            render_with_typo_absent(source).as_deref(),
+            Ok(expected),
+            "{source:?}"
+        );
+    }
+    for (source, missing) in [
+        (
+            "{% if typo is defined or typo == \"x\" %}{% endif %}",
+            "typo",
+        ),
+        ("{{ typo.attr is defined }}", "typo"),
+        ("{{ typo | default(other_typo) }}", "other_typo"),
+        ("{{ [typo] is defined }}", "typo"),
+        ("{{ (typo ~ \"\") | default(\"x\") }}", "typo"),
+    ] {
+        match render_with_typo_absent(source) {
+            Err(Error {
+                problem: Problem::Missing(variable),
+                ..
+            }) => assert_eq!(variable, missing, "{source:?}"),
+            other => panic!("{source:?} must fail on {missing}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_line_is_where_the_missing_value_is_used() {
+    let (line, variable) = missing("{{ name ~\n   \"-\" ~\n   typo }}");
+    assert_eq!((line, variable.as_str()), (Some(3), "typo"));
+    let (line, _) = missing("{% if work %}\n{% else %}\n\n  {{ [1,\n typo] }}\n{% endif %}");
+    assert_eq!(line, Some(5));
+}
+
+#[test]
+fn ordinary_builtins_and_statements_still_work() {
+    let source = "{{ [1, 2] | join(\",\") }} {{ email | upper }} {{ email | lower }} \
+                  {% for i in range(2) %}{{ loop.index }}{% endfor %} \
+                  {% set ns = namespace(n=1) %}{% set ns.n = ns.n + 1 %}{{ ns.n }} \
+                  {% filter upper %}x{% endfilter %} {{ dict(a=1).a }} \
+                  {% set pair = (1, 2) %}{% set a, b = pair %}{{ a + b }} \
+                  {% with w = font_size %}{{ w }}{% endwith %} \
+                  {{ \"a-b\" | replace(\"-\", \"+\") }} {{ \"%s!\" | format(name) }} \
+                  {{ \"\" if false }}|{{ email is string }}";
+    assert_eq!(
+        render(source, &linux()).unwrap(),
+        "1,2 DAN@EXAMPLE.COM dan@example.com 12 2 X 1 3 13 a+b Dan Myles! |true"
+            .replace("true", "True")
+    );
+}
+
+#[test]
+fn divisibleby_zero_is_a_template_error_not_a_panic() {
+    match render("ok\n{{ 1 is divisibleby(0) }}", &linux()) {
+        Err(Error {
+            file,
+            line: Some(2),
+            problem: Problem::Render(message),
+        }) => {
+            assert_eq!(file, Path::new(FILE));
+            assert!(message.contains("divisibleby(0)"), "{message}");
+        }
+        other => panic!("divisibleby(0) must be a template error, got {other:?}"),
+    }
+    assert!(render("{{ 1.0 is divisibleby(0.0) }}", &linux()).is_err());
+    assert_eq!(
+        render(
+            "{{ 6 is divisibleby(3) }} {{ 7 is divisibleby(2) }} {{ 1.5 is divisibleby(0.5) }} \
+             {{ font_size is divisibleby(13) }} {{ \"x\" is divisibleby(2) }}",
+            &linux()
+        )
+        .unwrap(),
+        "True False True True False"
+    );
+}
+
+#[test]
+fn an_engine_panic_is_this_files_error_not_a_crash() {
+    match render("{{ [1, 2] | slice(4611686018427387904) }}", &linux()) {
+        Err(Error {
+            file,
+            line: None,
+            problem: Problem::Render(message),
+        }) => {
+            assert_eq!(file, Path::new(FILE));
+            assert!(
+                message.starts_with("the template engine failed: "),
+                "{message}"
+            );
+        }
+        other => panic!("an engine panic must be a template error, got {other:?}"),
+    }
+    assert_eq!(render("{{ name }}", &linux()).unwrap(), "Dan Myles");
+}
+
+#[test]
+fn attribute_builtins_require_the_attribute_unless_given_a_default() {
+    for source in [
+        "{{ [machine] | map(attribute=\"hostname\") | join(\",\") }}",
+        "{{ [machine] | sort(attribute=\"hostname\") | length }}",
+        "{{ [machine] | sort(attribute=\"os, hostname\") | length }}",
+        "{{ [machine] | groupby(\"hostname\") | length }}",
+        "{{ [machine] | groupby(attribute=\"hostname\") | length }}",
+        "{{ [machine] | unique(attribute=\"hostname\") | length }}",
+        "{{ [machine] | min(attribute=\"hostname\") | length }}",
+        "{{ [machine] | max(attribute=\"hostname\") | length }}",
+    ] {
+        match render(source, &linux()) {
+            Err(Error {
+                line: Some(1),
+                problem: Problem::Render(message),
+                ..
+            }) => assert!(
+                message.contains("an item has no `hostname`"),
+                "{source:?}: {message}"
+            ),
+            other => panic!("{source:?} must fail on the missing attribute, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        render(
+            "{{ [machine] | map(attribute=\"hostname\", default=\"h\") | join }} \
+             {{ [machine] | map(attribute=\"os\") | join }} \
+             {{ [machine] | groupby(\"hostname\", default=\"g\") | map(attribute=\"grouper\") | join }} \
+             {{ [machine, machine] | sort(attribute=\"os,arch\") | length }} \
+             {{ [machine] | unique(attribute=\"os\") | length }} \
+             {{ [machine] | max(attribute=\"name\") | attr(\"name\") }} \
+             {{ [{\"a\": [1, 2]}] | map(attribute=\"a.1\") | join }} \
+             {{ [\"a\"] | map(\"upper\") | join }}",
+            &linux()
+        )
+        .unwrap(),
+        "h linux g 2 1 work-laptop 2 A"
+    );
+}

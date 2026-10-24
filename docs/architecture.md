@@ -23,7 +23,7 @@ async would buy v1 nothing.
 | `thiserror` | each module's error enum |
 | `anyhow` | command-level errors with context |
 | `gethostname` | the default machine name |
-| `minijinja` | templates (U2). Default features off; only `builtins` and `debug` |
+| `minijinja` | templates (U2). Pinned `=3.0.3`, default features off; only `builtins`, `debug`, and `unstable_machinery` |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -84,7 +84,7 @@ src/
     status.rs, rollback.rs                                                  [U3]
     update.rs, service.rs                                                   [U8]
     init.rs                                                                 [U9]
-  template/mod.rs         render, check, check_all                          [built: U2]
+  template/               mod.rs (API), strict.rs (guards), builtins.rs     [built: U2]
   state/                                                                    [U3]
   apply/                                                                    [U4]
   agents/                 adapter table, skills + instructions targets      [U5]
@@ -372,10 +372,41 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
   never a lossy path). `distro` is none on a machine without one: it compares unequal to every
   string and is falsy, and printing it is an error, so a template writes
   `{{ machine.distro or "unknown" }}`.
-- **Strict.** An undefined value is an error when printed, tested, iterated, passed to a filter,
-  or looked into, so a typo never renders as an empty string. `is defined` and `default(...)` are
-  the explicit escapes. A variable in a branch that isn't taken isn't needed, so a Windows-only
-  variable may live in `os/windows.toml`.
+- **Strict.** A missing value is an error wherever it is used, so a typo never renders, never
+  picks a branch, and never hides in a container. Strict undefined alone doesn't do this:
+  minijinja lets an undefined value pass through `pprint`, `is string`, a list or dict literal, a
+  comparison, `in`, or an assignment. So `render` does what minijinja's own compile does
+  (`parse`, `CodeGenerator`, `eval`) with one extra pass, `strict::rewrite`, between parse and
+  codegen. It rebuilds the AST and wraps every lookup, filter result, and call result that computes
+  a value in an internal guard filter. A guard that sees an undefined value fails with
+  `Problem::Missing` (a lookup: `typo`, `machine.hostname`, `email.domain`, `items[3]`) or
+  `Problem::Render` (an undefined filter or call result, such as `[] | first`). Only these stay
+  unguarded:
+  - the direct operand of `is defined`, `is undefined`, `default(...)`, and its alias `d(...)`,
+    the explicit escapes. Their operand's receiver and arguments are still guarded, so
+    `typo.attr is defined` is an error, as in minijinja's strict mode;
+  - a name being assigned (`set`, `for`, `with` targets);
+  - a called function's name and a called method's attribute (its receiver is guarded);
+  - the filters chained in a `{% filter %}` or `{% set … | f %}` header, which have no operand.
+
+  Guards run only when their expression runs, so a variable in a branch that isn't taken isn't
+  needed, and a Windows-only variable may live in `os/windows.toml`. The attribute builtins
+  (`map`, `sort`, `groupby`, `unique`, `min`, and `max` with `attribute=`) look attributes up out
+  of the guards' sight, so they are replaced by wrappers. Each wrapper requires every item to have
+  the attribute unless the filter's own `default=` is given, then calls minijinja's filter. An `if`
+  expression without `else` still yields Jinja's empty value; it reads no missing variable.
+- **Panics.** minijinja's `divisibleby` test computes `a % 0` unchecked, so it is replaced by a
+  checked one: a zero divisor is a `Render` error with its line. Any other panic inside the engine
+  is caught at `render` and becomes `Problem::Render("the template engine failed: …")` for the
+  file, with no line, because a panic carries none. A panic hook installed once suppresses the
+  report only while the current thread renders a template, and keeps the previous hook for
+  everything else. A builtin that asks for a vast but representable allocation (`indent(10**12)`)
+  can still exhaust memory, and no in-process handler catches an allocation failure.
+- **Pinned machinery.** `unstable_machinery` is minijinja's public but unstable API: `parse`, the
+  AST, `CodeGenerator`, and `eval`. Loadout depends on it at exactly `=3.0.3`. An upgrade must
+  re-review `strict.rs` against the new AST and codegen, not only recompile it. The rewrite's
+  `match` is exhaustive, so a new node kind fails to compile, but a changed meaning would not. The
+  features stay off: `multi_template`, `macros`, `loop_controls`, `json`, `serde`, and loaders.
 - **Closed.** There is no loader, so no file is reachable from a template. `include`, `import`,
   `from`, `extends`, `block`, and `macro` aren't even parsed (minijinja's `multi_template` and
   `macros` features are off), so they are syntax errors that validate reports. Nothing reads the
@@ -386,8 +417,11 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
   use `{%-` and `-%}` to trim.
 - **Errors** are `template::Error { file, line, problem }`, shown as `file:line: problem`. A missing
   variable is `Problem::Missing(name)`, naming nested lookups in full (`machine.hostname`): for
-  example ``files/gitconfig.tmpl:2: variable `signing_key` is not defined for this machine``. Other
-  problems are `Syntax`, `Render` (an unknown filter, a type error, printing none), and `Home`.
+  example ``files/gitconfig.tmpl:2: variable `signing_key` is not defined for this machine``. Its
+  line is where the missing name itself sits, even inside a multi-line expression. Other problems
+  are `Syntax`, `Render` (an unknown filter, a type error, printing none, an undefined result, a
+  missing attribute in an attribute builtin, division by zero, an engine panic), and `Home`. Every
+  error has a line except `Home` and an engine panic.
 - **Validate** (`template::check_all`) runs only after `Loadout::load` accepts the loadout, so every
   source has already passed the confinement checks in section 3 before its content is read. It
   then re-canonicalizes each distinct `.tmpl` user-file source from every layer, requires it to sit

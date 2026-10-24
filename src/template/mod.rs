@@ -1,8 +1,15 @@
+mod builtins;
+mod strict;
+
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
+use minijinja::machinery::{self, CodeGenerator};
 use minijinja::syntax::SyntaxConfig;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 
@@ -45,8 +52,7 @@ impl fmt::Display for Line {
 
 pub fn check(file: &Path, source: &str) -> Result<(), Error> {
     let name = file.display().to_string();
-    environment()
-        .template_from_named_str(&name, source)
+    machinery::parse(source, &name, syntax_config())
         .map(drop)
         .map_err(|error| syntax(file, &error))
 }
@@ -63,15 +69,52 @@ pub fn render(
         problem,
     })?;
     let name = file.display().to_string();
+    let parsed =
+        machinery::parse(source, &name, syntax_config()).map_err(|error| syntax(file, &error))?;
+    let mut generator = CodeGenerator::new(&name, source);
+    generator.compile_stmt(&strict::rewrite(source, &parsed));
+    let (instructions, blocks) = generator.finish();
     let environment = environment();
-    let template = environment
-        .template_from_named_str(&name, source)
-        .map_err(|error| syntax(file, &error))?;
-    template.render(context).map_err(|error| Error {
+    let mut output = String::new();
+    let failure = |line, problem| Error {
         file: file.to_path_buf(),
-        line: error.line(),
-        problem: runtime(&error),
-    })
+        line,
+        problem,
+    };
+    // A builtin that panics must still end as this file's template error, never as a crash or a
+    // panic report on stderr. Known panics are fixed at their builtin; this catches the rest.
+    quiet_panics();
+    RENDERING.set(true);
+    let evaluated = panic::catch_unwind(AssertUnwindSafe(|| {
+        machinery::eval(
+            &environment,
+            &instructions,
+            context,
+            &blocks,
+            &mut machinery::make_string_output(&mut output),
+            AutoEscape::None,
+        )
+        .map(drop)
+    }));
+    RENDERING.set(false);
+    match evaluated {
+        Ok(Ok(())) => Ok(output),
+        Ok(Err(error)) => {
+            let (line, problem) = runtime(&error);
+            Err(failure(line, problem))
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown failure".to_owned());
+            Err(failure(
+                None,
+                Problem::Render(format!("the template engine failed: {message}")),
+            ))
+        }
+    }
 }
 
 /// Syntax-checks every `.tmpl` source a user file names, in any layer. Call it only on a loadout
@@ -121,16 +164,19 @@ fn read(root: &Path, file: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "a template must be UTF-8 text".to_owned())
 }
 
+fn syntax_config() -> SyntaxConfig {
+    SyntaxConfig::builder()
+        .keep_trailing_newline(true)
+        .build()
+        .expect("the default delimiters are a valid syntax")
+}
+
 fn environment<'source>() -> Environment<'source> {
     let mut environment = Environment::new();
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_auto_escape_callback(|_| AutoEscape::None);
-    environment.set_syntax(
-        SyntaxConfig::builder()
-            .keep_trailing_newline(true)
-            .build()
-            .expect("the default delimiters are a valid syntax"),
-    );
+    environment.add_filter(strict::GUARD, strict::guard);
+    builtins::install(&mut environment);
     // Debug mode is what makes an undefined error name its variable; its debug() global would
     // print the whole context, so it goes.
     environment.set_debug(true);
@@ -190,13 +236,40 @@ fn syntax(file: &Path, error: &minijinja::Error) -> Error {
     }
 }
 
-fn runtime(error: &minijinja::Error) -> Problem {
+fn runtime(error: &minijinja::Error) -> (Option<usize>, Problem) {
+    if let Some(undefined) = std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<strict::Undefined>())
+    {
+        let problem = if undefined.lookup {
+            Problem::Missing(undefined.expression.clone())
+        } else {
+            Problem::Render(error.detail().unwrap_or_default().to_owned())
+        };
+        return (undefined.line.or(error.line()), problem);
+    }
     let detail = error.detail().unwrap_or_default();
-    match undefined_name(detail) {
+    let problem = match undefined_name(detail) {
         Some(name) => Problem::Missing(name.to_owned()),
         None if detail.is_empty() => Problem::Render(error.kind().to_string()),
         None => Problem::Render(detail.to_owned()),
-    }
+    };
+    (error.line(), problem)
+}
+
+thread_local! {
+    static RENDERING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn quiet_panics() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !RENDERING.get() {
+                previous(info);
+            }
+        }));
+    });
 }
 
 // minijinja names an undefined value only inside its detail text, as `name` is undefined.
