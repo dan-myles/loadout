@@ -517,17 +517,38 @@ included. Loadout instead validates the shape of everything it reads back before
 The `--loadout DIR` checkout a run used is known only from its journal. Rollback reserves that
 recorded checkout and the default `<state>/loadout` both. The state dir itself is always reserved.
 
-**Target roots.** A file or tree target must be absolute, clean, and lexically under one of the
+**Target roots.** A file or tree target must be absolute and clean, and must lie under one of the
 bases targets are built from:
 
 - `Context.home` and `Context.config`, the bases of `~/` and `{config}/`
 - `Context.xdg_config`
 - each agent dir override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and so on), which may lie outside home
 
-`observe`, `Run::begin`, and rollback enforce this (`Error::OutsideRoots`). A symlink below a
-root may still lead elsewhere, and the write follows it. One limit follows: a rollback must run
-with the same agent dir overrides the run had, or its targets under an override that is no longer
-set are refused.
+`observe`, `Run::begin`, `audit`, and rollback enforce this (`Error::OutsideRoots`), before the
+reserved check and any read. Membership compares path identities by whole components, using
+`reserved::identity`, which follows the same prefix rules as the reserved checks:
+
+- **Two forms on each side.** A target belongs when its lexical form, or its physical form, equals
+  or lies inside the lexical or physical form of a root. The physical form is
+  `reserved::normalize`: existing ancestors are canonicalized, and it only stats and reads links.
+  A path that can't be normalized contributes only its lexical form. Normalizing never adds an
+  acceptance.
+- **Windows spellings.** `\\?\C:\…` and `C:\…` are one drive, and `\\?\UNC\srv\share\…` and
+  `\\srv\share\…` are one share. ASCII letters in names compare case-insensitively. A configured
+  UNC root works like any other root. An admin share such as `\\localhost\c$` is a share, never
+  equated with the drive it maps to.
+- **Unix spellings.** Names compare exactly and case-sensitively. A symlinked spelling of a root
+  and its real path are one root; on macOS that covers `/var` and `/private/var`. On a
+  case-insensitive macOS volume, a case variant of an *existing* root folder resolves to the same
+  physical folder and is accepted through its physical form.
+- **Lossless identity.** Names stay `OsString`. Two non-UTF-8 names that differ only in invalid
+  bytes are different roots.
+- **Links below a root.** A symlink below a root keeps its lexical membership, and the write
+  follows it (section 5). A path outside every root in both its lexical and physical forms is
+  refused.
+
+One limit follows: a rollback must run with the same agent dir overrides the run had, or its
+targets under an override that is no longer set are refused.
 
 - `state.json`: `{ "version": 1, "records": [Record] }`. A `Record` is `{ target, item, sha256, run }`:
   the `Target` and `ItemRef` (serialized exactly as in `plan --json`), the hash of what loadout last

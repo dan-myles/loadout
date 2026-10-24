@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::plan::{Content, ItemRef, Observed, Target};
+use crate::platform::Os;
 use crate::reserved::{self, Use};
 
 pub use rollback::{RolledBack, rollback};
@@ -378,13 +379,34 @@ fn target_shape(target: &Target) -> bool {
 /// Where loadout's targets may live: the bases `Context::expand` uses for `~/` and `{config}/`,
 /// the XDG config dir some agents use on every OS, and each agent dir override. These are the
 /// same roots the resolver and the agent adapters build targets from, so a target outside all
-/// of them never came from a loadout. The check is lexical: a symlink below a root may still
-/// lead elsewhere, and the write follows it (section 5).
+/// of them never came from a loadout.
+///
+/// Membership compares path identities (`reserved::identity`, the same prefix rules the reserved
+/// checks use) by whole components. A target belongs when its lexical form or its physical form
+/// (`reserved::normalize`, existing ancestors canonicalized) equals or lies inside the lexical or
+/// physical form of a root. So `\\?\C:\Users\a` and `C:\Users\a` are one root, and so are a
+/// symlinked spelling of a root and its real path. Names compare case-insensitively on Windows
+/// only. A form that can't be normalized adds nothing. A symlink below a root may still lead
+/// elsewhere, and the write follows it (section 5).
 fn within_roots(context: &Context, path: &Path) -> bool {
+    let fold_case = context.os == Os::Windows;
+    let forms = |path: &Path| {
+        let mut forms = vec![reserved::identity(path, fold_case)];
+        if let Ok(real) = reserved::normalize(path) {
+            forms.push(reserved::identity(&real, fold_case));
+        }
+        forms
+    };
+    let targets = forms(path);
     [&context.home, &context.config, &context.xdg_config]
         .into_iter()
         .chain(context.agent_dirs.values())
-        .any(|root| path.starts_with(root))
+        .any(|root| {
+            let roots = forms(root);
+            targets
+                .iter()
+                .any(|target| roots.iter().any(|root| target.starts_with(root)))
+        })
 }
 
 /// The path of a file or tree target, after checking it is absolute, clean, and under a target

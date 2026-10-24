@@ -1357,3 +1357,277 @@ fn a_rollback_tmp_that_verifies_as_the_prior_is_reused() {
     );
     assert!(rolled.leftovers.is_empty());
 }
+
+fn observe_in(context: &Context, path: &Path) -> Result<Observed, Error> {
+    state::observe(context, &context.state.join("loadout"), &target(path))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_spelling_of_home_and_its_real_path_are_one_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let real = root.join("real-home");
+    let outside = root.join("outside");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let link = root.join("link-home");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("outside-link")).unwrap();
+    std::os::unix::fs::symlink(&outside, real.join("out-link")).unwrap();
+
+    let through_link = isolated(&link, &root.join("state"));
+    assert!(observe_in(&through_link, &real.join(".gitconfig")).is_ok());
+    let at_real = isolated(&real, &root.join("state"));
+    assert!(observe_in(&at_real, &link.join(".gitconfig")).is_ok());
+    assert!(
+        observe_in(&at_real, &real.join("out-link/x")).is_ok(),
+        "a link below a root keeps its lexical membership"
+    );
+    for outside in [
+        root.join("outside-link/x"),
+        outside.join("x"),
+        root.join("real-home2/x"),
+    ] {
+        assert!(
+            matches!(
+                observe_in(&at_real, &outside),
+                Err(Error::OutsideRoots { .. })
+            ),
+            "{}",
+            outside.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_canonical_spelling_of_a_temp_home_is_the_same_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let lexical = dir.path().join("home");
+    fs::create_dir_all(&lexical).unwrap();
+    let canonical = lexical.canonicalize().unwrap();
+    let state = dir.path().join("state");
+    assert!(observe_in(&isolated(&lexical, &state), &canonical.join(".x")).is_ok());
+    assert!(observe_in(&isolated(&canonical, &state), &lexical.join(".x")).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_case_variant_of_home_is_another_folder_on_linux() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let context = isolated(&home, &root.join("state"));
+    assert!(matches!(
+        observe_in(&context, &root.join("HOME/.x")),
+        Err(Error::OutsideRoots { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_differing_only_in_invalid_bytes_are_different_roots() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join(OsStr::from_bytes(b"home-\xff"));
+    let twin = root.join(OsStr::from_bytes(b"home-\xfe"));
+    assert_eq!(home.to_string_lossy(), twin.to_string_lossy());
+    let context = isolated(&home, &root.join("state"));
+    assert_eq!(
+        observe_in(&context, &home.join(".x")).unwrap(),
+        Observed::Absent
+    );
+    assert!(matches!(
+        observe_in(&context, &twin.join(".x")),
+        Err(Error::OutsideRoots { .. })
+    ));
+}
+
+/// `std::fs::canonicalize` on Windows returns the verbatim `\\?\C:\…` spelling; this is the
+/// ordinary `C:\…` spelling of the same path.
+#[cfg(windows)]
+fn ordinary(path: &Path) -> PathBuf {
+    let text = path.to_str().unwrap();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+}
+
+#[cfg(windows)]
+#[test]
+fn verbatim_case_and_ordinary_spellings_of_home_are_one_root_on_windows() {
+    let machine = Machine::new();
+    let home = ordinary(&machine.home);
+    assert!(
+        machine.home.to_str().unwrap().starts_with(r"\\?\"),
+        "canonical home is verbatim"
+    );
+    let context = isolated(&home, &ordinary(&machine.context.state));
+    let text = home.to_str().unwrap();
+    let lower_drive = format!("{}{}", text[..1].to_ascii_lowercase(), &text[1..]);
+    for spelling in [
+        machine.home.join(".gitconfig"),
+        home.join(".gitconfig"),
+        PathBuf::from(lower_drive).join(".gitconfig"),
+        PathBuf::from(text.to_ascii_uppercase()).join(".gitconfig"),
+    ] {
+        assert!(
+            observe_in(&context, &spelling).is_ok(),
+            "{}",
+            spelling.display()
+        );
+    }
+    let sibling = format!("{text}2");
+    let other_drive = format!("Z{}", &text[1..]);
+    for outside in [
+        PathBuf::from(&sibling).join(".x"),
+        PathBuf::from(format!(r"\\?\{sibling}")).join(".x"),
+        PathBuf::from(&other_drive).join(".x"),
+        PathBuf::from(format!(r"\\?\{other_drive}")).join(".x"),
+        PathBuf::from(r"C:relative\.x"),
+        PathBuf::from(r"relative\.x"),
+        home.join(r"..\escape\.x"),
+    ] {
+        assert!(
+            matches!(
+                observe_in(&context, &outside),
+                Err(Error::OutsideRoots { .. })
+            ),
+            "{}",
+            outside.display()
+        );
+    }
+    let auth = home.join(r".codex\auth.json");
+    fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    fs::write(&auth, "SYNTHETIC").unwrap();
+    let verbatim_auth = machine.home.join(r".codex\auth.json");
+    assert!(matches!(
+        observe_in(&context, &verbatim_auth),
+        Err(Error::Reserved { .. })
+    ));
+    assert_eq!(read(&auth), "SYNTHETIC");
+}
+
+/// One full lifecycle with the target spelled one way and the context the other: `observe`,
+/// `Run::begin` and `write`, `audit` (status), then a rollback that really restores the file.
+#[cfg(windows)]
+fn lifecycle(context: &Context, target_home: &Path) {
+    let path = target_home.join(".gitconfig");
+    fs::write(&path, "mine").unwrap();
+    let body = file("loadout's", false);
+    let checkout = context.state.join("loadout");
+    let action = Action {
+        item: item(),
+        target: target(&path),
+        change: Change::Replace,
+        prior: state::observe(context, &checkout, &target(&path)).unwrap(),
+        content: Some(body.clone()),
+    };
+    let lock = state::lock(context).unwrap();
+    let mut state = State::load(context).unwrap();
+    let plan = Plan {
+        actions: vec![action.clone()],
+    };
+    let mut run = Run::begin(context, &checkout, lock, &state, &plan).unwrap();
+    run.write(&action, &body).unwrap();
+    run.finish(&mut state).unwrap();
+    assert_eq!(read(&path), "loadout's");
+    let state = State::load(context).unwrap();
+    assert_eq!(state::audit(context, &checkout, &state)[0].1, Health::Ok);
+    let rolled = state::rollback(context, None).unwrap();
+    assert_eq!(rolled.restored, vec![target(&path)]);
+    assert_eq!(read(&path), "mine");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_verbatim_target_runs_its_whole_lifecycle_under_an_ordinary_context() {
+    let machine = Machine::new();
+    let context = isolated(&ordinary(&machine.home), &ordinary(&machine.context.state));
+    lifecycle(&context, &machine.home);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_ordinary_target_runs_its_whole_lifecycle_under_a_verbatim_context() {
+    let machine = Machine::new();
+    lifecycle(&machine.context, &ordinary(&machine.home));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_run_written_in_one_spelling_is_audited_and_rolled_back_in_the_other() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    fs::write(&path, "mine").unwrap();
+    machine.apply(&path, &file("loadout's", false));
+    let context = isolated(&ordinary(&machine.home), &ordinary(&machine.context.state));
+    let state = State::load(&context).unwrap();
+    let audit = state::audit(&context, &context.state.join("loadout"), &state);
+    assert_eq!(
+        audit[0].1,
+        Health::Ok,
+        "a finished owned target is not unchecked"
+    );
+    let rolled = state::rollback(&context, None).unwrap();
+    assert_eq!(rolled.restored, vec![target(&path)]);
+    assert_eq!(read(&path), "mine");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_target_outside_every_spelling_of_home_is_refused_untouched() {
+    let machine = Machine::new();
+    let context = isolated(&ordinary(&machine.home), &ordinary(&machine.context.state));
+    let sibling = PathBuf::from(format!("{}2", ordinary(&machine.home).display()));
+    fs::create_dir_all(&sibling).unwrap();
+    let outside = sibling.join(".gitconfig");
+    fs::write(&outside, "outside").unwrap();
+    let mut permissions = fs::metadata(&outside).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&outside, permissions).unwrap();
+    let before = fs::metadata(&outside).unwrap();
+    for spelling in [
+        outside.clone(),
+        PathBuf::from(format!(r"\\?\{}", outside.display())),
+    ] {
+        assert!(matches!(
+            observe_in(&context, &spelling),
+            Err(Error::OutsideRoots { .. })
+        ));
+        let body = file("loadout's", false);
+        let action = Action {
+            item: item(),
+            target: target(&spelling),
+            change: Change::Replace,
+            prior: present(&"0".repeat(64)),
+            content: Some(body),
+        };
+        let lock = state::lock(&context).unwrap();
+        let error = Run::begin(
+            &context,
+            &context.state.join("loadout"),
+            lock,
+            &State::load(&context).unwrap(),
+            &Plan {
+                actions: vec![action],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::OutsideRoots { .. }), "{error}");
+    }
+    let after = fs::metadata(&outside).unwrap();
+    assert_eq!(read(&outside), "outside");
+    assert!(after.permissions().readonly());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(after.len(), before.len());
+    let mut permissions = after.permissions();
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows only: clears the read-only attribute so the temp dir can be removed"
+    )]
+    permissions.set_readonly(false);
+    fs::set_permissions(&outside, permissions).unwrap();
+}

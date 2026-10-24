@@ -337,3 +337,79 @@ fn a_state_file_linked_outside_the_state_dir_is_never_read() {
         stderr(&output)
     );
 }
+
+#[cfg(windows)]
+fn cli_as(home: &Path, state: &Path, args: &[&str]) -> Output {
+    let child = {
+        let _forks = forks();
+        Command::new(env!("CARGO_BIN_EXE_loadout"))
+            .args(args)
+            .env("LOADOUT_HOME", home)
+            .env("LOADOUT_STATE_DIR", state)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(windows)]
+fn ordinary(path: &Path) -> PathBuf {
+    let text = path.to_str().unwrap();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+}
+
+#[cfg(windows)]
+#[test]
+fn the_cli_rolls_back_a_verbatim_spelled_run_from_an_ordinary_home() {
+    let machine = Machine::new();
+    assert!(machine.home.to_str().unwrap().starts_with(r"\\?\"));
+    let path = machine.home.join(".gitconfig");
+    fs::write(&path, "mine").unwrap();
+    machine.run(&[(&path, "loadout's")], true);
+    let (home, state) = (ordinary(&machine.home), ordinary(&machine.state));
+    let output = cli_as(&home, &state, &["status"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let output = cli_as(&home, &state, &["rollback"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "mine");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_to_home_is_the_same_root() {
+    let machine = Machine::new();
+    let alias = ordinary(&machine.home.with_file_name("home-junction"));
+    let made = {
+        let _forks = forks();
+        Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(ordinary(&machine.home))
+            .output()
+            .unwrap()
+    };
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let vars = BTreeMap::from([
+        ("LOADOUT_HOME", alias.clone().into_os_string()),
+        (
+            "LOADOUT_STATE_DIR",
+            ordinary(&machine.state).into_os_string(),
+        ),
+    ]);
+    let context =
+        Context::resolve(Os::current().unwrap(), |name| vars.get(name).cloned(), None).unwrap();
+    let real = Target::Path {
+        path: machine.home.join(".gitconfig"),
+    };
+    assert!(state::observe(&context, &ordinary(&machine.checkout()), &real).is_ok());
+    let through = Target::Path {
+        path: alias.join(".gitconfig"),
+    };
+    assert!(state::observe(&machine.context, &machine.checkout(), &through).is_ok());
+}
