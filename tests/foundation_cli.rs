@@ -1255,6 +1255,55 @@ fn git_pointers_outside_the_loadout_are_refused_without_being_opened() {
     assert_eq!(code, 0, "an ordinary worktree checkout stays valid: {text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unresolvable_commondir_fails_validation_instead_of_counting_as_absent() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let case = |name: &str| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(root.join("meta")).unwrap();
+        fs::write(root.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+        fs::write(root.join(".git"), "gitdir: meta\n").unwrap();
+        root
+    };
+    let run = |root: &Path, json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let dangling = case("dangling");
+    symlink(
+        dangling.join("meta/missing"),
+        dangling.join("meta/commondir"),
+    )
+    .unwrap();
+    let denied = case("denied");
+    fs::create_dir_all(denied.join("locked/x")).unwrap();
+    symlink(
+        denied.join("locked/x/target"),
+        denied.join("meta/commondir"),
+    )
+    .unwrap();
+    fs::set_permissions(denied.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let enforced = fs::read_dir(denied.join("locked")).is_err();
+
+    for json in [false, true] {
+        let (code, text) = run(&dangling, json);
+        assert_eq!(code, 3, "dangling commondir json={json}: {text}");
+        if enforced {
+            let (code, text) = run(&denied, json);
+            assert_eq!(code, 3, "denied commondir json={json}: {text}");
+        }
+    }
+    fs::set_permissions(denied.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
