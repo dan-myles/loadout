@@ -5,11 +5,20 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use process_wrap::std::JobObject;
 #[cfg(unix)]
-use process_wrap::std::ProcessGroup;
-use process_wrap::std::{ChildWrapper, CommandWrap};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(unix)]
+use std::process::{Child, ChildStdin};
+use std::process::{ChildStderr, ChildStdout, ExitStatus};
+
+#[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
+use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
+use nix::unistd::Pid;
+#[cfg(windows)]
+use process_wrap::std::{ChildWrapper, CommandWrap, JobObject};
 
 use super::manager::Invocation;
 
@@ -151,15 +160,21 @@ pub(super) fn query(invocation: &Invocation) -> Result<Captured, QueryError> {
     run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP)
 }
 
-/// Runs a query in its own process group (Unix) or job object (Windows), so the deadline, an
-/// oversized answer, or a process it left behind can stop the whole tree. Every outcome, success
-/// included, ends with `settle`, and only a settled query's buffers are read.
+/// Runs a query in a process tree loadout can stop as a whole: on Unix a process group whose id
+/// a loadout-owned anchor holds, on Windows a job object. Every outcome, success included, ends
+/// with `settle`, and only a settled query's buffers are read.
 fn run_query(
     invocation: &Invocation,
     deadline: Duration,
     cap: usize,
 ) -> Result<Captured, QueryError> {
-    run_query_with(invocation, deadline, cap, QUERY_CLEANUP_GRACE)
+    run_query_with(
+        invocation,
+        deadline,
+        cap,
+        QUERY_CLEANUP_GRACE,
+        &mut Trace::default(),
+    )
 }
 
 fn run_query_with(
@@ -167,21 +182,13 @@ fn run_query_with(
     deadline: Duration,
     cap: usize,
     grace: Duration,
+    trace: &mut Trace,
 ) -> Result<Captured, QueryError> {
-    let mut wrapped = CommandWrap::from(command(invocation));
-    #[cfg(unix)]
-    {
-        wrapped.wrap(ProcessGroup::leader());
-    }
-    #[cfg(windows)]
-    {
-        wrapped.wrap(JobObject);
-    }
-    let mut child = wrapped.spawn().map_err(QueryError::Spawn)?;
-    let stdout = reader(child.stdout().take(), Keep::All(cap));
-    let stderr = reader(child.stderr().take(), Keep::All(cap));
-    let outcome = watch(child.as_mut(), &stdout, &stderr, deadline, cap);
-    if let Err(detail) = settle(child.as_mut(), &stdout, &stderr, grace) {
+    let mut query = Query::spawn(invocation, grace, trace)?;
+    let stdout = reader(query.take_stdout(), Keep::All(cap));
+    let stderr = reader(query.take_stderr(), Keep::All(cap));
+    let outcome = watch(&mut query, &stdout, &stderr, deadline, cap);
+    if let Err(detail) = query.settle(&stdout, &stderr, Instant::now() + grace, trace) {
         return Err(QueryError::Cleanup {
             cause: outcome.err().map(Box::new),
             detail,
@@ -195,10 +202,10 @@ fn run_query_with(
     })
 }
 
-/// Waits for the query's direct child to exit, stopping early on an oversized stream or at the
-/// deadline. Output still held open after the exit belongs to `settle`.
+/// Waits for the query's own process to exit, stopping early on an oversized stream or at the
+/// deadline. Whatever it leaves behind belongs to `settle`.
 fn watch(
-    child: &mut dyn ChildWrapper,
+    query: &mut Query,
     stdout: &Shared,
     stderr: &Shared,
     deadline: Duration,
@@ -211,7 +218,7 @@ fn watch(
                 return Err(QueryError::Oversized { stream, cap });
             }
         }
-        if let Some(status) = child.try_wait().map_err(QueryError::Wait)? {
+        if let Some(status) = query.try_exit().map_err(QueryError::Wait)? {
             return Ok(status.code());
         }
         if Instant::now() >= limit {
@@ -221,88 +228,325 @@ fn watch(
     }
 }
 
-/// Stops whatever is left of the query and confirms it within one shared `grace`: the whole
-/// group or job is killed, the direct child is reaped, the Unix process group is empty, and
-/// both readers reached EOF. A reader blocked on output held by a process that left the group
-/// can't be confirmed, so that is an error (its thread stays blocked until that process exits).
-///
-/// Windows exposes no safe check that a job has no processes left, so there the job's
-/// termination, the direct child's exit, and both readers' EOF are the whole confirmation.
-///
-/// On Unix the group is signalled right after `watch` reaped its leader. Once the group is empty
-/// its id is free, so in principle a new group could take it in that instant; the empty-group
-/// probe sends no signal, so a reused id can only make cleanup fail, never kill.
-fn settle(
-    child: &mut dyn ChildWrapper,
-    stdout: &Shared,
-    stderr: &Shared,
-    grace: Duration,
-) -> Result<(), String> {
-    let limit = Instant::now() + grace;
-    killed(child.start_kill())?;
-    let mut reaped = false;
+/// Polls `done` until it holds or `limit` passes; `Ok(false)` means time ran out.
+fn until(
+    limit: Instant,
+    mut done: impl FnMut() -> Result<bool, String>,
+) -> Result<bool, String> {
     loop {
-        if !reaped {
-            reaped = child
-                .try_wait()
-                .map_err(|error| format!("cannot reap it: {error}"))?
-                .is_some();
-        }
-        #[cfg(unix)]
-        let empty = group_empty(child.id())?;
-        #[cfg(windows)]
-        let empty = true;
-        let drained = lock(stdout).done && lock(stderr).done;
-        if reaped && empty && drained {
-            return Ok(());
+        if done()? {
+            return Ok(true);
         }
         if Instant::now() >= limit {
-            let pending = [
-                (!reaped, "it has not exited"),
-                (!empty, "processes it started are still running"),
-                (!drained, "its output is still held open"),
-            ];
-            let pending: Vec<&str> = pending
-                .iter()
-                .filter(|(still, _)| *still)
-                .map(|(_, what)| *what)
-                .collect();
-            return Err(format!(
-                "{} {} seconds after loadout stopped it",
-                pending.join(", and "),
-                grace.as_secs()
-            ));
+            return Ok(false);
         }
         thread::sleep(POLL);
     }
 }
 
-/// The result of killing the group or job. On Unix, `ESRCH` from `killpg` means the group is
-/// already gone, which is the goal; every other error is real.
+fn drained(stdout: &Shared, stderr: &Shared) -> bool {
+    lock(stdout).done && lock(stderr).done
+}
+
+/// Keeps the first thing that went wrong while cleanup carries on with the rest.
+fn first(problem: &mut Option<String>, step: Result<bool, String>, pending: &str) {
+    let detail = match step {
+        Ok(true) => return,
+        Ok(false) => pending.to_owned(),
+        Err(detail) => detail,
+    };
+    problem.get_or_insert(detail);
+}
+
+/// The query, and the anchor that holds its process group's id.
+///
+/// The anchor is `/bin/sh -c 'read -r line'`, the leader of a fresh group, blocked on a pipe only
+/// loadout writes; if loadout dies, the pipe closes and the anchor exits. While loadout hasn't
+/// reaped it, alive or as a zombie, the group id can't be reused, so every SIGKILL to the group is
+/// sent before the anchor is reaped, and after that only signal 0. Only each child's own pid is
+/// ever waited on, never the group, so nothing reaps the anchor early. A system without `/bin/sh`
+/// can't run queries: the spawn fails, and detection is an error.
+#[cfg(unix)]
+struct Query {
+    child: Child,
+    anchor: Child,
+    anchor_input: Option<ChildStdin>,
+    group: Pid,
+}
+
+#[cfg(unix)]
+const ANCHOR_SHELL: &str = "/bin/sh";
+
+#[cfg(unix)]
+impl Query {
+    fn spawn(
+        invocation: &Invocation,
+        grace: Duration,
+        trace: &mut Trace,
+    ) -> Result<Self, QueryError> {
+        let mut anchor = spawn_anchor(ANCHOR_SHELL).map_err(QueryError::Spawn)?;
+        let anchor_input = anchor.stdin.take();
+        #[cfg(test)]
+        note(trace, Event::Anchor(anchor.id()));
+        let spawned = i32::try_from(anchor.id())
+            .map_err(|_| io::Error::other(format!("pid {} is out of range", anchor.id())))
+            .and_then(|group| {
+                let mut command = command(invocation);
+                command.process_group(group);
+                command.spawn().map(|child| (child, Pid::from_raw(group)))
+            });
+        match spawned {
+            Ok((child, group)) => {
+                #[cfg(test)]
+                note(trace, Event::Query(child.id()));
+                Ok(Self {
+                    child,
+                    anchor,
+                    anchor_input,
+                    group,
+                })
+            }
+            Err(error) => {
+                let limit = Instant::now() + grace;
+                match release_anchor(&mut anchor, anchor_input, limit, trace) {
+                    Ok(()) => Err(QueryError::Spawn(error)),
+                    Err(detail) => Err(QueryError::Cleanup {
+                        cause: Some(Box::new(QueryError::Spawn(error))),
+                        detail,
+                    }),
+                }
+            }
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    /// Waits on the query's own pid only.
+    fn try_exit(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Stops the query and confirms it within `limit`, which one shared grace sets for every step.
+    /// While the anchor is unreaped (phase A) the group is killed, the query reaped, the readers
+    /// drained, and the group killed again for processes forked during the first kill. Then the
+    /// anchor is reaped, and from there (phase B) only signal 0 checks the group is empty. Every
+    /// step runs even after one fails, and the first failure is reported.
+    fn settle(
+        &mut self,
+        stdout: &Shared,
+        stderr: &Shared,
+        limit: Instant,
+        trace: &mut Trace,
+    ) -> Result<(), String> {
+        let mut problem = None;
+        first(&mut problem, self.kill_group(trace).map(|()| true), "");
+        let reaped = until(limit, || {
+            self.child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|error| format!("cannot reap it: {error}"))
+        });
+        if reaped == Ok(true) {
+            note(trace, Event::ReapedQuery);
+        }
+        first(&mut problem, reaped, "it has not exited");
+        let drain = until(limit, || Ok(drained(stdout, stderr)));
+        if drain == Ok(true) {
+            note(trace, Event::ReadersDone);
+        }
+        first(&mut problem, drain, "its output is still held open");
+        first(&mut problem, self.kill_group(trace).map(|()| true), "");
+        let input = self.anchor_input.take();
+        if let Err(detail) = release_anchor(&mut self.anchor, input, limit, trace) {
+            problem.get_or_insert(detail);
+        }
+        let group = self.group;
+        let empty = until(limit, || group_empty(group));
+        note(trace, Event::Probed);
+        first(&mut problem, empty, "processes it started are still running");
+        match problem {
+            None => Ok(()),
+            Some(detail) => Err(format!(
+                "{detail} (within the {} second cleanup limit)",
+                QUERY_CLEANUP_GRACE.as_secs()
+            )),
+        }
+    }
+
+    /// SIGKILL to the whole group. Only called while the anchor is unreaped, so the id is ours.
+    fn kill_group(&self, trace: &mut Trace) -> Result<(), String> {
+        note(trace, Event::KilledGroup);
+        killed(killpg(self.group, Signal::SIGKILL).map_err(io::Error::from))
+    }
+}
+
+/// The anchor: the leader of a fresh process group, blocked reading a pipe only loadout writes,
+/// with no access to loadout's own stdio.
+#[cfg(unix)]
+fn spawn_anchor(shell: &str) -> io::Result<Child> {
+    Command::new(shell)
+        .args(["-c", "read -r line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+}
+
+/// Ends the anchor: SIGKILL to its own pid (it is unreaped, so the pid is still the anchor's),
+/// close its input, and reap it within `limit`. An anchor that ended by anything but that kill
+/// means something outside loadout interfered with the group, which is an error.
+#[cfg(unix)]
+fn release_anchor(
+    anchor: &mut Child,
+    input: Option<ChildStdin>,
+    limit: Instant,
+    trace: &mut Trace,
+) -> Result<(), String> {
+    let mut problem = None;
+    if let Err(error) = anchor.kill() {
+        problem = Some(format!("cannot stop loadout's group anchor: {error}"));
+    }
+    drop(input);
+    let mut status = None;
+    let reaped = until(limit, || {
+        status = anchor
+            .try_wait()
+            .map_err(|error| format!("cannot reap loadout's group anchor: {error}"))?;
+        Ok(status.is_some())
+    });
+    if reaped == Ok(true) {
+        note(trace, Event::ReapedAnchor);
+    }
+    first(&mut problem, reaped, "loadout's group anchor did not exit");
+    if let Some(status) = status
+        && status.signal() != Some(Signal::SIGKILL as i32)
+    {
+        problem.get_or_insert(format!(
+            "loadout's group anchor ended before loadout stopped it ({status})"
+        ));
+    }
+    problem.map_or(Ok(()), Err)
+}
+
+/// The result of killing the group or job. On Unix, `ESRCH` means the group is already gone;
+/// every other error is real.
 fn killed(result: io::Result<()>) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
         #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => Ok(()),
         Err(error) => Err(format!("cannot stop it: {error}")),
     }
 }
 
-/// Whether the query's process group has no members left. `ProcessGroup::leader()` makes the
-/// direct child the group leader, so the group id is its pid. Signal 0 delivers nothing.
+/// Whether the group has no members left. Signal 0 delivers nothing, so a reused id can only
+/// make this answer "not empty", never harm another group.
 #[cfg(unix)]
-fn group_empty(leader: u32) -> Result<bool, String> {
-    use nix::errno::Errno;
-    use nix::sys::signal::killpg;
-    use nix::unistd::Pid;
-
-    let group =
-        i32::try_from(leader).map_err(|_| format!("group id {leader} is out of range"))?;
-    match killpg(Pid::from_raw(group), None) {
+fn group_empty(group: Pid) -> Result<bool, String> {
+    match killpg(group, None) {
         Ok(()) => Ok(false),
         Err(Errno::ESRCH) => Ok(true),
         Err(error) => Err(format!("cannot check process group {group}: {error}")),
     }
+}
+
+/// On Windows the query runs in a job object, addressed through loadout's own handle, so there
+/// is no id to be reused. No safe API reports that a job has no processes left, so the job's
+/// termination, the query's exit, and both readers' EOF are the whole confirmation.
+#[cfg(windows)]
+struct Query {
+    child: Box<dyn ChildWrapper>,
+}
+
+#[cfg(windows)]
+impl Query {
+    fn spawn(
+        invocation: &Invocation,
+        _grace: Duration,
+        _trace: &mut Trace,
+    ) -> Result<Self, QueryError> {
+        let mut wrapped = CommandWrap::from(command(invocation));
+        wrapped.wrap(JobObject);
+        Ok(Self {
+            child: wrapped.spawn().map_err(QueryError::Spawn)?,
+        })
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout().take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr().take()
+    }
+
+    fn try_exit(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn settle(
+        &mut self,
+        stdout: &Shared,
+        stderr: &Shared,
+        limit: Instant,
+        _trace: &mut Trace,
+    ) -> Result<(), String> {
+        let mut problem = None;
+        first(&mut problem, killed(self.child.start_kill()).map(|()| true), "");
+        let reaped = until(limit, || {
+            self.child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|error| format!("cannot reap it: {error}"))
+        });
+        first(&mut problem, reaped, "it has not exited");
+        let drain = until(limit, || Ok(drained(stdout, stderr)));
+        first(&mut problem, drain, "its output is still held open");
+        match problem {
+            None => Ok(()),
+            Some(detail) => Err(format!(
+                "{detail} (within the {} second cleanup limit)",
+                QUERY_CLEANUP_GRACE.as_secs()
+            )),
+        }
+    }
+}
+
+/// The order of signals and reaps, recorded only in tests, to check that no SIGKILL follows the
+/// anchor's reap.
+#[derive(Default)]
+struct Trace {
+    #[cfg(all(test, unix))]
+    events: Vec<Event>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+    #[cfg(test)]
+    Anchor(u32),
+    #[cfg(test)]
+    Query(u32),
+    KilledGroup,
+    ReapedQuery,
+    ReadersDone,
+    ReapedAnchor,
+    Probed,
+}
+
+#[cfg(unix)]
+fn note(trace: &mut Trace, event: Event) {
+    #[cfg(test)]
+    trace.events.push(event);
+    #[cfg(not(test))]
+    let _ = (trace, event);
 }
 
 /// A settled stream's final state, read under one lock: an overflow first, then a read error,
@@ -399,7 +643,7 @@ fn reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> Shared {
         return shared;
     };
     let sink = Arc::clone(&shared);
-    drop(thread::spawn(move || {
+    let spawned = thread::Builder::new().spawn(move || {
         let mut chunk = [0_u8; 8192];
         loop {
             match source.read(&mut chunk) {
@@ -419,7 +663,12 @@ fn reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> Shared {
             }
         }
         lock(&sink).done = true;
-    }));
+    });
+    if let Err(error) = spawned {
+        let mut buffer = lock(&shared);
+        buffer.error = Some(error);
+        buffer.done = true;
+    }
     shared
 }
 
@@ -603,6 +852,7 @@ mod tests {
             Duration::from_secs(20),
             1024,
             Duration::from_millis(500),
+            &mut Trace::default(),
         );
         let elapsed = started.elapsed();
         if let Ok(pid) = std::fs::read_to_string(&escapee) {
@@ -703,6 +953,110 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(held.code, Some(0));
         assert!(held.stderr.contains("still holds open"), "{}", held.stderr);
+    }
+
+    fn traced(
+        invocation: &Invocation,
+        deadline: Duration,
+        cap: usize,
+    ) -> (Result<Captured, QueryError>, Vec<Event>) {
+        let mut trace = Trace::default();
+        let result = run_query_with(invocation, deadline, cap, QUERY_CLEANUP_GRACE, &mut trace);
+        (result, trace.events)
+    }
+
+    fn pid_of(events: &[Event], anchor: bool) -> Option<u32> {
+        events.iter().find_map(|event| match (event, anchor) {
+            (Event::Anchor(pid), true) | (Event::Query(pid), false) => Some(*pid),
+            _ => None,
+        })
+    }
+
+    /// The identity invariant on a recorded settle: two group kills, the second after the query
+    /// is reaped and drained, both before the anchor is reaped, nothing destructive after it, and
+    /// a signal-0 probe last.
+    fn assert_settled_in_order(events: &[Event]) {
+        let at = |wanted: Event, from: usize| {
+            events[from..]
+                .iter()
+                .position(|event| *event == wanted)
+                .map(|offset| from + offset)
+                .unwrap_or_else(|| panic!("no {wanted:?} after {from}: {events:?}"))
+        };
+        let first_kill = at(Event::KilledGroup, 0);
+        let reaped_query = at(Event::ReapedQuery, first_kill);
+        let drained = at(Event::ReadersDone, reaped_query);
+        let second_kill = at(Event::KilledGroup, drained);
+        let reaped_anchor = at(Event::ReapedAnchor, second_kill);
+        assert!(
+            !events[reaped_anchor..].contains(&Event::KilledGroup),
+            "a SIGKILL after the anchor was reaped: {events:?}"
+        );
+        assert_eq!(events.last(), Some(&Event::Probed), "{events:?}");
+    }
+
+    fn assert_gone(events: &[Event]) {
+        for (role, anchor) in [("anchor", true), ("query", false)] {
+            let pid = pid_of(events, anchor).unwrap_or_else(|| panic!("no {role}: {events:?}"));
+            assert!(!alive(&pid.to_string()), "the {role} {pid} must be gone at return");
+        }
+    }
+
+    #[test]
+    fn a_successful_query_is_settled_in_order_and_leaves_no_anchor_or_query() {
+        let (result, events) = traced(&sh("echo done"), Duration::from_secs(20), 1024);
+        assert_eq!(result.unwrap().stdout, "done\n");
+        assert_settled_in_order(&events);
+        assert_gone(&events);
+    }
+
+    #[test]
+    fn a_timed_out_query_is_settled_in_the_same_order() {
+        let (result, events) = traced(&sh("sleep 30"), Duration::from_millis(300), 1024);
+        assert!(matches!(result, Err(QueryError::TimedOut(_))), "{result:?}");
+        assert_settled_in_order(&events);
+        assert_gone(&events);
+    }
+
+    #[test]
+    fn an_oversized_query_is_settled_in_the_same_order() {
+        let (result, events) = traced(&sh("head -c 65 /dev/zero"), Duration::from_secs(20), 64);
+        assert!(
+            matches!(result, Err(QueryError::Oversized { .. })),
+            "{result:?}"
+        );
+        assert_settled_in_order(&events);
+        assert_gone(&events);
+    }
+
+    #[test]
+    fn a_query_that_cannot_start_leaves_no_anchor_behind() {
+        let missing = Invocation::new(Path::new("/nonexistent/loadout-manager"), ["x"]);
+        let (result, events) = traced(&missing, Duration::from_secs(5), 1024);
+        assert!(matches!(result, Err(QueryError::Spawn(_))), "{result:?}");
+        assert!(!events.contains(&Event::KilledGroup), "{events:?}");
+        assert!(events.contains(&Event::ReapedAnchor), "{events:?}");
+        let anchor = pid_of(&events, true).unwrap();
+        assert!(!alive(&anchor.to_string()), "the anchor {anchor} must be gone");
+    }
+
+    #[test]
+    fn a_missing_anchor_shell_is_a_spawn_failure() {
+        assert!(spawn_anchor("/nonexistent/sh").is_err());
+    }
+
+    #[test]
+    fn a_query_cannot_join_a_group_whose_anchor_is_gone() {
+        let mut gone = spawn_anchor(ANCHOR_SHELL).unwrap();
+        gone.kill().unwrap();
+        gone.wait().unwrap();
+        let group = i32::try_from(gone.id()).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "true"]).process_group(group);
+        assert!(
+            command.spawn().is_err(),
+            "joining the dead anchor's group {group} must fail"
+        );
     }
 
     #[test]

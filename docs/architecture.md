@@ -25,8 +25,8 @@ async would buy v1 nothing.
 | `gethostname` | the default machine name |
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
 | `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
-| `process-wrap` (std, process-group, job-object) | programs: queries killed as a whole process tree at their deadline (U7) |
-| `nix` (`signal`, Unix only) | programs: confirms a stopped query left no process in its group (U7) |
+| `process-wrap` (std, job-object; Windows only) | programs: each query runs in a job object, killed as a whole (U7) |
+| `nix` (`signal`; Unix only) | programs: signals the query's process group and confirms it is empty (U7) |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -918,30 +918,48 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   `QUERY_OUTPUT_CAP` (8 MiB each). A larger answer stops the query early, and is an error, never
   parsed truncated.
 - **Every query is settled, success included.** However a query ends (it exits, overflows, times
-  out, or can't be waited on), loadout kills its whole group or job and confirms the stop:
-  - The kill result is checked. On Unix, `ESRCH` from `killpg` means the group is already gone;
-    any other error is a failure.
-  - The direct child is reaped.
-  - On Unix, the process group is confirmed empty (`killpg` with signal 0 answers `ESRCH`).
-  - Both output readers reach EOF.
+  out, can't be waited on, or can't even start), loadout stops everything it started and
+  confirms the stop. One shared `QUERY_CLEANUP_GRACE` (5 seconds) bounds all of it together, with
+  no unbounded wait. If the stop can't be confirmed, the result is `QueryError::Cleanup`, which
+  keeps what ended the query as its cause, and the detection is `Error::Detect`. Only then are
+  the output buffers read, each under its own lock: an overflow first, then a read error, then
+  the bytes. Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error. A
+  reader thread that can't start marks its stream with a read error.
+- **Unix: an anchor holds the process group's id.** Every query gets a loadout-owned anchor,
+  `/bin/sh -c 'read -r line'`. It is the leader of a fresh process group and blocks on a pipe
+  only loadout writes, with no access to loadout's own stdio; if loadout dies, the pipe closes and
+  the anchor exits. The query is a plain `std::process::Child` that joins the anchor's group
+  (`CommandExt::process_group`).
 
-  One shared `QUERY_CLEANUP_GRACE` (5 seconds) bounds all of these together, with no unbounded
-  wait. If the stop can't be confirmed, the result is `QueryError::Cleanup`, which keeps what
-  ended the query as its cause, and the detection is `Error::Detect`. Only then are the output
-  buffers read, each under its own lock: an overflow first, then a read error, then the bytes.
-  Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error.
+  While loadout hasn't reaped the anchor, alive or as a zombie, the group id can't be reused, so:
+  - **Phase A (anchor unreaped)**, the only time a destructive signal is sent:
+    1. `killpg(SIGKILL)` to the group, with the result checked (only `ESRCH`, "already gone", is
+       accepted).
+    2. Reap the query's own pid.
+    3. Wait for both readers' EOF.
+    4. `killpg(SIGKILL)` again, for processes forked during the first kill.
+    5. Kill and reap the anchor by its own pid; an anchor that ended any other way is an error.
+  - **Phase B:** signal 0 only, until the group is empty. A reused id can then only make cleanup
+    fail, never kill another group.
 
-  Limits:
-  - **Windows:** a safe API can't confirm that a job has no processes left. There, the job's
-    `TerminateJobObject`, the direct child's exit, and both readers' EOF are the confirmation, and
-    a descendant whose output is redirected is covered only by `TerminateJobObject`'s documented
-    semantics. `process-wrap`'s first-message job wait is not used as proof.
-  - **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
-    The reader blocked on it stays blocked until that process exits; that is a resource limit,
-    not success.
-  - **Unix kill timing:** the group is signalled just after its leader is reaped. A reused group
-    id in that instant can only make the empty-group probe fail closed, but in principle the
-    SIGKILL could reach a new group that took the id first.
+  Only each child's own pid is ever waited on, never the group, so nothing reaps the anchor
+  early. A query that fails to start, after its anchor started, still has its anchor killed and
+  reaped within the same bound.
+
+  **Unix doesn't use `process-wrap`.** Its group `try_wait` reaps every child of ours in the
+  group, and `ProcessGroup::attach_to` records the child's own pid as the group id; both are
+  incompatible with an anchor.
+
+  A system without `/bin/sh` can't run queries: the anchor's spawn fails, and detection is an
+  error. Loadout doesn't claim every Unix has `/bin/sh`.
+- **Windows: a job object.** A job is addressed through loadout's own handle, so there is no id
+  to reuse. No safe API reports that a job has no processes left, so the job's
+  `TerminateJobObject` (checked), the query's exit, and both readers' EOF are the confirmation.
+  A descendant whose output is redirected is covered only by `TerminateJobObject`'s documented
+  semantics, and `process-wrap`'s first-message job wait is not used as proof.
+- **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
+  The reader blocked on it stays blocked until that process exits; that is a resource limit, not
+  success.
 - **Installs have no deadline, and U7 can't cancel them.** An install runs in loadout's own
   process group, so `sudo` can prompt and Ctrl-C reaches it. Errors keep the last 64 KiB of each
   output stream. After the installer exits, loadout reads its output for at most 30 more seconds.
