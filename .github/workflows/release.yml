@@ -15,6 +15,7 @@ on:
       - .cargo/**
       - "**/build.rs"
       - src/**
+      - crates/**
       - tests/**
       - README.md
       - LICENSE*
