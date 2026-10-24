@@ -184,9 +184,21 @@ pub fn which(program: &str) -> Option<PathBuf> {
             let mut name = OsString::from(program);
             name.push(extension);
             let candidate = dir.join(name);
-            candidate.is_file().then_some(candidate)
+            executable(&candidate).then_some(candidate)
         })
     })
+}
+
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]

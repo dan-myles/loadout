@@ -701,6 +701,36 @@ fn empty_home_override_is_not_reported_as_isolation() {
     assert!(!text.contains("from LOADOUT_HOME"), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_lists_only_executable_managers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let bin = tempfile::tempdir().unwrap();
+    for (name, mode) in [("npm", 0o644), ("cargo", 0o755)] {
+        let path = bin.path().join(name);
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .args(["doctor", "--json"])
+        .env("PATH", bin.path())
+        .env("LOADOUT_HOME", &sandbox.home)
+        .env("LOADOUT_STATE_DIR", &sandbox.state)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let managers = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "managers")
+        .unwrap()["detail"]
+        .clone();
+    assert_eq!(managers, "cargo");
+}
+
 #[test]
 fn relative_home_override_is_a_runtime_error() {
     let sandbox = Sandbox::new();
