@@ -112,6 +112,24 @@ impl Sandbox {
         agents::materialize(&resolved, context, &self.loadout)
     }
 
+    /// The path U4 takes: the guarded load, resolve, then the runtime reserved check on targets.
+    fn checked(&self, text: &str, context: &Context) -> Result<resolve::Resolved, String> {
+        fs::write(self.loadout.join("loadout.toml"), text).unwrap();
+        let (loadout, _) = Loadout::load_guarded(&self.loadout, context)
+            .unwrap_or_else(|diagnostics| panic!("fixture must validate: {diagnostics:?}"));
+        let facts = Facts {
+            name: "box".to_owned(),
+            os: context.os,
+            distro: None,
+            arch: Arch::X86_64,
+            home: context.home.clone(),
+        };
+        let (resolved, _) = resolve::resolve(&loadout, &facts).map_err(|errors| lines(&errors))?;
+        let targets = resolve::check_targets(&resolved, context, &self.loadout);
+        assert!(!targets.has_errors(), "{}", lines(&targets));
+        Ok(resolved)
+    }
+
     fn ok(&self, text: &str, context: &Context) -> (Vec<Desired>, Vec<Action>) {
         self.run(text, context)
             .unwrap_or_else(|error| panic!("materialize must succeed: {error}: {error:?}"))
@@ -156,6 +174,21 @@ impl Sandbox {
             }
         }
         seen
+    }
+}
+
+fn lines(diagnostics: &loadout::diagnostic::Diagnostics) -> String {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.to_string().replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn refusal(resolved: &resolve::Resolved, context: &Context, checkout: &Path) -> String {
+    match agents::materialize(resolved, context, checkout) {
+        Ok(_) => panic!("materialize must refuse this checkout"),
+        Err(Error::Invalid(diagnostics)) => lines(&diagnostics),
     }
 }
 
@@ -1137,4 +1170,341 @@ fn git_metadata_named_by_a_gitfile_or_commondir_stays_refused_after_validation()
         panic!("a skill is a tree");
     };
     assert_eq!(tree[Path::new("extra")].bytes, b"plain\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_pointers_aliasing_protected_files_are_refused_before_they_are_read() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    let base = sandbox.home.parent().unwrap().to_path_buf();
+    let home = sandbox.home.clone();
+    fs::remove_dir(&home).unwrap();
+    let sandbox = sandbox.relocated(home.clone());
+    let context = sandbox.ambient(Os::Linux, &[("CLAUDE_CONFIG_DIR", base.join("claude"))]);
+    let resolved = sandbox
+        .checked(&manifest(&agents_line(r#"["claude"]"#)), &context)
+        .unwrap();
+    fs::create_dir_all(home.join("meta/repo")).unwrap();
+    fs::create_dir_all(home.join("meta/common")).unwrap();
+
+    let auth = sandbox.home_file(".codex/auth.json", "gitdir: meta/repo\nAUTH-SENTINEL\n");
+    symlink(&auth, home.join(".git")).unwrap();
+    let errors = refusal(&resolved, &context, &home);
+    assert!(
+        errors.contains("Git pointer .git") && errors.contains("auth"),
+        "{errors}"
+    );
+    assert!(!errors.contains("SENTINEL"), "{errors}");
+    fs::remove_file(home.join(".git")).unwrap();
+
+    sandbox.home_file(".git", "gitdir: meta/repo\n");
+    let settings = sandbox.home_file(".t3/settings.json", "../common\nPROVIDER-SENTINEL\n");
+    let commondir = home.join("meta/repo/commondir");
+    symlink(&settings, &commondir).unwrap();
+    let errors = refusal(&resolved, &context, &home);
+    assert!(
+        errors.contains("Git pointer meta/repo/commondir") && errors.contains("private"),
+        "{errors}"
+    );
+    assert!(!errors.contains("SENTINEL"), "{errors}");
+    fs::remove_file(&commondir).unwrap();
+
+    sandbox.home_file("meta/repo/commondir", "../common\n");
+    let (desired, _) = agents::materialize(&resolved, &context, &home).unwrap();
+    find(&desired, ItemKind::Skill, "review", "claude");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_pointer_into_an_override_auth_store_under_a_private_checkout_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    let checkout = sandbox.home.join(".t3").join("worktrees").join("loadout");
+    let sandbox = sandbox.relocated(checkout.clone());
+    let context = sandbox.ambient(Os::Linux, &[("CODEX_HOME", checkout.join("codex"))]);
+    let resolved = sandbox
+        .checked(&manifest(&agents_line(r#"["claude"]"#)), &context)
+        .unwrap();
+    fs::create_dir_all(checkout.join("meta/repo")).unwrap();
+    let auth = sandbox.home_file(
+        ".t3/worktrees/loadout/codex/auth.json",
+        "gitdir: meta/repo\nAUTH-SENTINEL\n",
+    );
+    symlink(&auth, checkout.join(".git")).unwrap();
+    let errors = refusal(&resolved, &context, &checkout);
+    assert!(
+        errors.contains("Git pointer .git") && errors.contains("auth"),
+        "{errors}"
+    );
+    assert!(!errors.contains("SENTINEL"), "{errors}");
+    fs::remove_file(checkout.join(".git")).unwrap();
+
+    sandbox.home_file(".t3/worktrees/loadout/.git", "gitdir: meta/repo\n");
+    let (desired, _) = agents::materialize(&resolved, &context, &checkout).unwrap();
+    find(&desired, ItemKind::Skill, "review", "claude");
+}
+
+/// Two custom agents that merge MCP servers into one file: `[path, format, map, shape]` each.
+fn shared_mcp(devin: [&str; 4], jules: [&str; 4], servers: &str) -> String {
+    let agent = |id: &str, [path, format, map, shape]: [&str; 4]| {
+        format!(
+            "[agents.custom.{id}]\nevidence = \"x\"\n\n[agents.custom.{id}.mcp]\nlinux = \"{path}\"\nformat = \"{format}\"\nmap = \"{map}\"\nshape = \"{shape}\"\nenv_syntax = \"none\"\n\n"
+        )
+    };
+    format!(
+        "[loadout]\nversion = 1\n\n[agents]\nenabled = [\"devin\", \"jules\"]\n\n{}{}{servers}",
+        agent("devin", devin),
+        agent("jules", jules)
+    )
+}
+
+const ONE_SERVER: &str = "[mcp.docs]\ncommand = \"docs\"\n";
+const TWO_SERVERS: &str = "[mcp.docs]\ncommand = \"docs\"\nagents = [\"devin\"]\n\n[mcp.lint]\ncommand = \"lint\"\nagents = [\"jules\"]\n";
+
+fn entries(desired: &[Desired]) -> Vec<(String, McpFormat, String, String)> {
+    desired
+        .iter()
+        .filter_map(|one| match &one.target {
+            Target::Entry {
+                file,
+                format,
+                pointer,
+                key,
+                ..
+            } => Some((
+                file.file_name().unwrap().to_string_lossy().into_owned(),
+                *format,
+                pointer.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn custom_agents_may_merge_one_literal_file_in_one_format() {
+    let sandbox = sandbox();
+    let context = sandbox.isolated(Os::Linux);
+    let maps = shared_mcp(
+        ["~/shared/mcp.json", "json", "/one", "cursor-json"],
+        ["~/shared/mcp.json", "json", "/two", "claude-json"],
+        ONE_SERVER,
+    );
+    let resolved = sandbox.checked(&maps, &context).unwrap();
+    let (desired, unsupported) =
+        agents::materialize(&resolved, &context, &sandbox.loadout).unwrap();
+    assert!(unsupported.is_empty(), "{unsupported:#?}");
+    assert_eq!(
+        entries(&desired),
+        [
+            (
+                "mcp.json".to_owned(),
+                McpFormat::Json,
+                "/one".to_owned(),
+                "docs".to_owned()
+            ),
+            (
+                "mcp.json".to_owned(),
+                McpFormat::Json,
+                "/two".to_owned(),
+                "docs".to_owned()
+            ),
+        ]
+    );
+
+    let keys = shared_mcp(
+        ["~/shared/mcp.json", "json", "/mcpServers", "cursor-json"],
+        ["~/shared/mcp.json", "json", "/mcpServers", "cursor-json"],
+        TWO_SERVERS,
+    );
+    let resolved = sandbox.checked(&keys, &context).unwrap();
+    let (desired, _) = agents::materialize(&resolved, &context, &sandbox.loadout).unwrap();
+    let keys: Vec<String> = entries(&desired).into_iter().map(|entry| entry.3).collect();
+    assert_eq!(keys, ["docs", "lint"]);
+
+    let same = shared_mcp(
+        ["~/shared/mcp.json", "json", "/mcpServers", "cursor-json"],
+        ["~/shared/mcp.json", "json", "/mcpServers", "cursor-json"],
+        ONE_SERVER,
+    );
+    let resolved = sandbox.checked(&same, &context).unwrap();
+    let errors = refusal(&resolved, &context, &sandbox.loadout);
+    assert!(errors.contains("sets the same MCP key as"), "{errors}");
+}
+
+#[test]
+fn one_literal_file_declared_in_two_formats_is_refused_by_resolve() {
+    let sandbox = sandbox();
+    let context = sandbox.isolated(Os::Linux);
+    for (format, shape) in [("toml", "grok-toml"), ("jsonc", "opencode-json")] {
+        let text = shared_mcp(
+            ["~/shared/mcp", "json", "/one", "cursor-json"],
+            ["~/shared/mcp", format, "/two", shape],
+            ONE_SERVER,
+        );
+        let errors = sandbox.checked(&text, &context).unwrap_err();
+        assert!(
+            errors.contains("one file has one format"),
+            "{format}: {errors}"
+        );
+        assert!(
+            errors.contains("as json") && errors.contains(&format!("as {format}")),
+            "{errors}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn aliases_of_one_file_must_agree_on_its_format() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    fs::create_dir_all(sandbox.home.join("shared")).unwrap();
+    symlink(sandbox.home.join("shared"), sandbox.home.join("alias")).unwrap();
+    let context = sandbox.isolated(Os::Linux);
+    for (format, shape) in [("toml", "grok-toml"), ("jsonc", "opencode-json")] {
+        let text = shared_mcp(
+            ["~/shared/mcp", "json", "/one", "cursor-json"],
+            ["~/alias/mcp", format, "/two", shape],
+            ONE_SERVER,
+        );
+        let resolved = sandbox.checked(&text, &context).unwrap();
+        let errors = refusal(&resolved, &context, &sandbox.loadout);
+        assert!(
+            errors.contains("mcp.docs for jules") && errors.contains("mcp.docs for devin"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains(&format!("merges into one MCP file as {format}, not json")),
+            "{errors}"
+        );
+    }
+
+    let text = shared_mcp(
+        ["~/shared/mcp.json", "json", "/one", "cursor-json"],
+        ["~/alias/mcp.json", "json", "/two", "claude-json"],
+        ONE_SERVER,
+    );
+    let resolved = sandbox.checked(&text, &context).unwrap();
+    let (desired, _) = agents::materialize(&resolved, &context, &sandbox.loadout).unwrap();
+    let maps: Vec<String> = entries(&desired).into_iter().map(|entry| entry.2).collect();
+    assert_eq!(maps, ["/one", "/two"]);
+}
+
+#[cfg(unix)]
+fn validate(home: &Path, checkout: &Path) -> (i32, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .arg("validate")
+        .arg(checkout)
+        .env("LOADOUT_HOME", home)
+        .env("LOADOUT_STATE_DIR", home.parent().unwrap().join("state"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).replace('\\', "/");
+    (output.status.code().unwrap(), text)
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_refuses_protected_git_pointers_and_manifests_before_reading_them() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    let home = sandbox.home.clone();
+    fs::remove_dir(&home).unwrap();
+    let sandbox = sandbox.relocated(home.clone());
+    fs::write(
+        home.join("loadout.toml"),
+        manifest(&agents_line(r#"["claude"]"#)),
+    )
+    .unwrap();
+    fs::create_dir_all(home.join("meta/repo")).unwrap();
+    fs::create_dir_all(home.join("meta/common")).unwrap();
+    let (code, text) = validate(&home, &home);
+    assert_eq!(code, 0, "{text}");
+
+    let auth = sandbox.home_file(".codex/auth.json", "gitdir: meta/repo\nAUTH-SENTINEL = [\n");
+    symlink(&auth, home.join(".git")).unwrap();
+    let (code, text) = validate(&home, &home);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("Git pointer .git") && text.contains("auth"),
+        "{text}"
+    );
+    assert!(!text.contains("SENTINEL"), "{text}");
+    fs::remove_file(home.join(".git")).unwrap();
+
+    sandbox.home_file(".git", "gitdir: meta/repo\n");
+    let settings = sandbox.home_file(".t3/settings.json", "../common\nPROVIDER-SENTINEL\n");
+    let commondir = home.join("meta/repo/commondir");
+    symlink(&settings, &commondir).unwrap();
+    let (code, text) = validate(&home, &home);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("Git pointer meta/repo/commondir") && text.contains("private"),
+        "{text}"
+    );
+    assert!(!text.contains("SENTINEL"), "{text}");
+    fs::remove_file(&commondir).unwrap();
+
+    sandbox.home_file("meta/repo/commondir", "../common\n");
+    let (code, text) = validate(&home, &home);
+    assert_eq!(
+        code, 0,
+        "an ordinary gitfile and commondir validate: {text}"
+    );
+
+    fs::create_dir_all(home.join("os")).unwrap();
+    symlink(&auth, home.join("os/linux.toml")).unwrap();
+    let (code, text) = validate(&home, &home);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("os/linux.toml") && text.contains("auth"),
+        "{text}"
+    );
+    assert!(!text.contains("SENTINEL"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_guarded_load_refuses_protected_pointers_and_keeps_legitimate_checkouts() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = sandbox();
+    let checkout = sandbox.home.join(".t3").join("worktrees").join("loadout");
+    let sandbox = sandbox.relocated(checkout.clone());
+    let context = sandbox.ambient(Os::Linux, &[("CODEX_HOME", checkout.join("codex"))]);
+    fs::write(
+        checkout.join("loadout.toml"),
+        manifest(&agents_line(r#"["claude"]"#)),
+    )
+    .unwrap();
+    fs::create_dir_all(checkout.join("meta/repo")).unwrap();
+    sandbox.home_file(".t3/worktrees/loadout/.git", "gitdir: meta/repo\n");
+    let resolved = sandbox
+        .checked(&manifest(&agents_line(r#"["claude"]"#)), &context)
+        .unwrap();
+    let (desired, _) = agents::materialize(&resolved, &context, &checkout).unwrap();
+    find(&desired, ItemKind::Skill, "review", "claude");
+
+    fs::remove_file(checkout.join(".git")).unwrap();
+    let auth = sandbox.home_file(
+        ".t3/worktrees/loadout/codex/auth.json",
+        "gitdir: meta/repo\nAUTH-SENTINEL\n",
+    );
+    symlink(&auth, checkout.join(".git")).unwrap();
+    let Err(errors) = Loadout::load_guarded(&checkout, &context) else {
+        panic!("a .git aliasing an override auth store must be refused");
+    };
+    let errors = lines(&errors);
+    assert!(
+        errors.contains("Git pointer .git") && errors.contains("auth"),
+        "{errors}"
+    );
+    assert!(!errors.contains("SENTINEL"), "{errors}");
 }
