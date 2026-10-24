@@ -930,8 +930,14 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   no unbounded wait. If the stop can't be confirmed, the result is `QueryError::Cleanup`, which
   keeps what ended the query as its cause, and the detection is `Error::Detect`. Only then are
   the output buffers read, each under its own lock: an overflow first, then a read error, then
-  the bytes. Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error. A
-  reader thread that can't start marks its stream with a read error.
+  the bytes. Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error.
+- **One setup deadline.** `QUERY_CLEANUP_GRACE` from just before anything is spawned bounds the
+  cleanup of every setup failure, on both OSes, with no renewed budget for a later stage. A
+  query's setup is its spawn, both reader threads, and on Windows its resume. A reader thread
+  that can't start is a setup failure, returned as the primary `Read` error at once: the query
+  is stopped (and on Windows never resumed), not watched until its deadline. Only a query that
+  fully started moves on to `QUERY_DEADLINE`, and then to its own settle limit, set when its
+  wait ends. The setup deadline never limits a query that started.
 - **Unix: an anchor holds the process group's id.** Every query gets a loadout-owned anchor,
   `/bin/sh -c 'read -r line'`. It is the leader of a fresh process group and blocks on a pipe
   only loadout writes, with no access to loadout's own stdio; if loadout dies, the pipe closes and
@@ -984,22 +990,27 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
      wrapper `process-wrap` sees shares that child.
   2. If anything fails before loadout holds the job (handle duplication, `process-wrap`'s
      no-handle branch, creating or assigning the job), the query never ran, so it started
-     nothing. Loadout kills its one process (checked) and reaps it. **One setup deadline**,
-     `QUERY_CLEANUP_GRACE` from the start of the spawn, bounds `process-wrap`'s wait on that
-     process and loadout's own disposal together, with no renewed budget. The result is the
-     spawn error, or `Cleanup` with the spawn error as its cause.
-  3. Once `process-wrap` returns the job's owner, the setup deadline is cleared (the innermost
-     wrapper's blocking `wait` then refuses, rather than block without a bound). The readers
-     start, then `loadout_winproc::resume_suspended` resumes the query. It finds the child's
+     nothing. Loadout kills its one process (checked) and reaps it. The setup deadline bounds
+     `process-wrap`'s wait on that process (the innermost wrapper's `wait` polls only up to it)
+     and loadout's own disposal together. The result is the spawn error, or `Cleanup` with the
+     spawn error as its cause.
+  3. Once `process-wrap` returns the job's owner, the readers start. If one can't, the query is
+     not resumed, and the whole job is stopped within the setup deadline, with the `Read` error
+     as the cause.
+  4. If the setup deadline has already passed, the query is **not resumed**. Loadout still
+     terminates the job at once (checked) and confirms what it can within the spent limit. The
+     result is the setup error, or `Cleanup` with it as the cause; never success.
+  5. Otherwise `loadout_winproc::resume_suspended` resumes the query. It finds the child's
      threads in one snapshot, requires exactly one, opens it, checks it still belongs to the
      child, and only then resumes it. A previous suspend count other than 1 is an error.
-  4. **Any** resume error is treated as "the query may have run": there is no `watch`, and the
-     ordinary settle stops the whole job, with the resume error as the cause.
+  6. **Any** resume error is treated as "the query may have run": there is no `watch`, and the
+     whole job is stopped within the **same** setup deadline, with the resume error as the
+     cause. Only a successful resume ends setup and clears the deadline. From then on, the
+     innermost wrapper's blocking `wait` refuses rather than block without a bound; loadout
+     itself only ever polls.
 
-  The setup deadline applies only to setup failures. A query that starts gets the ordinary
-  `QUERY_DEADLINE` and then the ordinary up-to-5-second settle; it is never limited to 5
-  seconds. A real `TerminateJobObject` failure can't be constructed in a test: only that its
-  error is kept is unit-covered.
+  A real `TerminateJobObject` failure can't be constructed in a test: only that its error is
+  kept is unit-covered.
 - **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
   The reader blocked on it stays blocked until that process exits; that is a resource limit, not
   success.

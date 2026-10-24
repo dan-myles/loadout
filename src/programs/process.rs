@@ -184,15 +184,32 @@ fn run_query_with(
     grace: Duration,
     trace: &mut Trace,
 ) -> Result<Captured, QueryError> {
-    let mut query = Query::spawn(invocation, grace, trace)?;
-    let stdout = reader(query.take_stdout(), Keep::All(cap));
-    let stderr = reader(query.take_stderr(), Keep::All(cap));
+    // One setup deadline, set before anything is spawned, bounds the cleanup of every setup
+    // failure, with no renewed budget. Only a query that fully started gets its own deadline and
+    // then its own settle.
+    let setup = Instant::now() + grace;
+    #[cfg(test)]
+    {
+        trace.setup_limit = Some(setup);
+    }
+    let mut query = Query::spawn(invocation, setup, trace)?;
+    let (stdout, stdout_started) = query_reader(query.take_stdout(), cap, "stdout");
+    let (stderr, stderr_started) = query_reader(query.take_stderr(), cap, "stderr");
+    let started = stdout_started.and(stderr_started).map_err(QueryError::Read);
     #[cfg(windows)]
-    let started = query.start();
-    #[cfg(unix)]
-    let started = Ok(());
-    let outcome = started.and_then(|()| watch(&mut query, &stdout, &stderr, deadline, cap));
-    if let Err(detail) = query.settle(&stdout, &stderr, Instant::now() + grace, trace) {
+    let started = started.and_then(|()| query.start(setup));
+    let (outcome, limit) = match started {
+        Ok(()) => {
+            let outcome = watch(&mut query, &stdout, &stderr, deadline, cap);
+            (outcome, Instant::now() + grace)
+        }
+        Err(error) => (Err(error), setup),
+    };
+    #[cfg(test)]
+    {
+        trace.disposal_limit = Some(limit);
+    }
+    if let Err(detail) = query.settle(&stdout, &stderr, limit, trace) {
         return Err(QueryError::Cleanup {
             cause: outcome.err().map(Box::new),
             detail,
@@ -280,9 +297,10 @@ const ANCHOR_SHELL: &str = "/bin/sh";
 
 #[cfg(unix)]
 impl Query {
+    /// A query that fails to start still has its anchor released, within the setup deadline.
     fn spawn(
         invocation: &Invocation,
-        grace: Duration,
+        setup: Instant,
         trace: &mut Trace,
     ) -> Result<Self, QueryError> {
         let mut anchor = spawn_anchor(ANCHOR_SHELL).map_err(QueryError::Spawn)?;
@@ -308,8 +326,11 @@ impl Query {
                 })
             }
             Err(error) => {
-                let limit = Instant::now() + grace;
-                match release_anchor(&mut anchor, anchor_input, limit, trace) {
+                #[cfg(test)]
+                {
+                    trace.disposal_limit = Some(setup);
+                }
+                match release_anchor(&mut anchor, anchor_input, setup, trace) {
                     Ok(()) => Err(QueryError::Spawn(error)),
                     Err(detail) => Err(QueryError::Cleanup {
                         cause: Some(Box::new(QueryError::Spawn(error))),
@@ -550,25 +571,27 @@ fn killed(result: io::Result<()>) -> Result<(), String> {
 ///
 /// The query is created suspended. `process-wrap` sees loadout's own `CREATE_SUSPENDED` and so
 /// never resumes it; loadout resumes it in `start`, once it owns the job. `root` is loadout's own
-/// hold on the process, kept from the moment it exists.
+/// hold on the process, kept from the moment it exists. `setup` is the setup deadline the
+/// innermost wrapper's `wait` is bounded by, cleared only once the query has fully started.
 #[cfg(windows)]
 struct Query {
     child: Box<dyn ChildWrapper>,
     root: Arc<Mutex<Child>>,
+    setup: Arc<Mutex<Option<Instant>>>,
 }
 
 #[cfg(windows)]
 impl Query {
     /// Until the job exists, loadout owns the child. If anything fails before then, the child has
     /// never run (nothing resumed it), so stopping that one process is complete. That is bounded
-    /// by `grace`, one deadline shared with `process-wrap`'s own wait on the child. Once the job
-    /// is loadout's, the deadline is cleared, and the query gets its ordinary limits.
+    /// by the setup deadline, shared with `process-wrap`'s own wait on the child. The deadline
+    /// stays in force after the job is loadout's, until `start` succeeds.
     fn spawn(
         invocation: &Invocation,
-        grace: Duration,
+        limit: Instant,
         trace: &mut Trace,
     ) -> Result<Self, QueryError> {
-        let setup = Arc::new(Mutex::new(Some(Instant::now() + grace)));
+        let setup = Arc::new(Mutex::new(Some(limit)));
         let mut root = None;
         let mut wrapped = CommandWrap::from(command(invocation));
         wrapped.wrap(CreationFlags(loadout_winproc::CREATE_SUSPENDED));
@@ -577,8 +600,8 @@ impl Query {
             let child = Arc::new(Mutex::new(command.spawn()?));
             root = Some(Arc::clone(&child));
             #[cfg(test)]
-            if seam::is(&seam::Seam::FailDuplicate) {
-                return Err(io::Error::other("injected: handle duplication failed"));
+            if let Some(error) = seam::before_duplicate(limit) {
+                return Err(error);
             }
             let leaf = Leaf::new(child, Arc::clone(&setup))?;
             Ok(Box::new(leaf) as Box<dyn ChildWrapper>)
@@ -590,13 +613,13 @@ impl Query {
         #[cfg(not(test))]
         let _ = trace;
         match (spawned, root) {
-            (Ok(child), Some(root)) => {
-                *guard(&setup) = None;
-                Ok(Self { child, root })
-            }
+            (Ok(child), Some(root)) => Ok(Self { child, root, setup }),
             (Err(error), None) => Err(QueryError::Spawn(error)),
             (Err(error), Some(root)) => {
-                let limit = guard(&setup).unwrap_or_else(Instant::now);
+                #[cfg(test)]
+                {
+                    trace.disposal_limit = Some(limit);
+                }
                 match dispose_never_run(&root, limit) {
                     Ok(()) => Err(QueryError::Spawn(error)),
                     Err(detail) => Err(QueryError::Cleanup {
@@ -609,13 +632,28 @@ impl Query {
         }
     }
 
-    /// Resumes the suspended query. Loadout owns the job by now, so any error, even one after the
-    /// thread started, leaves the whole job to `settle`, with this error as the cause.
-    fn start(&self) -> Result<(), QueryError> {
+    /// Resumes the suspended query, unless the setup deadline has passed: a query is never newly
+    /// resumed after it. Loadout owns the job by now, so any error, even one after the thread
+    /// started, leaves the whole job to `settle`, within the same setup deadline, with this error
+    /// as the cause. Only a successful resume ends setup.
+    fn start(&self, limit: Instant) -> Result<(), QueryError> {
+        #[cfg(test)]
+        seam::before_resume(limit);
+        if Instant::now() >= limit {
+            return Err(QueryError::Spawn(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "its setup did not finish within the {} second setup limit, so loadout did not resume it",
+                    QUERY_CLEANUP_GRACE.as_secs()
+                ),
+            )));
+        }
         let resumed = loadout_winproc::resume_suspended(&guard(&self.root));
         #[cfg(test)]
         let resumed = resumed.and_then(|()| seam::after_resume());
-        resumed.map_err(QueryError::Spawn)
+        resumed.map_err(QueryError::Spawn)?;
+        *guard(&self.setup) = None;
+        Ok(())
     }
 
     fn take_stdout(&mut self) -> Option<ChildStdout> {
@@ -635,9 +673,15 @@ impl Query {
         stdout: &Shared,
         stderr: &Shared,
         limit: Instant,
-        _trace: &mut Trace,
+        trace: &mut Trace,
     ) -> Result<(), String> {
         let mut problem = None;
+        #[cfg(test)]
+        {
+            trace.job_kills += 1;
+        }
+        #[cfg(not(test))]
+        let _ = trace;
         first(
             &mut problem,
             killed(self.child.start_kill()).map(|()| true),
@@ -664,7 +708,7 @@ impl Query {
 
 /// The innermost child `process-wrap` wraps: loadout's own process, shared with `Query::root`
 /// so loadout keeps it even if `process-wrap` drops this wrapper on a setup error. Its `wait` is
-/// bounded by the setup deadline, and refuses to block once that is cleared.
+/// bounded by the setup deadline, and refuses to block once the query has started.
 #[cfg(windows)]
 #[derive(Debug)]
 struct Leaf {
@@ -805,21 +849,38 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Test-only fault injection for the Windows setup path. Each seam reaches exactly one branch.
-#[cfg(all(test, windows))]
+/// Test-only fault injection for query setup. Each seam reaches exactly one branch. The two
+/// deadline seams wait for the real setup deadline to pass, so the branch after them runs with
+/// an exhausted budget; they move no clock.
+#[cfg(test)]
 mod seam {
     use std::cell::RefCell;
+    use std::io;
+    #[cfg(windows)]
     use std::path::PathBuf;
+    #[cfg(windows)]
+    use std::thread;
+    #[cfg(windows)]
     use std::time::{Duration, Instant};
-    use std::{io, thread};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum Seam {
+        /// Refuses to start the reader of this stream, as if no thread could be created.
+        FailReader(&'static str),
         /// Fails right after loadout took the child, before the handle is duplicated.
+        #[cfg(windows)]
         FailDuplicate,
+        /// As `FailDuplicate`, but only once the setup deadline has passed.
+        #[cfg(windows)]
+        FailDuplicateAtDeadline,
         /// Withholds the process handle, so `process-wrap` takes its own no-handle branch.
+        #[cfg(windows)]
         HideHandle,
+        /// Holds `start` until the setup deadline has passed, so it must refuse to resume.
+        #[cfg(windows)]
+        ExhaustBeforeResume,
         /// After a real resume, waits until the test's descendant writes this file, then fails.
+        #[cfg(windows)]
         FailAfterResume(PathBuf),
     }
 
@@ -831,10 +892,47 @@ mod seam {
         SEAM.with(|cell| *cell.borrow_mut() = seam);
     }
 
+    #[cfg(windows)]
     pub(super) fn is(wanted: &Seam) -> bool {
         SEAM.with(|cell| cell.borrow().as_ref() == Some(wanted))
     }
 
+    pub(super) fn reader(stream: &str) -> Option<io::Error> {
+        SEAM.with(|cell| match cell.borrow().as_ref() {
+            Some(Seam::FailReader(failing)) if *failing == stream => Some(io::Error::other(
+                format!("injected: cannot start the {stream} reader"),
+            )),
+            _ => None,
+        })
+    }
+
+    #[cfg(windows)]
+    fn wait_out(limit: Instant) {
+        while Instant::now() < limit {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn before_duplicate(limit: Instant) -> Option<io::Error> {
+        if is(&Seam::FailDuplicateAtDeadline) {
+            wait_out(limit);
+        } else if !is(&Seam::FailDuplicate) {
+            return None;
+        }
+        Some(io::Error::other("injected: handle duplication failed"))
+    }
+
+    #[cfg(windows)]
+    pub(super) fn before_resume(limit: Instant) {
+        if is(&Seam::ExhaustBeforeResume) {
+            wait_out(limit);
+        }
+    }
+
+    /// The readiness wait is the test's own bound. It is longer than the production setup
+    /// deadline, so a test using this seam supplies a longer setup deadline of its own.
+    #[cfg(windows)]
     pub(super) fn after_resume() -> io::Result<()> {
         let ready = SEAM.with(|cell| match cell.borrow().as_ref() {
             Some(Seam::FailAfterResume(ready)) => Some(ready.clone()),
@@ -854,14 +952,22 @@ mod seam {
     }
 }
 
-/// The order of signals and reaps, recorded only in tests, to check that no SIGKILL follows the
-/// anchor's reap. On Windows, the id of the process loadout created, to check it is gone.
+/// What tests check, recorded only in tests: the order of signals and reaps (Unix), to check
+/// that no SIGKILL follows the anchor's reap; the id of the process loadout created and each job
+/// termination attempt (Windows); and the absolute setup deadline and the limit actually given
+/// to cleanup, to check that a setup failure's cleanup gets no renewed budget.
 #[derive(Default)]
 struct Trace {
     #[cfg(all(test, unix))]
     events: Vec<Event>,
     #[cfg(all(test, windows))]
     root: Option<u32>,
+    #[cfg(all(test, windows))]
+    job_kills: u32,
+    #[cfg(test)]
+    setup_limit: Option<Instant>,
+    #[cfg(test)]
+    disposal_limit: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -975,12 +1081,46 @@ fn text(buffer: &Mutex<Buffer>) -> String {
 }
 
 /// Reads one output stream on its own thread, so a manager can never block on a full pipe
-/// while loadout waits for it to exit.
+/// while loadout waits for it to exit. A reader that can't start marks its stream with the error.
 fn reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> Shared {
+    let (shared, started) = start_reader(source, keep);
+    if let Err(error) = started {
+        lock(&shared).error = Some(error);
+    }
+    shared
+}
+
+/// A query's reader. One that can't start is a setup failure, returned at once, so the query is
+/// stopped before it is resumed (Windows) or watched, not discovered at its deadline.
+fn query_reader<R: Read + Send + 'static>(
+    source: Option<R>,
+    cap: usize,
+    stream: &str,
+) -> (Shared, io::Result<()>) {
+    #[cfg(test)]
+    if let Some(error) = seam::reader(stream) {
+        drop(source);
+        let shared = Shared::default();
+        lock(&shared).done = true;
+        return (shared, Err(error));
+    }
+    let (shared, started) = start_reader(source, Keep::All(cap));
+    let started = started.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot start the {stream} reader: {error}"),
+        )
+    });
+    (shared, started)
+}
+
+/// Starts the reader thread. If it can't start, the stream is marked done and the error is
+/// returned to the caller, which decides what it means.
+fn start_reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> (Shared, io::Result<()>) {
     let shared = Shared::default();
     let Some(mut source) = source else {
         lock(&shared).done = true;
-        return shared;
+        return (shared, Ok(()));
     };
     let sink = Arc::clone(&shared);
     let spawned = thread::Builder::new().spawn(move || {
@@ -1004,17 +1144,154 @@ fn reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> Shared {
         }
         lock(&sink).done = true;
     });
-    if let Err(error) = spawned {
-        let mut buffer = lock(&shared);
-        buffer.error = Some(error);
-        buffer.done = true;
+    match spawned {
+        Ok(_) => (shared, Ok(())),
+        Err(error) => {
+            lock(&shared).done = true;
+            (shared, Err(error))
+        }
     }
-    shared
+}
+
+/// Bounded handling for the processes tests start themselves (helpers such as `ps` or
+/// `tasklist`, and fixture children). No test waits on one without a bound: past it, the process
+/// is killed and reaped, and the test fails.
+#[cfg(test)]
+mod fixture {
+    use std::io::{self, Read};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// A generous bound for a short helper command.
+    pub(super) const HELPER: Duration = Duration::from_secs(20);
+
+    /// Runs a helper command to completion within `limit`, reading its output on bounded threads.
+    /// Only failing to start it is an error; not finishing in time fails the test.
+    pub(super) fn output(command: &mut Command, limit: Duration) -> io::Result<Output> {
+        let started = Instant::now();
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let mut owned = Owned::new(child);
+        let status = owned
+            .wait_within(limit.saturating_sub(started.elapsed()))
+            .unwrap_or_else(|| panic!("the test helper {command:?} did not exit within {limit:?}"));
+        let rest = limit.saturating_sub(started.elapsed()) + Duration::from_secs(1);
+        Ok(Output {
+            status,
+            stdout: collect(&stdout, rest, command),
+            stderr: collect(&stderr, rest, command),
+        })
+    }
+
+    fn drain(source: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = mpsc::channel();
+        if let Some(mut source) = source {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = source.read_to_end(&mut bytes);
+                let _ = sender.send(bytes);
+            });
+        } else {
+            let _ = sender.send(Vec::new());
+        }
+        receiver
+    }
+
+    fn collect(receiver: &mpsc::Receiver<Vec<u8>>, limit: Duration, command: &Command) -> Vec<u8> {
+        receiver
+            .recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("the test helper {command:?} still holds its output open"))
+    }
+
+    /// A child the test started itself. Dropped without `wait_within` succeeding (an assertion
+    /// failed, or the test returned early), it is killed and reaped within a bound; if that can't
+    /// be confirmed, the test fails, unless it is already failing.
+    pub(super) struct Owned {
+        child: Option<Child>,
+    }
+
+    impl Owned {
+        pub(super) fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        #[cfg(unix)]
+        pub(super) fn child(&mut self) -> &mut Child {
+            self.child.as_mut().expect("the fixture child was already reaped")
+        }
+
+        #[cfg(unix)]
+        pub(super) fn id(&self) -> u32 {
+            self.child.as_ref().expect("the fixture child was already reaped").id()
+        }
+
+        /// Waits for the child within `limit`. `None` if it is still running then; it stays owned,
+        /// and is killed when dropped.
+        pub(super) fn wait_within(&mut self, limit: Duration) -> Option<ExitStatus> {
+            self.poll(limit)
+                .unwrap_or_else(|error| panic!("cannot wait for the fixture child: {error}"))
+        }
+
+        fn poll(&mut self, limit: Duration) -> io::Result<Option<ExitStatus>> {
+            let until = Instant::now() + limit;
+            loop {
+                let Some(child) = self.child.as_mut() else {
+                    return Err(io::Error::other("the fixture child was already reaped"));
+                };
+                if let Some(status) = child.try_wait()? {
+                    self.child = None;
+                    return Ok(Some(status));
+                }
+                if Instant::now() >= until {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Kills the child and reaps it within `limit`. An error is the reason it can't be
+        /// confirmed gone.
+        pub(super) fn stop(&mut self, limit: Duration) -> Result<(), String> {
+            let Some(child) = self.child.as_mut() else {
+                return Ok(());
+            };
+            let id = child.id();
+            let killed = child.kill();
+            match self.poll(limit) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(format!(
+                    "the fixture child {id} did not exit within {limit:?} of being killed ({killed:?})"
+                )),
+                Err(error) => Err(format!("cannot reap the fixture child {id}: {error}")),
+            }
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Err(detail) = self.stop(Duration::from_secs(10)) {
+                if thread::panicking() {
+                    eprintln!("{detail}");
+                } else {
+                    panic!("{detail}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
+
+    use nix::sys::signal::kill;
 
     use super::*;
 
@@ -1030,13 +1307,14 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// Signal 0, sent directly, so the check itself starts no process. `EPERM` (it exists but
+    /// isn't ours) counts as alive.
     fn alive(pid: &str) -> bool {
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("kill -0 {pid} 2>/dev/null"))
-            .status()
-            .unwrap()
-            .success()
+        match kill(Pid::from_raw(pid.parse().unwrap()), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(error) => panic!("cannot check process {pid}: {error}"),
+        }
     }
 
     #[test]
@@ -1201,7 +1479,7 @@ mod tests {
 
     #[test]
     fn output_held_by_a_process_that_left_the_group_is_a_bounded_cleanup_error() {
-        if Command::new("python3").arg("--version").output().is_err() {
+        if fixture::output(Command::new("python3").arg("--version"), fixture::HELPER).is_err() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1219,12 +1497,13 @@ mod tests {
             &mut Trace::default(),
         );
         let elapsed = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(&escapee) {
-            let _ = Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!("kill -9 {}", pid.trim()))
-                .status();
-        }
+        // The escapee is no child of the test (init reaps it), so it is killed by its pid, which
+        // it wrote itself, and then checked gone within a bound.
+        let escapee_gone = std::fs::read_to_string(&escapee).map(|pid| {
+            let pid = pid.trim().to_owned();
+            let _ = kill(Pid::from_raw(pid.parse().unwrap()), Signal::SIGKILL);
+            until(Instant::now() + Duration::from_secs(10), || Ok(!alive(&pid)))
+        });
         let error = result.unwrap_err();
         assert!(
             matches!(&error, QueryError::Cleanup { cause: None, .. }),
@@ -1235,6 +1514,10 @@ mod tests {
             "{error}"
         );
         assert!(elapsed < Duration::from_secs(10));
+        assert!(
+            matches!(escapee_gone, Ok(Ok(true))),
+            "the escapee must be found and gone after the test kills it: {escapee_gone:?}"
+        );
     }
 
     #[test]
@@ -1274,20 +1557,22 @@ mod tests {
     /// them and answers EPERM. Either way, only reaping frees the group (ESRCH).
     #[test]
     fn a_zombie_only_group_answers_as_the_platform_does_until_it_is_freed() {
-        let mut anchor = spawn_anchor(ANCHOR_SHELL).unwrap();
+        let mut anchor = fixture::Owned::new(spawn_anchor(ANCHOR_SHELL).unwrap());
         let group = Pid::from_raw(i32::try_from(anchor.id()).unwrap());
-        anchor.kill().unwrap();
         let pid = anchor.id().to_string();
+        anchor.child().kill().unwrap();
         let zombie = until(Instant::now() + Duration::from_secs(5), || {
-            let stat = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid])
-                .output()
-                .map_err(|error| error.to_string())?;
+            let stat = fixture::output(
+                Command::new("ps").args(["-o", "stat=", "-p", &pid]),
+                fixture::HELPER,
+            )
+            .map_err(|error| error.to_string())?;
             Ok(String::from_utf8_lossy(&stat.stdout).trim_start().starts_with('Z'))
         });
         let kill = killpg(group, Signal::SIGKILL);
         let signal_zero = killpg(group, None);
-        anchor.wait().unwrap();
+        let reaped = anchor.wait_within(Duration::from_secs(10));
+        assert!(reaped.is_some(), "the anchor {pid} was not reaped within 10 seconds");
         assert_eq!(zombie, Ok(true), "the anchor {pid} never became a zombie");
         if cfg!(target_os = "macos") {
             assert_eq!(kill, Err(Errno::EPERM));
@@ -1501,16 +1786,15 @@ mod tests {
 
     #[test]
     fn a_query_cannot_join_a_group_whose_anchor_is_gone() {
-        let mut gone = spawn_anchor(ANCHOR_SHELL).unwrap();
-        gone.kill().unwrap();
-        gone.wait().unwrap();
+        let mut gone = fixture::Owned::new(spawn_anchor(ANCHOR_SHELL).unwrap());
         let group = i32::try_from(gone.id()).unwrap();
+        gone.stop(Duration::from_secs(10)).unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "true"]).process_group(group);
-        assert!(
-            command.spawn().is_err(),
-            "joining the dead anchor's group {group} must fail"
-        );
+        if let Ok(joined) = command.spawn() {
+            let _joined = fixture::Owned::new(joined);
+            panic!("joining the dead anchor's group {group} must fail");
+        }
     }
 
     #[test]
@@ -1521,6 +1805,77 @@ mod tests {
             Err(QueryError::Spawn(_))
         ));
         assert!(run_install(&missing, 100, Duration::from_secs(1)).is_err());
+    }
+
+    /// A reader that can't start is a setup failure: the query is stopped at once, within the
+    /// setup deadline, rather than watched until its own deadline. The other stream's reader
+    /// started, so the failing one is the primary cause.
+    #[test]
+    fn a_reader_that_cannot_start_stops_the_query_within_the_setup_deadline() {
+        let mut trace = Trace::default();
+        seam::set(Some(seam::Seam::FailReader("stderr")));
+        let started = Instant::now();
+        let result = run_query_with(
+            &sh("sleep 30"),
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            &mut trace,
+        );
+        let elapsed = started.elapsed();
+        seam::set(None);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, QueryError::Read(inner) if inner.to_string().contains("stderr reader")),
+            "{error}"
+        );
+        assert!(trace.setup_limit.is_some());
+        assert_eq!(trace.disposal_limit, trace.setup_limit, "no renewed budget");
+        assert!(elapsed < QUERY_CLEANUP_GRACE + Duration::from_secs(2), "{elapsed:?}");
+        let query = pid_of(&trace.events, false).unwrap();
+        let anchor = pid_of(&trace.events, true).unwrap();
+        assert!(!alive(&query.to_string()), "the query {query} must be gone");
+        assert!(!alive(&anchor.to_string()), "the anchor {anchor} must be gone");
+    }
+
+    #[test]
+    fn a_query_that_fails_to_start_is_cleaned_up_within_the_setup_deadline() {
+        let mut trace = Trace::default();
+        let invocation = Invocation::new(
+            Path::new("/nonexistent/loadout-no-such-program"),
+            std::iter::empty::<&str>(),
+        );
+        let result = run_query_with(
+            &invocation,
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            &mut trace,
+        );
+        assert!(matches!(result, Err(QueryError::Spawn(_))), "{result:?}");
+        assert!(trace.setup_limit.is_some());
+        assert_eq!(trace.disposal_limit, trace.setup_limit, "no renewed budget");
+    }
+
+    /// The setup deadline bounds only setup. A query that runs longer than it still completes,
+    /// and its settle gets its own limit, set after it exits.
+    #[test]
+    fn a_query_longer_than_the_setup_deadline_completes() {
+        let mut trace = Trace::default();
+        let started = Instant::now();
+        let result = run_query_with(
+            &sh("sleep 6; echo slow"),
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            &mut trace,
+        );
+        let elapsed = started.elapsed();
+        let captured = result.unwrap();
+        assert_eq!(captured.code, Some(0));
+        assert_eq!(captured.stdout.trim(), "slow");
+        assert!(elapsed > QUERY_CLEANUP_GRACE, "{elapsed:?}");
+        assert!(trace.disposal_limit.unwrap() > trace.setup_limit.unwrap());
     }
 }
 
@@ -1540,8 +1895,16 @@ mod windows_tests {
         Invocation::new(&path, std::iter::empty::<&str>())
     }
 
+    /// A query that would leave a marker if it ever ran, then exits.
+    fn marking(dir: &Path) -> (Invocation, std::path::PathBuf) {
+        let marker = dir.join("ran");
+        let invocation = script(dir, &format!("echo ran> \"{}\"", marker.display()));
+        (invocation, marker)
+    }
+
     /// Starts a PowerShell descendant that writes its own id to `ready` (written whole, then
-    /// renamed, so the file never holds a partial id) and then stays alive.
+    /// renamed, so the file never holds a partial id) and then stays alive. It ends on its own
+    /// after 60 seconds, so even a failed test leaves nothing running for long.
     fn descendant(dir: &Path) -> String {
         let partial = dir.join("ready.partial");
         let ready = dir.join("ready");
@@ -1561,46 +1924,73 @@ mod windows_tests {
             .unwrap()
     }
 
+    /// `tasklist`, run within a bound.
     fn alive(pid: u32) -> bool {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output()
-            .unwrap();
+        let output = fixture::output(
+            Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]),
+            fixture::HELPER,
+        )
+        .unwrap();
         assert!(output.status.success(), "tasklist failed");
         String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
     }
 
-    /// Runs one query with `injected` set on this thread, returning the result, the id of the process
-    /// loadout created, and how long the whole call took.
+    /// For the exhausted-budget controls: the job was terminated, but its exit may not have been
+    /// observed before the spent limit. The test waits for it within its own bound.
+    fn gone_within(pid: u32, limit: Duration) -> bool {
+        until(Instant::now() + limit, || Ok(!alive(pid))) == Ok(true)
+    }
+
+    /// One query run with `injected` set on this thread, and `grace` as its setup deadline and
+    /// settle limit. Production uses `QUERY_CLEANUP_GRACE`; only the readiness control supplies
+    /// a longer one, and says so.
     fn run(
         invocation: &Invocation,
         deadline: Duration,
         cap: usize,
+        grace: Duration,
         injected: Option<seam::Seam>,
-    ) -> (Result<Captured, QueryError>, Option<u32>, Duration) {
+    ) -> (Result<Captured, QueryError>, Trace, Duration) {
         let mut trace = Trace::default();
         seam::set(injected);
         let started = Instant::now();
-        let result = run_query_with(invocation, deadline, cap, QUERY_CLEANUP_GRACE, &mut trace);
+        let result = run_query_with(invocation, deadline, cap, grace, &mut trace);
         let elapsed = started.elapsed();
         seam::set(None);
-        (result, trace.root, elapsed)
+        (result, trace, elapsed)
     }
 
     /// The whole setup-failure path, the dependency's leaf wait plus loadout's disposal, shares
     /// one five-second deadline. The margin covers only creating the process and polling.
     const SETUP_BOUND: Duration = Duration::from_secs(7);
 
+    fn assert_setup_disposal(trace: &Trace) {
+        assert!(trace.setup_limit.is_some());
+        assert_eq!(
+            trace.disposal_limit, trace.setup_limit,
+            "a setup failure's cleanup must use the original setup deadline, not a renewed one"
+        );
+    }
+
+    /// The error is `cause`, or a `Cleanup` that keeps `cause` as what ended the query.
+    fn primary(error: &QueryError) -> &QueryError {
+        match error {
+            QueryError::Cleanup {
+                cause: Some(cause), ..
+            } => cause,
+            other => other,
+        }
+    }
+
     #[test]
     fn a_failed_handle_duplication_stops_the_query_that_never_ran() {
         let scratch = tempdir().unwrap();
-        let dir = scratch.path();
-        let marker = dir.join("ran");
-        let invocation = script(dir, &format!("echo ran> \"{}\"", marker.display()));
-        let (result, root, elapsed) = run(
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
             &invocation,
             Duration::from_secs(20),
             1024,
+            QUERY_CLEANUP_GRACE,
             Some(seam::Seam::FailDuplicate),
         );
         let error = result.unwrap_err();
@@ -1608,22 +1998,50 @@ mod windows_tests {
             matches!(&error, QueryError::Spawn(inner) if inner.to_string().contains("handle duplication")),
             "{error}"
         );
-        let root = root.expect("loadout created the query before the injected failure");
+        let root = trace
+            .root
+            .expect("loadout created the query before the injected failure");
         assert!(!alive(root), "the query {root} must be gone at return");
         assert!(!marker.exists(), "the query must never have run");
         assert!(elapsed < SETUP_BOUND, "{elapsed:?}");
+        assert_setup_disposal(&trace);
+    }
+
+    /// The same branch, reached only once the setup deadline has passed: the disposal still
+    /// tries to stop the query at once, and gets no fresh budget for it.
+    #[test]
+    fn a_handle_duplication_failure_at_the_deadline_is_still_disposed_of() {
+        let scratch = tempdir().unwrap();
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
+            &invocation,
+            Duration::from_secs(20),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::FailDuplicateAtDeadline),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(primary(&error), QueryError::Spawn(inner) if inner.to_string().contains("handle duplication")),
+            "{error}"
+        );
+        assert_setup_disposal(&trace);
+        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
+        let root = trace.root.unwrap();
+        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(!marker.exists(), "the query must never have run");
     }
 
     #[test]
     fn a_withheld_process_handle_takes_the_dependency_no_handle_branch() {
         let scratch = tempdir().unwrap();
-        let dir = scratch.path();
-        let marker = dir.join("ran");
-        let invocation = script(dir, &format!("echo ran> \"{}\"", marker.display()));
-        let (result, root, elapsed) = run(
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
             &invocation,
             Duration::from_secs(20),
             1024,
+            QUERY_CLEANUP_GRACE,
             Some(seam::Seam::HideHandle),
         );
         let error = result.unwrap_err();
@@ -1631,27 +2049,88 @@ mod windows_tests {
             matches!(&error, QueryError::Spawn(inner) if inner.kind() == io::ErrorKind::Unsupported),
             "{error}"
         );
-        let root = root.expect("loadout created the query before process-wrap refused it");
+        let root = trace
+            .root
+            .expect("loadout created the query before process-wrap refused it");
         assert!(!alive(root), "the query {root} must be gone at return");
         assert!(!marker.exists(), "the query must never have run");
         assert!(elapsed < SETUP_BOUND, "{elapsed:?}");
+        assert_setup_disposal(&trace);
+    }
+
+    /// An immediate setup failure after the job is loadout's: the reader can't start, so the
+    /// query is never resumed, and the whole job is stopped within the setup deadline.
+    #[test]
+    fn a_reader_that_cannot_start_stops_the_job_before_the_query_is_resumed() {
+        let scratch = tempdir().unwrap();
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
+            &invocation,
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::FailReader("stderr")),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, QueryError::Read(inner) if inner.to_string().contains("stderr reader")),
+            "{error}"
+        );
+        assert_eq!(trace.job_kills, 1);
+        assert_setup_disposal(&trace);
+        assert!(elapsed < SETUP_BOUND, "{elapsed:?}");
+        assert!(!alive(trace.root.unwrap()));
+        assert!(!marker.exists(), "the query must never have been resumed");
+    }
+
+    /// The setup deadline passes before `start`: the query is not newly resumed, and the job
+    /// is still terminated at once, with the spent budget and no fresh one.
+    #[test]
+    fn a_query_whose_setup_deadline_passed_is_not_resumed_and_its_job_is_stopped() {
+        let scratch = tempdir().unwrap();
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
+            &invocation,
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::ExhaustBeforeResume),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(primary(&error), QueryError::Spawn(inner) if inner.kind() == io::ErrorKind::TimedOut),
+            "{error}"
+        );
+        assert_eq!(trace.job_kills, 1, "the job must be terminated even with no budget left");
+        assert_setup_disposal(&trace);
+        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
+        let root = trace.root.unwrap();
+        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(!marker.exists(), "the query must never have been resumed");
     }
 
     /// The query really runs and really starts a descendant, which reports itself ready, before
     /// the injected error. The whole job must then be stopped: the query and the descendant are
     /// each checked to be gone.
+    ///
+    /// Test-only setup deadline: the readiness wait can take up to 20 seconds, so this control
+    /// supplies 60. It proves the cleanup uses that same original deadline (no fresh budget),
+    /// not that production setup fits in 5 seconds; the 5-second controls above prove that.
     #[test]
-    fn a_failure_after_the_query_resumed_stops_the_whole_job() {
+    fn a_failure_after_the_query_resumed_stops_the_whole_job_by_the_setup_deadline() {
+        const READINESS_GRACE: Duration = Duration::from_secs(60);
         let scratch = tempdir().unwrap();
         let dir = scratch.path();
         let invocation = script(
             dir,
             &format!("{}\r\nping -n 60 127.0.0.1 >nul", descendant(dir)),
         );
-        let (result, root, elapsed) = run(
+        let (result, trace, elapsed) = run(
             &invocation,
             Duration::from_secs(60),
             1024,
+            READINESS_GRACE,
             Some(seam::Seam::FailAfterResume(dir.join("ready"))),
         );
         let error = result.unwrap_err();
@@ -1659,12 +2138,13 @@ mod windows_tests {
             matches!(&error, QueryError::Spawn(inner) if inner.to_string().contains("after the query was resumed")),
             "{error}"
         );
-        let root = root.unwrap();
+        assert_setup_disposal(&trace);
+        assert_eq!(trace.job_kills, 1);
+        let root = trace.root.unwrap();
         let descendant = descendant_id(dir);
         assert!(!alive(root), "the query {root} must be gone at return");
         assert!(!alive(descendant), "its descendant {descendant} must be gone at return");
-        // At most 20 seconds waiting for the descendant, then one five-second settle.
-        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+        assert!(elapsed < READINESS_GRACE, "{elapsed:?}");
     }
 
     /// A real `TerminateJobObject` failure can't be constructed. This proves only that its error
@@ -1678,12 +2158,37 @@ mod windows_tests {
     #[test]
     fn an_ordinary_query_is_resumed_and_answers() {
         let scratch = tempdir().unwrap();
-        let dir = scratch.path();
-        let (result, root, _) = run(&script(dir, "echo hello"), Duration::from_secs(20), 1024, None);
+        let (result, trace, _) = run(
+            &script(scratch.path(), "echo hello"),
+            Duration::from_secs(20),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            None,
+        );
         let captured = result.unwrap();
         assert_eq!(captured.code, Some(0));
         assert_eq!(captured.stdout.trim(), "hello");
-        assert!(!alive(root.unwrap()));
+        assert!(!alive(trace.root.unwrap()));
+    }
+
+    /// The setup deadline bounds only setup. A query that runs longer than it still completes,
+    /// and its settle gets its own limit, set after it exits.
+    #[test]
+    fn a_query_longer_than_the_setup_deadline_completes() {
+        let scratch = tempdir().unwrap();
+        let (result, trace, elapsed) = run(
+            &script(scratch.path(), "ping -n 8 127.0.0.1 >nul\r\necho slow"),
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            None,
+        );
+        let captured = result.unwrap();
+        assert_eq!(captured.code, Some(0));
+        assert_eq!(captured.stdout.trim(), "slow");
+        assert!(elapsed > QUERY_CLEANUP_GRACE, "{elapsed:?}");
+        assert!(trace.disposal_limit.unwrap() > trace.setup_limit.unwrap());
+        assert!(!alive(trace.root.unwrap()));
     }
 
     #[test]
@@ -1692,9 +2197,15 @@ mod windows_tests {
             Path::new(r"C:\loadout-no-such-dir\no-such-program.exe"),
             std::iter::empty::<&str>(),
         );
-        let (result, root, _) = run(&invocation, Duration::from_secs(20), 1024, None);
+        let (result, trace, _) = run(
+            &invocation,
+            Duration::from_secs(20),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            None,
+        );
         assert!(matches!(result, Err(QueryError::Spawn(_))), "{result:?}");
-        assert_eq!(root, None);
+        assert_eq!(trace.root, None);
     }
 
     #[test]
@@ -1707,45 +2218,57 @@ mod windows_tests {
             descendant(dir),
             ready.display()
         );
-        let (result, root, _) = run(&script(dir, &body), Duration::from_secs(60), 1024, None);
+        let (result, trace, _) = run(
+            &script(dir, &body),
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            None,
+        );
         let captured = result.unwrap();
         assert_eq!(captured.code, Some(0));
         assert_eq!(captured.stdout.trim(), "done");
         let descendant = descendant_id(dir);
-        assert!(!alive(root.unwrap()));
-        assert!(!alive(descendant), "the descendant {descendant} must be gone at return");
+        assert!(!alive(trace.root.unwrap()));
+        assert!(
+            !alive(descendant),
+            "the descendant {descendant} must be gone at return"
+        );
     }
 
     #[test]
     fn a_query_that_never_finishes_is_stopped_at_its_deadline() {
         let scratch = tempdir().unwrap();
-        let dir = scratch.path();
         let started = Instant::now();
-        let (result, root, _) = run(
-            &script(dir, "ping -n 60 127.0.0.1 >nul"),
+        let (result, trace, _) = run(
+            &script(scratch.path(), "ping -n 60 127.0.0.1 >nul"),
             Duration::from_millis(300),
             1024,
+            QUERY_CLEANUP_GRACE,
             None,
         );
         assert!(matches!(result, Err(QueryError::TimedOut(_))), "{result:?}");
-        assert!(!alive(root.unwrap()));
+        assert!(!alive(trace.root.unwrap()));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
     fn an_oversized_answer_is_refused_and_the_query_stopped() {
         let scratch = tempdir().unwrap();
-        let dir = scratch.path();
-        let (result, root, _) = run(
-            &script(dir, "echo 0123456789012345678901234567890123456789\r\nping -n 60 127.0.0.1 >nul"),
+        let (result, trace, _) = run(
+            &script(
+                scratch.path(),
+                "echo 0123456789012345678901234567890123456789\r\nping -n 60 127.0.0.1 >nul",
+            ),
             Duration::from_secs(60),
             16,
+            QUERY_CLEANUP_GRACE,
             None,
         );
         assert!(
             matches!(result, Err(QueryError::Oversized { stream: "stdout", .. })),
             "{result:?}"
         );
-        assert!(!alive(root.unwrap()));
+        assert!(!alive(trace.root.unwrap()));
     }
 }

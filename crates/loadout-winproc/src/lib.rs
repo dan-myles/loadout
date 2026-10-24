@@ -116,47 +116,108 @@ fn open_thread(thread_id: u32, pid: u32) -> io::Result<Owned<HANDLE>> {
 #[cfg(test)]
 mod tests {
     use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
-    fn cmd(script: &str, flags: u32) -> Child {
-        Command::new("cmd.exe")
-            .args(["/d", "/c", script])
-            .creation_flags(flags)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
+    /// A child the test started. Every fixture is one process with no descendants: `cmd /c exit`
+    /// runs a built-in, and `ping` is started directly. However the test ends, the child is
+    /// killed and reaped within a bound, and a child that can't be confirmed gone fails the test.
+    /// The `Child`, and so its process handle, is kept after the reap, so its id can't be reused.
+    struct Fixture {
+        child: Child,
+        reaped: bool,
     }
+
+    impl Fixture {
+        fn spawn(program: &str, args: &[&str], flags: u32) -> Self {
+            let child = Command::new(program)
+                .args(args)
+                .creation_flags(flags)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        /// Waits for the child to exit, within `limit`.
+        fn exit_within(&mut self, limit: Duration) -> io::Result<Option<ExitStatus>> {
+            let until = Instant::now() + limit;
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    self.reaped = true;
+                    return Ok(Some(status));
+                }
+                if Instant::now() >= until {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn stop(&mut self) -> Result<(), String> {
+            if self.reaped {
+                return Ok(());
+            }
+            let id = self.child.id();
+            let killed = self.child.kill();
+            match self.exit_within(Duration::from_secs(10)) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(format!(
+                    "fixture {id} did not exit within 10 seconds of being killed ({killed:?})"
+                )),
+                Err(error) => Err(format!("cannot reap fixture {id}: {error}")),
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Err(detail) = self.stop() {
+                if thread::panicking() {
+                    eprintln!("{detail}");
+                } else {
+                    panic!("{detail}");
+                }
+            }
+        }
+    }
+
+    const EXIT: Duration = Duration::from_secs(20);
 
     #[test]
     fn a_child_created_suspended_is_resumed_and_runs() {
-        let mut child = cmd("exit 7", CREATE_SUSPENDED.0);
-        resume_suspended(&child).unwrap();
-        assert_eq!(child.wait().unwrap().code(), Some(7));
+        let mut fixture = Fixture::spawn("cmd.exe", &["/d", "/c", "exit 7"], CREATE_SUSPENDED.0);
+        resume_suspended(&fixture.child).unwrap();
+        let status = fixture.exit_within(EXIT).unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(7));
     }
 
     /// Whether the running child has one thread (whose suspend count is 0) or several, it is
     /// refused, and it keeps running.
     #[test]
     fn a_child_that_is_already_running_is_refused() {
-        let mut child = cmd("ping -n 30 127.0.0.1 >nul", 0);
-        let refused = resume_suspended(&child);
-        let still_running = child.try_wait().unwrap().is_none();
-        child.kill().unwrap();
-        child.wait().unwrap();
+        let mut fixture = Fixture::spawn("ping.exe", &["-n", "30", "127.0.0.1"], 0);
+        let refused = resume_suspended(&fixture.child);
+        let still_running = fixture.child.try_wait().unwrap().is_none();
+        fixture.stop().unwrap();
         assert!(refused.is_err(), "{refused:?}");
         assert!(still_running);
     }
 
     #[test]
     fn a_child_that_has_exited_is_refused() {
-        let mut child = cmd("exit 0", CREATE_SUSPENDED.0);
-        resume_suspended(&child).unwrap();
-        child.wait().unwrap();
-        let error = resume_suspended(&child).unwrap_err();
+        let mut fixture = Fixture::spawn("cmd.exe", &["/d", "/c", "exit 0"], CREATE_SUSPENDED.0);
+        resume_suspended(&fixture.child).unwrap();
+        assert!(fixture.exit_within(EXIT).unwrap().is_some());
+        let error = resume_suspended(&fixture.child).unwrap_err();
         assert!(error.to_string().contains("has 0 threads"), "{error}");
     }
 }
