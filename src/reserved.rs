@@ -478,7 +478,17 @@ mod tests {
     use super::*;
     use crate::platform::Os;
 
-    const NO_LOADOUT: &str = "/nonexistent/loadout-checkout";
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
+
+    fn no_loadout() -> PathBuf {
+        PathBuf::from(abs("/nonexistent/loadout-checkout"))
+    }
 
     const CLAUDE_MCP: Use<'static> = Use::KeyMerge(Merge {
         map: "/mcpServers",
@@ -608,13 +618,13 @@ mod tests {
     #[test]
     fn expanded_paths_follow_agent_overrides_and_the_real_state_dir() {
         let vars = |name: &str| match name {
-            "CODEX_HOME" => Some(OsString::from("/alt/codex")),
-            "CLAUDE_CONFIG_DIR" => Some(OsString::from("/alt/claude")),
+            "CODEX_HOME" => Some(OsString::from(abs("/alt/codex"))),
+            "CLAUDE_CONFIG_DIR" => Some(OsString::from(abs("/alt/claude"))),
             _ => None,
         };
-        let context = Context::resolve(Os::Linux, vars, Some("/h".into())).unwrap();
+        let context = Context::resolve(Os::Linux, vars, Some(abs("/h").into())).unwrap();
         let kind = |path: &str| {
-            check_path(&context, Path::new(NO_LOADOUT), Path::new(path), Use::Write)
+            check_path(&context, &no_loadout(), Path::new(&abs(path)), Use::Write)
                 .and_then(|conflict| conflict.kind())
         };
         assert_eq!(kind("/alt/codex/auth.json"), Some(Kind::Auth));
@@ -662,7 +672,7 @@ mod tests {
         };
         let context = Context::resolve(Os::Linux, vars, Some(at("home"))).unwrap();
         let kind = |relative: &str| {
-            check_path(&context, Path::new(NO_LOADOUT), &at(relative), Use::Write)
+            check_path(&context, &no_loadout(), &at(relative), Use::Write)
                 .and_then(|conflict| conflict.kind())
         };
 
@@ -687,7 +697,7 @@ mod tests {
         assert_eq!(
             check_path(
                 &context,
-                Path::new(NO_LOADOUT),
+                &no_loadout(),
                 &at("home/ordinary-alias/codex/skills"),
                 Use::WriteInto
             ),
@@ -708,7 +718,7 @@ mod tests {
             Context::resolve(Os::Linux, |_| None, Some(scratch.path().join("home"))).unwrap();
         let result = check_path(
             &context,
-            Path::new(NO_LOADOUT),
+            &no_loadout(),
             &locked.join("inner/file"),
             Use::Write,
         );
@@ -723,13 +733,7 @@ mod tests {
             "{result:?}"
         );
         assert!(
-            check_path(
-                &context,
-                Path::new(NO_LOADOUT),
-                Path::new("relative/x"),
-                Use::Write
-            )
-            .is_some(),
+            check_path(&context, &no_loadout(), Path::new("relative/x"), Use::Write).is_some(),
             "unclean paths fail closed"
         );
     }
@@ -797,13 +801,13 @@ mod tests {
     #[test]
     fn xdg_data_and_gemini_home_move_their_protected_files() {
         let vars = |name: &str| match name {
-            "XDG_DATA_HOME" => Some(OsString::from("/alt/data")),
-            "GEMINI_HOME" => Some(OsString::from("/alt/gemini")),
+            "XDG_DATA_HOME" => Some(OsString::from(abs("/alt/data"))),
+            "GEMINI_HOME" => Some(OsString::from(abs("/alt/gemini"))),
             _ => None,
         };
-        let context = Context::resolve(Os::Linux, vars, Some("/h".into())).unwrap();
+        let context = Context::resolve(Os::Linux, vars, Some(abs("/h").into())).unwrap();
         let kind = |path: &str| {
-            check_path(&context, Path::new(NO_LOADOUT), Path::new(path), Use::Write)
+            check_path(&context, &no_loadout(), Path::new(&abs(path)), Use::Write)
                 .and_then(|conflict| conflict.kind())
         };
         assert_eq!(kind("/alt/data/opencode/mcp-auth.json"), Some(Kind::Auth));
@@ -829,20 +833,15 @@ mod tests {
         let isolated = Context::resolve(
             Os::Linux,
             |name| match name {
-                "LOADOUT_HOME" => Some(OsString::from("/sandbox")),
+                "LOADOUT_HOME" => Some(OsString::from(abs("/sandbox"))),
                 other => vars(other),
             },
-            Some("/h".into()),
+            Some(abs("/h").into()),
         )
         .unwrap();
         let isolated_kind = |path: &str| {
-            check_path(
-                &isolated,
-                Path::new(NO_LOADOUT),
-                Path::new(path),
-                Use::Write,
-            )
-            .and_then(|conflict| conflict.kind())
+            check_path(&isolated, &no_loadout(), Path::new(&abs(path)), Use::Write)
+                .and_then(|conflict| conflict.kind())
         };
         assert_eq!(isolated_kind("/alt/data/opencode/mcp-auth.json"), None);
         assert_eq!(
@@ -893,7 +892,7 @@ mod tests {
         symlink(root.join("dotfiles/ssh"), root.join("home/.ssh")).unwrap();
         let context = Context::resolve(Os::Linux, |_| None, Some(root.join("home"))).unwrap();
         let kind = |path: PathBuf| {
-            check_path(&context, Path::new(NO_LOADOUT), &path, Use::Write)
+            check_path(&context, &no_loadout(), &path, Use::Write)
                 .and_then(|conflict| conflict.kind())
         };
         assert_eq!(kind(root.join("dotfiles/ssh/id_ed25519")), Some(Kind::Auth));

@@ -209,6 +209,14 @@ fn executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
+
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
@@ -233,70 +241,90 @@ mod tests {
     fn linux_honours_absolute_xdg_and_ignores_relative() {
         let context = Context::resolve(
             Os::Linux,
-            vars(&[("XDG_CONFIG_HOME", "/x/config"), ("XDG_STATE_HOME", "rel")]),
-            Some("/home/a".into()),
+            vars(&[
+                ("XDG_CONFIG_HOME", &*abs("/x/config")),
+                ("XDG_STATE_HOME", "rel"),
+            ]),
+            Some(abs("/home/a").into()),
         )
         .unwrap();
-        assert_eq!(context.config, PathBuf::from("/x/config"));
-        assert_eq!(context.state, PathBuf::from("/home/a/.local/state/loadout"));
+        assert_eq!(context.config, PathBuf::from(abs("/x/config")));
+        assert_eq!(
+            context.state,
+            PathBuf::from(abs("/home/a/.local/state/loadout"))
+        );
     }
 
     #[test]
     fn overrides_replace_home_and_state() {
         let context = Context::resolve(
             Os::Macos,
-            vars(&[("LOADOUT_HOME", "/tmp/h"), ("LOADOUT_STATE_DIR", "/tmp/s")]),
-            Some("/Users/a".into()),
+            vars(&[
+                ("LOADOUT_HOME", &*abs("/tmp/h")),
+                ("LOADOUT_STATE_DIR", &*abs("/tmp/s")),
+            ]),
+            Some(abs("/Users/a").into()),
         )
         .unwrap();
-        assert_eq!(context.home, PathBuf::from("/tmp/h"));
+        assert_eq!(context.home, PathBuf::from(abs("/tmp/h")));
         assert!(context.isolated);
         assert_eq!(
             context.config,
-            PathBuf::from("/tmp/h/Library/Application Support")
+            PathBuf::from(abs("/tmp/h/Library/Application Support"))
         );
-        assert_eq!(context.state, PathBuf::from("/tmp/s"));
+        assert_eq!(context.state, PathBuf::from(abs("/tmp/s")));
     }
 
     #[test]
     fn isolated_home_ignores_ambient_xdg_and_agent_dirs() {
         let ambient = [
-            ("XDG_CONFIG_HOME", "/real/.config"),
-            ("XDG_STATE_HOME", "/real/.local/state"),
-            ("CLAUDE_CONFIG_DIR", "/real/.claude"),
-            ("CODEX_HOME", "/real/.codex"),
-            ("XDG_DATA_HOME", "/real/.data"),
-            ("GEMINI_HOME", "/real/.gemini-alt"),
+            ("XDG_CONFIG_HOME", &*abs("/real/.config")),
+            ("XDG_STATE_HOME", &*abs("/real/.local/state")),
+            ("CLAUDE_CONFIG_DIR", &*abs("/real/.claude")),
+            ("CODEX_HOME", &*abs("/real/.codex")),
+            ("XDG_DATA_HOME", &*abs("/real/.data")),
+            ("GEMINI_HOME", &*abs("/real/.gemini-alt")),
         ];
         let mut isolated = ambient.to_vec();
-        isolated.push(("LOADOUT_HOME", "/sandbox"));
-        let context = Context::resolve(Os::Linux, vars(&isolated), Some("/real".into())).unwrap();
-        assert_eq!(context.config, PathBuf::from("/sandbox/.config"));
-        assert_eq!(context.xdg_config, PathBuf::from("/sandbox/.config"));
-        assert_eq!(context.xdg_data, PathBuf::from("/sandbox/.local/share"));
+        let sandbox = abs("/sandbox");
+        isolated.push(("LOADOUT_HOME", &sandbox));
+        let context =
+            Context::resolve(Os::Linux, vars(&isolated), Some(abs("/real").into())).unwrap();
+        assert_eq!(context.config, PathBuf::from(abs("/sandbox/.config")));
+        assert_eq!(context.xdg_config, PathBuf::from(abs("/sandbox/.config")));
+        assert_eq!(
+            context.xdg_data,
+            PathBuf::from(abs("/sandbox/.local/share"))
+        );
         assert_eq!(
             context.state,
-            PathBuf::from("/sandbox/.local/state/loadout")
+            PathBuf::from(abs("/sandbox/.local/state/loadout"))
         );
         assert!(context.agent_dirs.is_empty());
 
-        isolated.push(("LOADOUT_STATE_DIR", "/explicit/state"));
-        let context = Context::resolve(Os::Linux, vars(&isolated), Some("/real".into())).unwrap();
-        assert_eq!(context.state, PathBuf::from("/explicit/state"));
+        let explicit = abs("/explicit/state");
+        isolated.push(("LOADOUT_STATE_DIR", &explicit));
+        let context =
+            Context::resolve(Os::Linux, vars(&isolated), Some(abs("/real").into())).unwrap();
+        assert_eq!(context.state, PathBuf::from(abs("/explicit/state")));
 
-        let context = Context::resolve(Os::Linux, vars(&ambient), Some("/real".into())).unwrap();
+        let context =
+            Context::resolve(Os::Linux, vars(&ambient), Some(abs("/real").into())).unwrap();
         assert!(!context.isolated);
-        assert_eq!(context.config, PathBuf::from("/real/.config"));
-        assert_eq!(context.state, PathBuf::from("/real/.local/state/loadout"));
+        assert_eq!(context.config, PathBuf::from(abs("/real/.config")));
+        assert_eq!(
+            context.state,
+            PathBuf::from(abs("/real/.local/state/loadout"))
+        );
         assert_eq!(
             context.agent_dir("CODEX_HOME"),
-            Some(Path::new("/real/.codex"))
+            Some(Path::new(&abs("/real/.codex")))
         );
         assert_eq!(context.agent_dir("GROK_HOME"), None);
-        assert_eq!(context.xdg_data, PathBuf::from("/real/.data"));
+        assert_eq!(context.xdg_data, PathBuf::from(abs("/real/.data")));
         assert_eq!(
             context.agent_dir("GEMINI_HOME"),
-            Some(Path::new("/real/.gemini-alt"))
+            Some(Path::new(&abs("/real/.gemini-alt")))
         );
     }
 
