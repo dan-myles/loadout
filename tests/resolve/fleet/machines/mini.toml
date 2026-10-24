@@ -1,0 +1,2 @@
+[files.shell]
+when = { os = "macos" }

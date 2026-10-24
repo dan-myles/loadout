@@ -1,0 +1,51 @@
+[loadout]
+version = 1
+
+[machines.studio]
+tags = ["work", "laptop"]
+
+[machines.tower]
+tags = ["laptop", "work"]
+
+[machines.mini]
+
+[variables]
+email = "me@home.example"
+
+[agents]
+enabled = ["claude", "codex", "acp"]
+
+[agents.custom.acp]
+evidence = "synthetic ACP agent declared by this fixture"
+skills = { linux = "~/.acp/skills", macos = "~/.acp/skills", windows = "~/.acp/skills" }
+instructions = { linux = "~/.acp/AGENTS.md", macos = "~/.acp/AGENTS.md", windows = "~/.acp/AGENTS.md" }
+
+[files.shell]
+source = "files/shellrc"
+target = "~/.shellrc"
+
+[files.notes]
+source = "files/notes"
+target = "~/notes:today"
+
+[skills.review]
+source = "skills/review"
+
+[skills.deploy]
+source = "skills/deploy"
+agents = ["claude", "acp"]
+
+[instructions.main]
+source = "instructions/AGENTS.md"
+
+[mcp.fs]
+command = "npx"
+args = ["-y", "server-fs"]
+
+[mcp.docs]
+url = "https://docs.example.com/mcp"
+
+[programs.rg]
+brew = "ripgrep"
+apt = "ripgrep"
+winget = "BurntSushi.ripgrep.MSVC"

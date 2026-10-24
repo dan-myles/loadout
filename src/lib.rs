@@ -5,6 +5,7 @@ pub mod diagnostic;
 pub mod id;
 pub mod machine;
 pub mod manifest;
+pub mod mcp;
 pub mod plan;
 pub mod platform;
 pub mod reserved;
