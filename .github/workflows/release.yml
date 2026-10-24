@@ -1,7 +1,5 @@
 name: Release
 
-# Tag pushes build every target and create a draft GitHub release. Manual runs
-# and pull requests touching packaging only build and upload workflow artifacts.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
@@ -10,6 +8,16 @@ on:
     paths:
       - scripts/release/**
       - .github/workflows/release.yml
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - rust-toolchain
+      - rust-toolchain.toml
+      - .cargo/**
+      - "**/build.rs"
+      - src/**
+      - tests/**
+      - README.md
+      - LICENSE*
 
 permissions:
   contents: read

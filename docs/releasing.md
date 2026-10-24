@@ -55,8 +55,12 @@ The repository is public, so these downloads need no GitHub token.
 
 Triggers:
 
-- **Manual dispatch** and **pull requests that touch packaging**: build all six targets and upload
-  them as workflow artifacts (`loadout-<target>` and `release-dist`). Nothing is published.
+- **Manual dispatch**, and **pull requests that change release inputs**: build all six targets and
+  upload them as workflow artifacts (`loadout-<target>` and `release-dist`). Nothing is published.
+  Release inputs are the packaging scripts, this workflow, any `Cargo.toml`, `Cargo.lock`, the
+  toolchain file, `.cargo/`, `build.rs`, `src/`, `tests/`, and the shipped `README.md`/`LICENSE*`.
+  A change to the binary therefore gets a native build and smoke test on all six platforms before
+  merge, not only at tag time.
 - **Pushing a `vX.Y.Z` tag**: builds as above, fails if the tag doesn't match the `version` in
   `Cargo.toml`, then creates a **draft** GitHub release with every asset and `SHA256SUMS`. Only this
   job gets `contents: write`. Rerunning it replaces the draft's assets. It refuses to touch a release
