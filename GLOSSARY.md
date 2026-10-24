@@ -16,9 +16,31 @@ _Avoid_: Loadout (for the tool), sync tool
 One computer a loadout is brought onto.
 _Avoid_: host, device
 
+**Machine name**:
+The name a machine goes by in a loadout, chosen on its first run and kept on the machine. It defaults to the hostname and survives renaming the computer.
+_Avoid_: hostname, machine ID
+
+### Customization
+
+**Layer**:
+One level of declarations in a loadout. The layers, broadest first: global, OS, tag, machine.
+_Avoid_: profile, scope, level
+
+**Global layer**:
+What every machine gets.
+_Avoid_: baseline, default, common
+
+**Tag**:
+A named group of machines, such as `work` or `laptop`, with its own layer.
+_Avoid_: group, profile, role
+
 **Override**:
-A declaration that makes one machine differ from the loadout's global baseline.
+A declaration in a narrower layer that adds, removes, replaces, or changes part of an item from a broader layer.
 _Avoid_: patch, exception
+
+**Template**:
+A user file containing variables and if/else conditions that are filled in per machine.
+_Avoid_: dynamic file
 
 ### What a loadout declares
 
