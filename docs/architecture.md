@@ -89,7 +89,8 @@ src/
   template/                                                                 [U2]
   state/                                                                    [U3]
   apply/                                                                    [U4]
-  agents/                 adapter table, skills + instructions targets      [U5]
+  agents/                 mod.rs (materialize, checks), table.rs (adapters), source.rs (skill and
+                          instructions sources), collide.rs (destination collisions), doctor.rs [built, U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [built: U6]
   programs/                                                                 [U7]
   sync/                   git clone/fetch, background service               [U8]
@@ -107,7 +108,7 @@ manifest                       -> platform, machine, context (path syntax), diag
 resolve                        -> manifest, machine, context, reserved, platform, diagnostic
 template                       -> resolve, machine
 mcp                            -> manifest, resolve, reserved, context
-agents                         -> manifest, resolve, mcp, plan (types), machine, context, diagnostic
+agents                         -> manifest, resolve, mcp, reserved, plan (types), context, diagnostic, platform
 programs                       -> manifest, resolve, machine, context, diagnostic
 state                          -> context, plan (types)
 plan                           -> resolve, template, agents, programs, state, context, diagnostic
@@ -526,6 +527,17 @@ delegated defaults.
   | `blocked(reason)` | the action needs elevation, or an unowned MCP key with the same name exists |
 
   `plan --json` prints the actions without their content.
+- **Targets.** `Target` is `Path { path }`, `Entry { file, format, pointer, key, shape }`,
+  `Program { manager, package }`, or `None`. `Entry.shape` is required: state passes it unchanged
+  to the `KeyMerge` check and `mcp::edit`, and never infers it from the agent id (a custom agent's
+  shape is whatever it declared). Records written without a shape are invalid, never defaulted.
+  `None` (JSON `{"type":"none"}`) exists only for an `unsupported` action whose item has no
+  destination on this machine, such as Cursor instructions (`Action::unsupported` builds it with
+  `prior: Absent` and no content). U4 rejects any other combination before I/O, and `None` never
+  reaches observe, ownership, backup, the journal, or a write. State rejects a caller-provided
+  `None` with a typed error before touching the file system, and a stored record or journal entry
+  holding `None` fails validation. An unsupported action with a real destination keeps that
+  target.
 - **Drift.** A drifted target is left alone and reported, with exit 4. `apply --force` backs it up
   and overwrites it. The background service never forces.
 - **Removal.** An owned target that hasn't changed since loadout wrote it is backed up, then removed.
@@ -573,7 +585,7 @@ delegated defaults.
 - **Concurrency.** `<state>/lock` (`std::fs::File::try_lock`) keeps a background update and a manual
   apply from overlapping. The second one exits 1 with a clear message.
 
-## 6. Agents (frozen, U5 adapters, U6 MCP)
+## 6. Agents (built: U5 adapters, U6 MCP)
 
 Evidence: `reports/agent-inventory.md` (final), T3 Code `4fef307`, and
 [Agent config surfaces](./wayfinder/loadout-v1/tickets/01-agent-config-surfaces.md). `~` is the home
@@ -589,7 +601,7 @@ install time (U8).
 | grok | `$GROK_HOME` or `~/.grok`, then `/skills` | `…/AGENTS.md` | `…/config.toml`, `/mcp_servers`, `grok-toml`, under Grok's `.config-init.lock` flock | `${VAR}` |
 | opencode | `<xdg_config>/opencode/skills` on every OS | `<xdg_config>/opencode/AGENTS.md` | `<xdg_config>/opencode/opencode.json` or `.jsonc`, `/mcp`, `opencode-json` | `{env:VAR}` |
 | pi | `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, then `/skills` | `…/AGENTS.md` | `…/mcp.json`, `/mcpServers`, `pi-json` | `${VAR}` |
-| muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json`, `/mcp_servers`, `muse-json` | `${VAR}` |
+| muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json` (macOS, Linux), `/mcp_servers`, `muse-json` | `${VAR}` |
 | antigravity | `$GEMINI_HOME` or `~/.gemini`, then `/antigravity-cli/skills` | `…/AGENTS.md` | `…/config/mcp_config.json`, `/mcpServers`, `antigravity-json` | none (undocumented) |
 
 `<xdg_config>` is `Context.xdg_config`: `$XDG_CONFIG_HOME` (outside isolation) or `~/.config` on
@@ -599,10 +611,44 @@ Windows (`%USERPROFILE%\.config`, not `%APPDATA%`), so their rows never use the 
 and Antigravity are inferred from home-directory joins in their source; Windows VM evidence confirms
 or corrects them.
 
-- **Capabilities are data.** U5 keeps a table of
-  `Capability<T> = Supported(PerOs<T>) | Unsupported(reason) | Unknown(reason)` per agent and kind.
-  An item an agent can't take is an `unsupported` plan action, never a silent skip. There is no
-  plugin framework.
+- **Capabilities are data** (`agents/table.rs`). `table::adapter(agent, os)` is one `match` that
+  returns each kind as `Supported(place)` or `Unsupported(reason)`, with the place as a root
+  (home, an override variable with its default, or `xdg_config`) plus a relative path. Each
+  adapter also records the folders it reads besides its own, its T3 pickup, whether its Windows
+  paths are inferred, and its evidence. An undocumented path is `Unsupported` with that reason, so
+  no separate `Unknown` state exists. An item an agent can't take is an `unsupported` plan action,
+  never a silent skip. There is no plugin framework.
+- **`agents::materialize(resolved, context, loadout)`** (built, U5). For every skill, instructions
+  item, and MCP server, and every agent in its effective `agents` list, it returns either a
+  `Desired` or an `unsupported` action:
+  - Skills: `Target::Path(<skills dir>/<id>)` with `Content::Tree`. Instructions:
+    `Target::Path(<file>)` with `Content::File`, never executable. MCP: `Target::Entry` with the
+    server id as key, the agent's map, format, and shape, and `Content::Entry(mcp::entry(..))`;
+    an `mcp::Unsupported` becomes an unsupported action on that same Entry target.
+  - A kind the agent lacks, or a custom agent that declares no table or no path for this OS, is
+    unsupported with `Target::None`. A skill id that is a Windows device name is unsupported on
+    Windows with its path.
+  - `context` is the only OS input. `loadout` is the active checkout. Every destination runs
+    through `reserved::check_path` (`Write` for skills and instructions, `KeyMerge` for MCP)
+    before any source is read or any other stat, and a conflict is unsupported with that target.
+  - OpenCode: `opencode.jsonc` (format `jsonc`) when it already exists, after its own reserved
+    check, otherwise `opencode.json`.
+  - Sources are read again from the checkout and copied verbatim (never rendered). Each source,
+    and each file a skill walk reaches, must canonicalize inside the checkout and outside its Git
+    metadata (`manifest::git_metadata`, the same identification validate uses). A skill may hold
+    only regular files, folders, and links to files inside the loadout; a link to a folder, a
+    special file, or a `.git` entry is refused. A skill needs `SKILL.md`. Every source file also
+    passes `reserved::check_path` before it is opened, and any conflict other than the checkout's
+    own reservation refuses it, so a checkout placed inside an agent folder can't copy an auth
+    store.
+  - **Collisions** are errors. Every pair with at least one agent destination is compared: agent
+    against user file target, and agent against agent, built-in or custom. Two writes collide when
+    their paths are equal or one is inside the other, compared as written and with links resolved
+    (`reserved::normalize`), with case folded by the OS default as in section 3. Two MCP entries in
+    one file collide when one key address (map pointer plus key) equals or contains the other; Pi
+    folds `-` and `_`. User file against user file stays with U1 and U4.
+  - Problems with sources or collisions return `agents::Error::Invalid(Diagnostics)`: exit 3, and
+    nothing is planned or written. Materialize never writes; it reads loadout sources and stats.
 - **Skills** are copied into each target agent's skills dir as `Content::Tree`. Validate has already
   confined the folder (section 3), and U5 re-checks it when copying. It copies regular files,
   dereferences file links (the copy gets the file's bytes, not a link), and keeps each file's
@@ -776,11 +822,22 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     expanded, canonical, and override-alias paths. A shared config reached through an alias still
     accepts only its own map. Validate already checks custom declarations statically.
 - An unowned shared config is never adopted or replaced as a whole file. Only U6's owned keys change.
-- **Doctor diagnostics** (U5): report which overrides are set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
-  `GROK_HOME`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`). Warn when Codex `AGENTS.override.md`
-  shadows `AGENTS.md`. Note that a T3-launched Antigravity sees skills only: T3 gives it a private
-  `GEMINI_HOME`, so user MCP and instructions don't reach it. Report double loading through
-  `~/.claude` compat dirs. Doctor claims nothing about T3 profile settings it doesn't read.
+- **Doctor diagnostics** (built, U5, `agents::checks`): only stats and folder-name listings, never
+  a file's contents, never a write, and never T3's settings.
+  - `agent overrides`: which of `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+    `PI_CODING_AGENT_DIR`, `GEMINI_HOME`, and `XDG_CONFIG_HOME` are set, or that isolation ignores them.
+  - `agent <id>` for each built-in agent: its skills, instructions, and MCP destinations on this
+    machine, unsupported kinds with their reason, its T3 pickup (sync and T3 pickup are separate
+    claims), inferred Windows paths, and its evidence. T3 pickup per driver: Codex, Claude, Grok,
+    OpenCode, Pi, and Muse read the native paths (Codex and Claude only for instances without a
+    custom home); Cursor is inferred; Antigravity is partial, because T3 gives it a private
+    `GEMINI_HOME` with only the skill folders linked in, so user MCP and instructions don't reach
+    T3 sessions. A custom agent's pickup is unverified.
+  - Warnings: `codex override` when `AGENTS.override.md` shadows `AGENTS.md`; `skill duplicates`
+    when an agent loads one skill name from two folders it reads (for example `~/.claude/skills`
+    and `~/.agents/skills` for Cursor, OpenCode, and Muse); `grok instructions` when Grok loads
+    both its `AGENTS.md` and `~/.claude/CLAUDE.md`; `opencode config` when both OpenCode files
+    exist.
 
 ## 7. Programs (frozen, U7)
 
@@ -913,6 +970,7 @@ pub struct Check { pub name: String, pub status: CheckStatus, pub detail: String
 
 // manifest (foundation)
 impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warnings */), Diagnostics>; }
+pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String>;   // canonical root; validate's Git metadata identification, reused by agents
 // Loadout { root, machines: BTreeMap<String, MachineEntry>, layers: Vec<LayerFile { scope: Scope, file, layer: Layer }> }
 // Scope::{Global, Os(Os), Tag(String), Machine(String)}; layers come global, os, tags, machines, each sorted by name
 
@@ -934,10 +992,11 @@ pub fn parse(bytes: &[u8], format: McpFormat, pointer: &str) -> Result<Servers, 
 pub fn edit(bytes: &[u8], format: McpFormat, pointer: &str, shape: McpShape, set: &Servers, remove: &[String]) -> Result<Vec<u8>, mcp::Error>; // new bytes; preserves everything else
 pub fn read(context: &Context, loadout: &Path, file: &Path, format: McpFormat, pointer: &str, shape: McpShape) -> Result<Servers, mcp::Error>; // check_path(KeyMerge) before any open
 pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::Lock>, mcp::Error>; // Some only for Grok's config.toml
-// Follow-up (U3/U4): plan::Target::Entry needs `shape: McpShape` so state can run the exact KeyMerge check and call edit.
+// plan::Target::Entry carries `shape: McpShape` (U5) so state runs the exact KeyMerge check and calls edit with it.
 
-// agents (U5)
-pub fn materialize(resolved: &Resolved, facts: &Facts, context: &Context) -> Result<(Vec<Desired>, Vec<Action /* unsupported */>), agents::Error>;
+// agents (built, U5). `facts` was dropped (context is the one OS input) and `loadout`, the active checkout, added.
+pub fn materialize(resolved: &Resolved, context: &Context, loadout: &Path) -> Result<(Vec<Desired>, Vec<Action /* Change::Unsupported */>), agents::Error>;
+pub enum Error { Invalid(Diagnostics) }                          // source or collision problems; exit 3, nothing written
 pub fn checks(context: &Context) -> Vec<Check>;
 
 // programs (U7)
@@ -954,6 +1013,7 @@ impl Run { pub fn begin(context: &Context, plan: &Plan) -> Result<Run, state::Er
 pub fn rollback(context: &Context, run: Option<&str>) -> Result<Vec<Target>, state::Error>;
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
+// Target::{Path, Entry { .., shape }, Program, None}; Action::unsupported(item, target, reason) builds prior Absent, no content
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
 // `loadout` = the active checkout root (default clone or --loadout DIR); passed to every reserved::check_path call
 // apply (U4)
