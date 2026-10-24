@@ -25,8 +25,15 @@ async would buy v1 nothing.
 | `gethostname` | the default machine name |
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
 | `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
-| `process-wrap` (std, job-object; Windows only) | programs: each query runs in a job object, killed as a whole (U7) |
+| `process-wrap` (std, job-object, creation-flags; Windows only) | programs: each query runs in a job object, killed as a whole (U7) |
+| `loadout-winproc` (local, `publish = false`; Windows only) | programs: resumes a query created suspended, once loadout owns its job (U7) |
 | `nix` (`signal`; Unix only) | programs: signals the query's process group and confirms it is empty (U7) |
+
+`loadout-winproc` (`crates/loadout-winproc`, a workspace member) is the workspace's only `unsafe`
+code: one safe function, `resume_suspended`, over `windows` 0.62 (already in the lock through
+`process-wrap`). It denies `unsafe_op_in_unsafe_fn`, gives every `unsafe` block one call and a
+`SAFETY` comment, and owns every handle it opens. The `loadout` crate keeps
+`unsafe_code = "forbid"`. Nothing else goes in that crate: it is not a general Windows wrapper.
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -913,7 +920,7 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
 - **Verified.** After the manager exits with success, `install` runs the installed-query again; a
   success that left the program missing is `Error::NotInstalled`.
 - **Bounded queries.** Every installed-query, scope query, and doctor query runs in its own process
-  group (Unix) or job object (Windows), through `process-wrap`. `QUERY_DEADLINE` (10 minutes)
+  group (Unix) or job object (Windows, through `process-wrap`). `QUERY_DEADLINE` (10 minutes)
   bounds waiting for the query's own process. A query's stdout and stderr are read in full up to
   `QUERY_OUTPUT_CAP` (8 MiB each). A larger answer stops the query early, and is an error, never
   parsed truncated.
@@ -967,6 +974,32 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   `TerminateJobObject` (checked), the query's exit, and both readers' EOF are the confirmation.
   A descendant whose output is redirected is covered only by `TerminateJobObject`'s documented
   semantics, and `process-wrap`'s first-message job wait is not used as proof.
+
+  **The query runs only once loadout owns its job.** Loadout passes `CREATE_SUSPENDED` itself
+  (`process-wrap`'s `CreationFlags`), so `process-wrap` assigns the job and **never resumes**
+  the query. Its own resume can fail after a thread already ran, and then discards the job's
+  termination result. Setup, in order:
+  1. Loadout spawns the `std::process::Child` itself (`spawn_with_child`) and keeps it
+     (`Arc<Mutex<Child>>`) before anything fallible, handle duplication included. The innermost
+     wrapper `process-wrap` sees shares that child.
+  2. If anything fails before loadout holds the job (handle duplication, `process-wrap`'s
+     no-handle branch, creating or assigning the job), the query never ran, so it started
+     nothing. Loadout kills its one process (checked) and reaps it. **One setup deadline**,
+     `QUERY_CLEANUP_GRACE` from the start of the spawn, bounds `process-wrap`'s wait on that
+     process and loadout's own disposal together, with no renewed budget. The result is the
+     spawn error, or `Cleanup` with the spawn error as its cause.
+  3. Once `process-wrap` returns the job's owner, the setup deadline is cleared (the innermost
+     wrapper's blocking `wait` then refuses, rather than block without a bound). The readers
+     start, then `loadout_winproc::resume_suspended` resumes the query. It finds the child's
+     threads in one snapshot, requires exactly one, opens it, checks it still belongs to the
+     child, and only then resumes it. A previous suspend count other than 1 is an error.
+  4. **Any** resume error is treated as "the query may have run": there is no `watch`, and the
+     ordinary settle stops the whole job, with the resume error as the cause.
+
+  The setup deadline applies only to setup failures. A query that starts gets the ordinary
+  `QUERY_DEADLINE` and then the ordinary up-to-5-second settle; it is never limited to 5
+  seconds. A real `TerminateJobObject` failure can't be constructed in a test: only that its
+  error is kept is unit-covered.
 - **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
   The reader blocked on it stays blocked until that process exits; that is a resource limit, not
   success.
