@@ -42,10 +42,16 @@ impl Captured {
         }
     }
 
-    /// The tail of what the manager printed, for an error the user can act on.
+    /// The tail of what the manager printed, as a terminal would show it: a progress bar that
+    /// redraws with `\r` keeps only its last state.
     pub(super) fn tail(&self) -> String {
         let text = format!("{}\n{}", self.stdout.trim(), self.stderr.trim());
-        let lines: Vec<&str> = text.trim().lines().collect();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').rsplit('\r').next())
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         let tail = lines[lines.len().saturating_sub(20)..].join("\n");
         if tail.is_empty() {
             String::new()
@@ -133,6 +139,8 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
                 "--id",
                 package,
                 "--exact",
+                "--source",
+                "winget",
                 "--accept-source-agreements",
                 "--disable-interactivity",
             ],
@@ -170,6 +178,8 @@ pub(super) fn scope(manager: Manager, program: &Path, package: &str) -> Result<S
             "--id",
             package,
             "--exact",
+            "--source",
+            "winget",
             "--scope",
             "user",
             "--accept-source-agreements",
@@ -179,11 +189,30 @@ pub(super) fn scope(manager: Manager, program: &Path, package: &str) -> Result<S
     winget_show(&shown)
 }
 
+/// `winget show` exits 0 even when no installer fits the requested scope (seen on winget 1.6),
+/// so the answer is the line under its `Installer:` heading.
 fn winget_show(shown: &Captured) -> Result<Scope, String> {
     match shown.hresult() {
-        Some(0) => Ok(Scope::User),
-        Some(WINGET_NO_APPLICABLE_INSTALLER) => Ok(Scope::System),
-        _ => Err(shown.unexpected()),
+        Some(0) => {}
+        Some(WINGET_NO_APPLICABLE_INSTALLER) => return Ok(Scope::System),
+        _ => return Err(shown.unexpected()),
+    }
+    let installer = shown
+        .stdout
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "Installer:")
+        .nth(1)
+        .unwrap_or_default();
+    if installer.starts_with("Installer Type:") {
+        Ok(Scope::User)
+    } else if installer.starts_with("No applicable installer found") {
+        Ok(Scope::System)
+    } else {
+        Err(format!(
+            "winget show printed no installer section{}",
+            shown.tail()
+        ))
     }
 }
 
@@ -486,6 +515,29 @@ mod tests {
     }
 
     #[test]
+    fn error_tails_keep_the_last_lines_as_a_terminal_shows_them() {
+        let progress = out(
+            1,
+            "- \r   \r  10%\r  50%\r 100%\r\nFailed when searching source: msstore\r\n",
+            "",
+        );
+        assert_eq!(
+            progress.tail(),
+            ":\n 100%\nFailed when searching source: msstore"
+        );
+        let long = (1..=30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = out(1, &long, "boom\n").tail();
+        assert!(
+            tail.starts_with(":\nline 12\n") && tail.ends_with("line 30\nboom"),
+            "{tail}"
+        );
+        assert_eq!(out(1, "", "").tail(), "");
+    }
+
+    #[test]
     fn brew_reads_the_installed_field_of_one_entry() {
         let formula = |installed: &str| {
             out(
@@ -591,16 +643,23 @@ mod tests {
         );
         let failure = winget_list(&out(hresult(0x8A15_000F), "", "")).unwrap_err();
         assert!(failure.contains("0x8A15000F"), "{failure}");
-        assert_eq!(winget_show(&out(0, "Found Foo [A.B]", "")), Ok(Scope::User));
+        let portable = "Found RipGrep MSVC [BurntSushi.ripgrep.MSVC]\r\nTags:\r\n  ripgrep\r\nInstaller:\r\n  Installer Type: portable (zip)\r\n  Installer Url: https://x/rg.zip\r\n";
+        assert_eq!(winget_show(&out(0, portable, "")), Ok(Scope::User));
+        let machine_only = "Found 7-Zip [7zip.7zip]\r\nTags:\r\n  zip\r\nInstaller:\r\n  No applicable installer found; see logs for more details.\r\n";
+        assert_eq!(winget_show(&out(0, machine_only, "")), Ok(Scope::System));
         assert_eq!(
-            winget_show(&out(
-                hresult(0x8A15_0010),
-                "No applicable installer found",
-                ""
-            )),
+            winget_show(&out(hresult(0x8A15_0010), "", "")),
             Ok(Scope::System)
         );
-        assert!(winget_show(&out(hresult(0x8A15_0014), "", "")).is_err());
+        assert!(
+            winget_show(&out(
+                hresult(0x8A15_0014),
+                "No package found matching input criteria.",
+                ""
+            ))
+            .is_err()
+        );
+        assert!(winget_show(&out(0, "Found Foo [A.B]\r\n", "")).is_err());
     }
 
     #[test]

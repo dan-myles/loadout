@@ -158,6 +158,8 @@ pub(super) fn install(manager: Manager, program: &Path, package: &str, scope: Sc
             "--id",
             package,
             "--exact",
+            "--source",
+            "winget",
             "--silent",
             "--accept-package-agreements",
             "--accept-source-agreements",

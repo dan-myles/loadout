@@ -743,7 +743,7 @@ executable found there. Every subprocess gets its argv as an array (no shell), a
 | `zypper` | zypper | `zypper --non-interactive --no-refresh search --installed-only --match-exact --type package P` | exit 104 | `zypper --non-interactive install P` |
 | `flatpak` | flatpak | `flatpak info P` (any installation) | exit 1 with "not installed" | `flatpak install --user --noninteractive P` |
 | `snap` | snap | `snap list P` | exit 1 with "no matching snaps installed" | `snap install P` |
-| `winget` | winget | `winget list --id P --exact` | `0x8A150014` | `winget install --id P --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --scope user\|machine` |
+| `winget` | winget | `winget list --id P --exact --source winget` | `0x8A150014` | `winget install --id P --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --scope user\|machine` |
 | `scoop` | scoop | `scoop prefix APP` (`APP` is `P` after any `bucket/`) | exit 1 with "Could not find app path" | `scoop install P` |
 | `choco` | choco (2.x) | `choco list --exact P --limit-output` | no `P\|version` line, or exit 2 | `choco install P -y --no-progress`; 1641 and 3010 are success |
 | `npm`, `pnpm` | npm / pnpm | `ls --global --depth=0 --json P` | no `dependencies.P` (exit 0 or 1) | `npm install --global P` / `pnpm add --global P` |
@@ -762,8 +762,11 @@ executable found there. Every subprocess gets its argv as an array (no shell), a
   or pins a version (`name@1.2` for npm, pnpm, bun; any `@` for cargo, uv, pipx, go). Go is the
   one manager given `@latest`, because `go install` requires a version.
 - **Scope.** `apt`, `dnf`, `pacman`, `zypper`, `snap`, and `choco` are system scope. A missing
-  winget package is user scope when `winget show --id P --exact --scope user` finds an installer,
-  and machine scope when it returns `0x8A150010` (no applicable installer). Everything else is
+  winget package is user scope when `winget show --id P --exact --source winget --scope user` lists an
+  installer under its `Installer:` heading, and machine scope when it prints "No applicable
+  installer found" there (winget 1.6 still exits 0) or returns `0x8A150010`. The `winget` field
+  names an id in the `winget` community source; every winget call passes `--source winget`,
+  so a broken `msstore` source (as in the Windows test guest) can't stop an install. Everything else is
   user scope. `install(step, false)` refuses a system-scope step with `Error::NeedsElevation`
   before any subprocess. With `elevated`, Unix runs `sudo -- [env K=V] TOOL …` (or the tool
   directly as root), and an absent `sudo` is `Error::NoSudo`. Windows runs the tool directly.

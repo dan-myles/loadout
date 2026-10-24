@@ -81,10 +81,12 @@ fn describe(step: &Step) -> Value {
         State::Installed(package) => json!({
             "program": program, "state": "installed",
             "manager": package.manager.id(), "package": package.id,
+            "executable": package.executable,
         }),
         State::Missing { package, scope } => json!({
             "program": program, "state": "missing",
             "manager": package.manager.id(), "package": package.id,
+            "executable": package.executable,
             "scope": format!("{scope:?}").to_lowercase(),
             "needs_elevation": step.needs_elevation(),
         }),
@@ -627,7 +629,7 @@ esac; exit 64"#,
         assert_eq!(
             run.commands(&bench.bin()),
             [
-                "winget list --id BurntSushi.ripgrep.MSVC --exact --accept-source-agreements --disable-interactivity"
+                "winget list --id BurntSushi.ripgrep.MSVC --exact --source winget --accept-source-agreements --disable-interactivity"
             ]
         );
     }
