@@ -1,4 +1,4 @@
-[files.ssh-config]
+[files.git-ignore]
 remove = true
 
 [files.powershell-profile]

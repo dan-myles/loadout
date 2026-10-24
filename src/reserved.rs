@@ -19,9 +19,7 @@ pub enum Kind {
 impl Kind {
     pub fn reason(self) -> &'static str {
         match self {
-            Kind::Auth => {
-                "an agent auth or OAuth store, which loadout never reads, copies, or writes"
-            }
+            Kind::Auth => "an auth or OAuth store, which loadout never reads, copies, or writes",
             Kind::SharedConfig => {
                 "an agent-owned shared config that loadout only key-merges MCP servers into"
             }
@@ -217,6 +215,18 @@ pub const TABLE: &[Entry] = &[
         "antigravity-json",
     ),
     entry(Anchor::Home, ".t3", Kind::Private),
+    entry(Anchor::Home, ".ssh", Kind::Auth),
+    entry(Anchor::XdgConfig, "gh/hosts.yml", Kind::Auth),
+    entry(
+        Anchor::Home,
+        "AppData/Roaming/GitHub CLI/hosts.yml",
+        Kind::Auth,
+    ),
+    entry(Anchor::Home, ".git-credentials", Kind::Auth),
+    entry(Anchor::XdgConfig, "git/credentials", Kind::Auth),
+    entry(Anchor::Home, ".netrc", Kind::Auth),
+    entry(Anchor::Home, "_netrc", Kind::Auth),
+    entry(Anchor::Home, ".aws/credentials", Kind::Auth),
     entry(Anchor::State, "", Kind::LoadoutState),
     entry(Anchor::XdgConfig, "loadout", Kind::LoadoutState),
 ];
@@ -839,5 +849,54 @@ mod tests {
             isolated_kind("/sandbox/.local/share/opencode/mcp-auth.json"),
             Some(Kind::Auth)
         );
+    }
+
+    #[test]
+    fn well_known_non_agent_credentials_are_reserved_but_their_siblings_are_not() {
+        for path in [
+            "~/.ssh/id_ed25519",
+            "~/.ssh/config",
+            "~/.ssh",
+            "~/.SSH/known_hosts",
+            "{config}/gh/hosts.yml",
+            "~/AppData/Roaming/GitHub CLI/hosts.yml",
+            "~/.git-credentials",
+            "{config}/git/credentials",
+            "~/.netrc",
+            "~/_netrc",
+            "~/.aws/credentials",
+            "~/.aws",
+        ] {
+            assert_eq!(conflict(path, Use::Write), Some(Kind::Auth), "{path}");
+        }
+        for path in [
+            "~/.gitconfig",
+            "~/.config/git/ignore",
+            "{config}/gh/config.yml",
+            "~/.aws/config",
+            "~/.sshrc",
+            "~/.netrc.d/x",
+        ] {
+            assert_eq!(conflict(path, Use::Write), None, "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_aliases_are_caught_through_links() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::create_dir_all(root.join("dotfiles/ssh")).unwrap();
+        symlink(root.join("dotfiles/ssh"), root.join("home/.ssh")).unwrap();
+        let context = Context::resolve(Os::Linux, |_| None, Some(root.join("home"))).unwrap();
+        let kind = |path: PathBuf| {
+            check_path(&context, Path::new(NO_LOADOUT), &path, Use::Write)
+                .and_then(|conflict| conflict.kind())
+        };
+        assert_eq!(kind(root.join("dotfiles/ssh/id_ed25519")), Some(Kind::Auth));
+        assert_eq!(kind(root.join("dotfiles/zshrc")), None);
     }
 }

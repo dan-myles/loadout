@@ -1001,6 +1001,27 @@ fn git_metadata_is_found_behind_links_gitfiles_and_separate_dirs() {
 }
 
 #[test]
+fn well_known_credential_files_are_reserved_targets() {
+    let manifest = |target: &str| {
+        format!("[loadout]\nversion = 1\n[files.a]\nsource = \"f\"\ntarget = \"{target}\"\n")
+    };
+    for target in [
+        "~/.ssh/id_ed25519",
+        "~/.aws/credentials",
+        "~/.netrc",
+        "{config}/gh/hosts.yml",
+    ] {
+        let (code, text) = validate_tree(&[("loadout.toml", &manifest(target)), ("f", "x")]);
+        assert_eq!(code, 3, "{target}: {text}");
+        assert!(text.contains("auth or OAuth store"), "{text}");
+    }
+    for target in ["~/.aws/config", "~/.gitconfig"] {
+        let (code, text) = validate_tree(&[("loadout.toml", &manifest(target)), ("f", "x")]);
+        assert_eq!(code, 0, "{target}: {text}");
+    }
+}
+
+#[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["doctor", "--json"]);

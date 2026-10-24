@@ -586,9 +586,17 @@ kinds:
 | Kind | Entries (default anchor shown) | Allowed use |
 | --- | --- | --- |
 | `auth` | `~/.claude/.credentials.json`, `~/.claude/mcp-needs-auth-cache.json`; `~/.codex/{auth.json,.credentials.json,mcp-oauth-locks}`; `~/.cursor/auth.json`, `~/.config/cursor/auth.json`, `~/AppData/Roaming/Cursor/auth.json`; `~/.grok/{auth.json,mcp_credentials.json}`; `<xdg_data>/opencode` (the auth file and credential DB); `~/.pi/agent/{auth.json,mcp-auth.json}`; `<xdg_config>/muse/{auth.json,trust.json}`; `<gemini_home>/antigravity/mcp_oauth_tokens.json` | none: never read, backed up, copied, or written |
+| `auth` (non-agent, well-known) | all of `~/.ssh` (keys and config, conservatively); `<xdg_config>/gh/hosts.yml`, `~/AppData/Roaming/GitHub CLI/hosts.yml`; `~/.git-credentials`, `<xdg_config>/git/credentials`; `~/.netrc`, `~/_netrc`; `~/.aws/credentials` | none |
 | `shared-config` | `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), `~/.codex/config.toml`, `~/.cursor/mcp.json`, `~/.grok/config.toml`, `<xdg_config>/opencode/opencode.json[c]`, `~/.pi/agent/mcp.json`, `<xdg_config>/muse/settings.json`, `<gemini_home>/config/mcp_config.json` | U6 key-merge of owned MCP server names only |
 | `loadout-state` | the state dir (`Context.state`; static defaults for all three OSes), `<xdg_config>/loadout` | none: only U3, U8, and U9 manage state, the clone, and `machine.toml` |
 | `private` | `~/.claude/backups`, `~/.grok/.config-init.lock`, `<gemini_home>/antigravity-cli/mcp` (generated), `~/.t3` (T3 settings with provider secrets, private profiles) | none |
+
+The standing rule against copying credentials covers more than agents, so the table also lists
+these well-known credential files. The list is finite. It does not discover arbitrary credential
+files, it has no user override to back up a known store, and no file contents are ever inspected.
+Reserving all of `~/.ssh` is a deliberate false positive: v1 can't manage `~/.ssh/config`.
+Overrides such as `AWS_SHARED_CREDENTIALS_FILE` or `GH_CONFIG_DIR` are not modelled; their default
+locations are protected.
 
 **Anchors.** `Home`, `ClaudeRoot`/`ClaudeDir` (`CLAUDE_CONFIG_DIR`), `CodexHome` (`CODEX_HOME`),
 `GrokHome` (`GROK_HOME`), `PiDir` (`PI_CODING_AGENT_DIR`), `GeminiHome` (`GEMINI_HOME`, default `~/.gemini`), `XdgConfig`

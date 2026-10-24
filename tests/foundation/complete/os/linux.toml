@@ -1,5 +1,5 @@
-[files.ssh-config]
-target = "~/.ssh/config"
+[files.git-ignore]
+target = "~/.config/git/ignore"
 
 [programs.fd]
 apt = "fd-find"

@@ -39,9 +39,9 @@ env_syntax = "${VAR}"
 source = "files/gitconfig.tmpl"
 target = "~/.gitconfig"
 
-[files.ssh-config]
-source = "files/ssh/config"
-target = "~/.ssh/config"
+[files.git-ignore]
+source = "files/git/ignore"
+target = "~/.config/git/ignore"
 when = { os = ["macos", "linux"] }
 
 [files.vscode-settings]
