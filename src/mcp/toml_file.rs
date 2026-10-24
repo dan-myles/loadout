@@ -81,6 +81,10 @@ pub(super) fn edit(
     set: &Servers,
     remove: &[String],
 ) -> Result<String, Error> {
+    let crlf = text.contains("\r\n");
+    if crlf && text.replace("\r\n", "").contains('\n') {
+        return Err(Error::MixedNewlines);
+    }
     let mut doc = document(text)?;
     let at = pointer::prefix(parts);
     let entries = set
@@ -109,7 +113,20 @@ pub(super) fn edit(
             table.insert(name, item);
         }
     }
-    Ok(doc.to_string())
+    // toml_edit writes every line ending as LF and always ends with one, so the file's own line
+    // endings and missing final newline are put back.
+    let mut out = doc.to_string();
+    if crlf {
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    let newline = if crlf { "\r\n" } else { "\n" };
+    if !text.is_empty()
+        && !text.ends_with('\n')
+        && let Some(kept) = out.strip_suffix(newline).map(str::len)
+    {
+        out.truncate(kept);
+    }
+    Ok(out)
 }
 
 fn entry(value: &Json, at: &str) -> Result<Table, Error> {
@@ -197,7 +214,12 @@ fn value_json(value: &Value, at: &str) -> Result<Json, Error> {
                 message: format!("{} has no JSON form", float.value()),
             })?,
         Value::Boolean(boolean) => Json::Bool(*boolean.value()),
-        Value::Datetime(datetime) => Json::String(datetime.value().to_string()),
+        Value::Datetime(datetime) => {
+            return Err(Error::Value {
+                pointer: at.to_owned(),
+                message: format!("the datetime {} has no JSON form", datetime.value()),
+            });
+        }
         Value::Array(values) => values
             .iter()
             .enumerate()

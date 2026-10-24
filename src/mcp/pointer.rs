@@ -30,9 +30,11 @@ pub(super) fn parse(pointer: &str) -> Result<Vec<String>, Error> {
 }
 
 pub(super) fn prefix(parts: &[String]) -> String {
-    parts.iter().fold(String::new(), |mut out, part| {
-        out.push('/');
-        out.push_str(&part.replace('~', "~0").replace('/', "~1"));
-        out
-    })
+    parts
+        .iter()
+        .fold(String::new(), |out, part| child(&out, part))
+}
+
+pub(super) fn child(at: &str, name: &str) -> String {
+    format!("{at}/{}", name.replace('~', "~0").replace('/', "~1"))
 }

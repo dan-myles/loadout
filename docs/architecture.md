@@ -24,7 +24,7 @@ async would buy v1 nothing.
 | `anyhow` | command-level errors with context |
 | `gethostname` | the default machine name |
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
-| `jsonc-parser` (`cst`, `serde_json`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
+| `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -590,17 +590,24 @@ or corrects them.
     commas, no JSON5 forms), so `.claude.json` and Antigravity's file are never written into a form
     the agent rejects. `jsonc` allows comments and trailing commas; OpenCode's `opencode.jsonc` is
     supported, not refused. Inserted values follow the file's indent, newline kind, and
-    trailing-comma style. A UTF-8 BOM survives.
-  - An edit that sets and removes nothing returns the input bytes unchanged. A comment attached to a
-    removed owned server goes with it. Missing parent tables are created only to set a server. A
-    map location (or an ancestor) holding anything but a table, a duplicate key on the path, a
-    `null` bound for TOML, and a non-finite TOML float are errors, never a silent rewrite.
+    trailing-comma style. A UTF-8 BOM survives. A TOML edit keeps CRLF line endings and a missing
+    final newline (toml_edit itself writes LF); a TOML file that mixes CRLF and LF is refused
+    (`Error::MixedNewlines`) rather than rewritten.
+  - `edit` parses the whole server map first. An edit that sets nothing and removes no existing
+    name returns the input bytes unchanged. A comment attached to a removed owned server goes with
+    it. Missing parent tables are created only to set a server.
+  - A value is read only when it converts to JSON exactly, so `parse` never retypes. These are
+    errors, never a silent rewrite: a map location (or an ancestor) holding anything but a table;
+    a duplicate key anywhere on the path or inside the server map, at any depth; a JSON number
+    serde_json can't hold (`1e400`, or an integer past 64 bits), which jsonc-parser would turn
+    into a string or a float; a TOML datetime,
+    which would read the same as a string; a non-finite TOML float; and a `null` bound for TOML.
   - Agent-written state in `~/.claude.json` (`oauthAccount`, `projects`) and `~/.codex/config.toml`
     (`projects`, `tui`) is never touched.
   - An existing server name that loadout doesn't own is `blocked`, not overwritten (U4 decides;
     `mcp::edit` changes only the names it is given).
-  - Muse needs `"schema_version": 1`: `edit` inserts it first when it sets a server, and refuses a
-    file at any other version. Antigravity takes `serverUrl` and rejects SSE (the schema has no SSE
+  - Muse needs `"schema_version": 1`: `edit` inserts it first when it sets a server. It refuses a
+    file that declares any other version for every edit, removal included. Antigravity takes `serverUrl` and rejects SSE (the schema has no SSE
     transport). Pi treats `-` and `_` in names as the same character, so `edit` refuses a set name
     that collides with another kept name (`Error::Collision`).
   - **Entry fixtures** (`mcp::entry`), from the inventory:
@@ -631,7 +638,11 @@ or corrects them.
     `mcp::read` is the guarded path form that does so before any open, and refuses a FIFO or a
     folder. For Grok's `config.toml`, `mcp::lock` runs the same check, then takes Grok's exclusive
     `flock` on `<grok home>/.config-init.lock`, with Grok's own policy (create the dir and file,
-    retry 50 times 20 ms). It refuses a linked or special lock file. The caller holds the guard
+    retry 50 times 20 ms). Grok's config is recognized by identity, as `check_path` recognizes it:
+    the given path and its parent-normalized form are compared with both forms of
+    `<GROK_HOME or ~/.grok>/config.toml`. So a file alias, a folder alias, an override home, and
+    the physical file behind a linked config all take the same lock in the owning home. A path
+    that can't be resolved is an error, not `None`. It refuses a linked or special lock file. The caller holds the guard
     across read, re-observe, and rename. The lock creates a file, so it is taken only at apply time,
     never at plan.
 - **Custom agents** get exactly the declared paths, their declared `format`, `map`, `shape`, and

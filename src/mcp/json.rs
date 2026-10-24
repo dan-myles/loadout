@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use jsonc_parser::ParseOptions;
-use jsonc_parser::cst::{CstInputValue, CstObject, CstObjectProp, CstRootNode};
-use serde_json::Value as Json;
+use jsonc_parser::cst::{CstInputValue, CstNode, CstObject, CstObjectProp, CstRootNode};
+use serde_json::{Map, Number, Value as Json};
 
 use super::{Error, Servers, pointer};
 use crate::manifest::McpFormat;
@@ -37,15 +37,83 @@ fn root(text: &str, format: McpFormat) -> Result<CstRootNode, Error> {
     CstRootNode::parse(text, &options).map_err(failed)
 }
 
-fn kind(value: &Json) -> &'static str {
-    match value {
-        Json::Null => "null",
-        Json::Bool(_) => "a boolean",
-        Json::Number(_) => "a number",
-        Json::String(_) => "a string",
-        Json::Array(_) => "an array",
-        Json::Object(_) => "an object",
+fn kind(node: &CstNode) -> &'static str {
+    if node.as_object().is_some() {
+        "an object"
+    } else if node.as_array().is_some() {
+        "an array"
+    } else if node.as_string_lit().is_some() {
+        "a string"
+    } else if node.as_number_lit().is_some() {
+        "a number"
+    } else if node.as_boolean_lit().is_some() {
+        "a boolean"
+    } else if node.as_null_keyword().is_some() {
+        "null"
+    } else {
+        "an unsupported value"
     }
+}
+
+// jsonc-parser's own conversion turns a number serde_json can't hold (such as 1e400) into a
+// string, which would hash like that string, so values are converted here and refuse instead.
+fn value(node: &CstNode, at: &str) -> Result<Json, Error> {
+    let refuse = |message: String| Error::Value {
+        pointer: at.to_owned(),
+        message,
+    };
+    if let Some(object) = node.as_object() {
+        object_value(&object, at)
+    } else if let Some(array) = node.as_array() {
+        array
+            .elements()
+            .iter()
+            .enumerate()
+            .map(|(index, element)| value(element, &format!("{at}/{index}")))
+            .collect::<Result<_, _>>()
+            .map(Json::Array)
+    } else if let Some(text) = node.as_string_lit() {
+        text.decoded_value()
+            .map(Json::String)
+            .map_err(|error| refuse(format!("unreadable string ({error:?})")))
+    } else if node.as_number_lit().is_some() {
+        let raw = node.to_string();
+        let integer = !raw.contains(['.', 'e', 'E']);
+        raw.parse::<Number>()
+            .ok()
+            .filter(|number| !integer || number.is_i64() || number.is_u64())
+            .map(Json::Number)
+            .ok_or_else(|| refuse(format!("the number {raw} has no exact JSON value")))
+    } else if let Some(boolean) = node.as_boolean_lit() {
+        Ok(Json::Bool(boolean.value()))
+    } else if node.as_null_keyword().is_some() {
+        Ok(Json::Null)
+    } else {
+        Err(refuse(format!("{node} is not a JSON value")))
+    }
+}
+
+fn object_value(object: &CstObject, at: &str) -> Result<Json, Error> {
+    let mut out = Map::new();
+    for prop in object.properties() {
+        let name = prop.decoded_name().ok_or_else(|| Error::Value {
+            pointer: at.to_owned(),
+            message: "unreadable property name".to_owned(),
+        })?;
+        let child = pointer::child(at, &name);
+        let node = prop.value().ok_or_else(|| Error::Value {
+            pointer: child.clone(),
+            message: "missing value".to_owned(),
+        })?;
+        let converted = value(&node, &child)?;
+        if out.insert(name.clone(), converted).is_some() {
+            return Err(Error::Duplicate {
+                pointer: at.to_owned(),
+                key: name,
+            });
+        }
+    }
+    Ok(Json::Object(out))
 }
 
 fn property(object: &CstObject, name: &str, at: &str) -> Result<Option<CstObjectProp>, Error> {
@@ -66,10 +134,7 @@ fn property(object: &CstObject, name: &str, at: &str) -> Result<Option<CstObject
 fn object_at(prop: &CstObjectProp, at: &str) -> Result<CstObject, Error> {
     prop.object_value().ok_or_else(|| Error::NotAnObject {
         pointer: at.to_owned(),
-        found: prop
-            .value()
-            .and_then(|node| node.to_serde_value())
-            .map_or("unreadable", |value| kind(&value)),
+        found: prop.value().as_ref().map_or("nothing", kind),
     })
 }
 
@@ -82,9 +147,7 @@ fn root_object(root: &CstRootNode, create: bool) -> Result<Option<CstObject>, Er
             .map(Some)
             .ok_or_else(|| Error::NotAnObject {
                 pointer: String::new(),
-                found: node
-                    .to_serde_value()
-                    .map_or("unreadable", |value| kind(&value)),
+                found: kind(&node),
             }),
     }
 }
@@ -112,28 +175,10 @@ pub(super) fn parse(text: &str, format: McpFormat, parts: &[String]) -> Result<S
     let Some(object) = map(&root, parts, false)? else {
         return Ok(BTreeMap::new());
     };
-    let at = pointer::prefix(parts);
-    let mut servers = BTreeMap::new();
-    for prop in object.properties() {
-        let name = prop.decoded_name().ok_or_else(|| Error::Parse {
-            format,
-            message: format!("unreadable property name in {at}"),
-        })?;
-        let value = prop
-            .value()
-            .and_then(|node| node.to_serde_value())
-            .ok_or_else(|| Error::Parse {
-                format,
-                message: format!("unreadable value for {at}/{name}"),
-            })?;
-        if servers.insert(name.clone(), value).is_some() {
-            return Err(Error::Duplicate {
-                pointer: at,
-                key: name,
-            });
-        }
+    match object_value(&object, &pointer::prefix(parts))? {
+        Json::Object(servers) => Ok(servers.into_iter().collect()),
+        _ => unreachable!("object_value returns an object"),
     }
-    Ok(servers)
 }
 
 pub(super) struct Change<'a> {
@@ -152,8 +197,8 @@ pub(super) fn edit(
     let fresh = root.value().is_none();
     let create = !change.set.is_empty();
     let at = pointer::prefix(parts);
-    if create && change.schema_version {
-        schema_version(&root)?;
+    if change.schema_version {
+        schema_version(&root, create)?;
     }
     if let Some(object) = map(&root, parts, create)? {
         for name in change.remove {
@@ -180,22 +225,30 @@ pub(super) fn edit(
 
 const SCHEMA_VERSION: &str = "schema_version";
 
-fn schema_version(root: &CstRootNode) -> Result<(), Error> {
-    let Some(object) = root_object(root, true)? else {
+pub(super) fn check_schema_version(text: &str, format: McpFormat) -> Result<(), Error> {
+    schema_version(&root(text, format)?, false)
+}
+
+fn schema_version(root: &CstRootNode, insert: bool) -> Result<(), Error> {
+    let Some(object) = root_object(root, insert)? else {
         return Ok(());
     };
     match property(&object, SCHEMA_VERSION, "")? {
-        None => {
+        None if insert => {
             object.insert(0, SCHEMA_VERSION, CstInputValue::Number("1".to_owned()));
             Ok(())
         }
+        None => Ok(()),
         Some(prop) => {
-            let found = prop.value().and_then(|node| node.to_serde_value());
+            let found = prop
+                .value()
+                .map(|node| value(&node, "/schema_version"))
+                .transpose()?;
             if found.as_ref().and_then(Json::as_u64) == Some(1) {
                 Ok(())
             } else {
                 Err(Error::Schema {
-                    found: found.map_or_else(|| "unreadable".to_owned(), |value| value.to_string()),
+                    found: found.map_or_else(|| "missing".to_owned(), |value| value.to_string()),
                 })
             }
         }

@@ -62,7 +62,9 @@ pub enum Error {
     Duplicate { pointer: String, key: String },
     #[error("{pointer}: {message}")]
     Value { pointer: String, message: String },
-    #[error("schema_version is {found}; loadout writes Muse settings only at schema_version 1")]
+    #[error("the TOML file mixes CRLF and LF line endings; loadout won't rewrite it")]
+    MixedNewlines,
+    #[error("schema_version is {found}; loadout edits Muse settings only at schema_version 1")]
     Schema { found: String },
     #[error("Pi treats - and _ as the same character, so server {name:?} collides with {other:?}")]
     Collision { name: String, other: String },
@@ -118,10 +120,17 @@ pub fn edit(
     if let Some(name) = remove.iter().find(|name| set.contains_key(*name)) {
         return Err(Error::SetAndRemove { name: name.clone() });
     }
-    if shape == McpShape::PiJson {
-        pi_collision(&parse(bytes, format, pointer)?, set, remove)?;
-    }
+    let existing = parse(bytes, format, pointer)?;
     let (bom, text) = text(bytes)?;
+    if shape == McpShape::MuseJson {
+        json::check_schema_version(text, format)?;
+    }
+    if shape == McpShape::PiJson {
+        pi_collision(&existing, set, remove)?;
+    }
+    if set.is_empty() && !remove.iter().any(|name| existing.contains_key(name)) {
+        return Ok(bytes.to_vec());
+    }
     let edited = match format {
         McpFormat::Json | McpFormat::Jsonc => json::edit(
             text,

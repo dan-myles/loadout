@@ -664,10 +664,171 @@ fn an_edit_that_changes_nothing_returns_the_input_bytes() {
             McpShape::CursorJson,
         ),
         ("x = 1\n", McpFormat::Toml, "/absent", McpShape::GrokToml),
+        (
+            "# keep\r\nmodel = 'keep'\r\n\r\n[mcp_servers.mine]\r\ncommand='mine'\r\n",
+            McpFormat::Toml,
+            "/mcp_servers",
+            McpShape::CodexToml,
+        ),
+        (
+            "model=\"keep\"",
+            McpFormat::Toml,
+            "/mcp_servers",
+            McpShape::GrokToml,
+        ),
+        (
+            "a = 1\r\nb = 2\n",
+            McpFormat::Toml,
+            "/mcp_servers",
+            McpShape::GrokToml,
+        ),
+        (
+            "{\"mcpServers\": {\"u\": {}}}",
+            McpFormat::Json,
+            "/mcpServers",
+            McpShape::PiJson,
+        ),
+        (
+            "{\r\n  // c\r\n  \"mcp\": {}\r\n}",
+            McpFormat::Jsonc,
+            "/mcp",
+            McpShape::OpencodeJson,
+        ),
     ] {
         let after = edit(before, format, pointer, shape, &Servers::new(), &["absent"]);
         assert_eq!(after, before);
     }
+}
+
+#[test]
+fn toml_edits_keep_crlf_line_endings_and_a_missing_final_newline() {
+    let servers = set(&[("new", json!({"command": "x"}))]);
+    let crlf = "# keep\r\nmodel = 'keep'\r\n\r\n[mcp_servers.mine]\r\ncommand='mine'\r\n";
+    let added = edit(
+        crlf,
+        McpFormat::Toml,
+        "/mcp_servers",
+        McpShape::CodexToml,
+        &servers,
+        &[],
+    );
+    assert_eq!(
+        added,
+        format!("{crlf}\r\n[mcp_servers.new]\r\ncommand = \"x\"\r\n")
+    );
+    let removed = edit(
+        &added,
+        McpFormat::Toml,
+        "/mcp_servers",
+        McpShape::CodexToml,
+        &Servers::new(),
+        &["new"],
+    );
+    assert_eq!(removed, crlf);
+
+    let no_final_newline = "model = \"keep\"";
+    let added = edit(
+        no_final_newline,
+        McpFormat::Toml,
+        "/mcp_servers",
+        McpShape::GrokToml,
+        &servers,
+        &[],
+    );
+    assert_eq!(
+        added,
+        "model = \"keep\"\n\n[mcp_servers.new]\ncommand = \"x\""
+    );
+
+    let error = mcp::edit(
+        b"a = 1\r\nb = 2\n",
+        McpFormat::Toml,
+        "/mcp_servers",
+        McpShape::GrokToml,
+        &servers,
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::MixedNewlines), "{error}");
+}
+
+#[test]
+fn json_numbers_without_an_exact_value_are_refused_not_retyped() {
+    for (text, format) in [
+        (r#"{"m": {"s": {"n": 1e400}}}"#, McpFormat::Json),
+        (
+            "{\"m\": {\"s\": {\"a\": [1, -1e999]}}} // c",
+            McpFormat::Jsonc,
+        ),
+        (
+            r#"{"m": {"s": {"big": 123456789012345678901234567890}}}"#,
+            McpFormat::Json,
+        ),
+    ] {
+        let error = mcp::parse(text.as_bytes(), format, "/m").unwrap_err();
+        assert!(
+            matches!(&error, Error::Value { pointer, .. } if pointer.starts_with("/m/s/")),
+            "{error}"
+        );
+        let error = mcp::edit(
+            text.as_bytes(),
+            format,
+            "/m",
+            McpShape::CursorJson,
+            &set(&[("t", json!({"command": "x"}))]),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Value { .. }), "{error}");
+    }
+    let exact = mcp::parse(
+        br#"{"m": {"s": {"a": 1.5, "b": -3, "c": 12345678901234567890, "d": "1e400"}}}"#,
+        McpFormat::Json,
+        "/m",
+    )
+    .unwrap();
+    assert_eq!(
+        exact["s"],
+        json!({"a": 1.5, "b": -3, "c": 12_345_678_901_234_567_890_u64, "d": "1e400"})
+    );
+}
+
+#[test]
+fn duplicate_keys_anywhere_in_the_server_map_are_refused() {
+    let nested = br#"{"m": {"s": {"command": "first", "command": "second"}}}"#;
+    assert!(matches!(
+        mcp::parse(nested, McpFormat::Json, "/m"),
+        Err(Error::Duplicate { ref pointer, ref key }) if pointer == "/m/s" && key == "command"
+    ));
+    let untouched = br#"{"m": {"u": {}, "u": {}}}"#;
+    let error = mcp::edit(
+        untouched,
+        McpFormat::Json,
+        "/m",
+        McpShape::CursorJson,
+        &set(&[("t", json!({"command": "x"}))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Duplicate { .. }), "{error}");
+}
+
+#[test]
+fn toml_datetimes_are_refused_rather_than_read_as_strings() {
+    let error =
+        mcp::parse(b"[m.s]\nx = 1979-05-27T07:32:00Z\n", McpFormat::Toml, "/m").unwrap_err();
+    assert!(
+        matches!(&error, Error::Value { pointer, .. } if pointer == "/m/s/x"),
+        "{error}"
+    );
+    let string = mcp::parse(
+        b"[m.s]\nx = '1979-05-27T07:32:00Z'\n",
+        McpFormat::Toml,
+        "/m",
+    )
+    .unwrap();
+    assert_eq!(string["s"]["x"], "1979-05-27T07:32:00Z");
+    assert!(mcp::parse(b"when = 1979-05-27\n[m.s]\nx = 1\n", McpFormat::Toml, "/m").is_ok());
 }
 
 #[test]
@@ -779,6 +940,19 @@ fn muse_settings_get_schema_version_one_and_refuse_other_versions() {
         &[],
     );
     assert_eq!(after.matches("schema_version").count(), 1);
+
+    for remove in [names(&["fs"]), names(&["absent"])] {
+        let error = mcp::edit(
+            b"{\"schema_version\": 2, \"mcp_servers\": {\"fs\": {}}}",
+            McpFormat::Json,
+            "/mcp_servers",
+            McpShape::MuseJson,
+            &Servers::new(),
+            &remove,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Schema { .. }), "{error}");
+    }
 
     let error = mcp::edit(
         b"{\"schema_version\": 2}",
@@ -1325,4 +1499,88 @@ fn lock_never_follows_a_linked_lock_file() {
     symlink(&dangling, home.join(".grok/.config-init.lock")).unwrap();
     assert!(mcp::lock(&context, &loadout, &home.join(".grok/config.toml")).is_err());
     assert!(!dangling.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn every_alias_of_groks_config_contends_for_the_same_lock() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let loadout = temp.path().join("checkout");
+    let dotfiles = temp.path().join("dotfiles");
+    let context = context(&home, &[]);
+    let grok = home.join(".grok");
+    let config = write(&dotfiles.join("grok.toml"), "[mcp_servers]\n");
+    fs::create_dir_all(&grok).unwrap();
+    symlink(&config, grok.join("config.toml")).unwrap();
+    symlink(grok.join("config.toml"), home.join("grok-alias.toml")).unwrap();
+    symlink(&grok, home.join("grok-dir")).unwrap();
+    let lock_path = fs::canonicalize(&grok).unwrap().join(".config-init.lock");
+    let paths = [
+        grok.join("config.toml"),
+        home.join("grok-alias.toml"),
+        home.join("grok-dir/config.toml"),
+        config.clone(),
+    ];
+
+    for path in &paths {
+        assert!(
+            mcp::read(
+                &context,
+                &loadout,
+                path,
+                McpFormat::Toml,
+                "/mcp_servers",
+                McpShape::GrokToml
+            )
+            .is_ok(),
+            "{}",
+            path.display()
+        );
+        let lock = mcp::lock(&context, &loadout, path).unwrap().unwrap();
+        assert_eq!(lock.path(), lock_path, "{}", path.display());
+    }
+
+    for (index, holder) in paths.iter().enumerate() {
+        let contender = &paths[(index + 1) % paths.len()];
+        let held = mcp::lock(&context, &loadout, holder).unwrap().unwrap();
+        let error = mcp::lock(&context, &loadout, contender).unwrap_err();
+        assert!(
+            matches!(error, Error::Lock { .. }),
+            "{} while {} holds it: {error}",
+            contender.display(),
+            holder.display()
+        );
+        drop(held);
+    }
+
+    let unrelated = write(&dotfiles.join("config.toml"), "");
+    assert!(mcp::lock(&context, &loadout, &unrelated).unwrap().is_none());
+    assert!(!dotfiles.join(".config-init.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_override_grok_home_reached_through_a_link_finds_its_lock() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let real = temp.path().join("real-grok");
+    let loadout = temp.path().join("checkout");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    symlink(&real, home.join("grok-link")).unwrap();
+    let context = context(&home, &[("GROK_HOME", &real)]);
+    let lock = mcp::lock(&context, &loadout, &home.join("grok-link/config.toml"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lock.path(),
+        fs::canonicalize(&real).unwrap().join(".config-init.lock")
+    );
+    assert!(matches!(
+        mcp::lock(&context, &loadout, &real.join("config.toml")),
+        Err(Error::Lock { .. })
+    ));
 }

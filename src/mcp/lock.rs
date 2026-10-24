@@ -25,22 +25,49 @@ impl Lock {
     }
 }
 
-fn grok_home(context: &Context, file: &Path) -> Option<PathBuf> {
-    if file.file_name()? != GROK_CONFIG {
-        return None;
+fn same(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+// A config is named by its own path and by its parent's path; either may be a link, and
+// reserved::check_path accepts every alias of Grok's config, so every alias must find its lock.
+fn forms(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut forms = vec![reserved::normalize(path)?];
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        forms.push(reserved::normalize(parent)?.join(name));
     }
-    let parent = reserved::normalize(file.parent()?).ok()?;
-    context
+    Ok(forms)
+}
+
+fn grok_home(context: &Context, file: &Path) -> Result<Option<PathBuf>, Error> {
+    let unverifiable = |path: &Path, error: io::Error| Error::Reserved {
+        path: path.to_path_buf(),
+        message: format!("cannot resolve it to check for Grok's config ({error}); refusing it"),
+    };
+    let targets = forms(file).map_err(|error| unverifiable(file, error))?;
+    let roots = context
         .agent_dir("GROK_HOME")
         .map(Path::to_path_buf)
         .into_iter()
-        .chain([context.home.join(".grok")])
-        .filter_map(|root| reserved::normalize(&root).ok())
-        .find(|root| *root == parent)
+        .chain([context.home.join(".grok")]);
+    for root in roots {
+        let config = root.join(GROK_CONFIG);
+        let known = forms(&config).map_err(|error| unverifiable(&config, error))?;
+        if targets
+            .iter()
+            .any(|target| known.iter().any(|known| same(target, known)))
+        {
+            return reserved::normalize(&root)
+                .map(Some)
+                .map_err(|error| unverifiable(&root, error));
+        }
+    }
+    Ok(None)
 }
 
 pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<Lock>, Error> {
-    let Some(home) = grok_home(context, file) else {
+    let Some(home) = grok_home(context, file)? else {
         return Ok(None);
     };
     let how = Use::KeyMerge(Merge {

@@ -11,7 +11,7 @@ publish = false
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 gethostname = "1"
-jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
+jsonc-parser = { version = "0.34", features = ["cst"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
