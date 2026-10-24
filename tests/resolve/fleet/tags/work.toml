@@ -1,0 +1,19 @@
+[variables]
+email = "me@work.example"
+
+[mcp.fs]
+args = { add = ["~/work"] }
+
+[mcp.docs]
+replace = true
+command = "docs-mcp"
+
+[skills.deploy]
+remove = true
+
+[instructions.main]
+agents = { remove = ["acp"] }
+
+[instructions.acp-rules]
+source = "instructions/ACP.md"
+agents = ["acp"]

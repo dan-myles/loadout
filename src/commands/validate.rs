@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::cli::Exit;
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::manifest::{Loadout, Scope};
+use crate::resolve;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -33,12 +34,16 @@ struct Layer<'a> {
 }
 
 pub fn run(args: &Args) -> anyhow::Result<Exit> {
-    let result = Loadout::load(&args.dir);
-    let (loadout, diagnostics) = match &result {
-        Ok((loadout, diagnostics)) => (Some(loadout), diagnostics),
+    let (loadout, diagnostics) = match Loadout::load(&args.dir) {
+        Ok((loadout, mut diagnostics)) => {
+            diagnostics.extend(resolve::check_all(&loadout));
+            (Some(loadout), diagnostics)
+        }
         Err(diagnostics) => (None, diagnostics),
     };
-    let valid = loadout.is_some();
+    let loadout = loadout.as_ref();
+    let diagnostics = &diagnostics;
+    let valid = !diagnostics.has_errors();
 
     if args.json {
         let report = Report {
@@ -61,7 +66,7 @@ pub fn run(args: &Args) -> anyhow::Result<Exit> {
             println!("{diagnostic}");
         }
         let warnings = diagnostics.count(Severity::Warning);
-        match loadout {
+        match loadout.filter(|_| valid) {
             Some(loadout) => println!(
                 "valid: {} ({} layers, {} items, {warnings} warnings)",
                 args.dir.display(),

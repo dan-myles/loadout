@@ -1,0 +1,29 @@
+[loadout]
+version = 1
+
+[machines.studio]
+tags = ["work"]
+
+[machines.tower]
+tags = ["gaming"]
+
+[agents]
+enabled = ["claude"]
+
+[files.colon]
+source = "f"
+target = "~/notes:2026"
+
+[files.cfg]
+source = "f"
+target = "~/.config/app/settings"
+
+[files.profile]
+source = "f"
+target = "~/.profile"
+
+[instructions.main]
+source = "AGENTS.md"
+
+[mcp.tools]
+command = "tools"
