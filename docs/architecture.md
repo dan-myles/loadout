@@ -75,7 +75,8 @@ src/
   reserved.rs             reserved destinations: auth, shared configs, state [foundation]
   machine.rs              Facts, machine name                               [foundation]
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
-  resolve/mod.rs          Resolved model                                    [types: foundation; resolve(): U1]
+  resolve/                mod.rs (API, Resolved), merge.rs (layer folding), finish.rs (agents,
+                          transports, reach), paths.rs (Windows, collisions, reserved), all.rs [built, U1]
   plan/mod.rs             Desired, Content, Target, Action, Plan            [types: foundation; build(): U4]
   commands/
     doctor.rs             loadout doctor                                    [foundation, contended]
@@ -102,7 +103,7 @@ reserved                       -> context, platform
 context                        -> platform
 machine                        -> platform, context, id
 manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
-resolve                        -> manifest, machine, diagnostic
+resolve                        -> manifest, machine, context, reserved, platform, diagnostic
 template                       -> manifest (Loadout, Variable), machine, diagnostic
 mcp                            -> manifest, resolve, plan (types)
 agents                         -> manifest, resolve, mcp, plan (types), machine, context, diagnostic
@@ -327,14 +328,41 @@ What validate enforces today, before any machine is known:
 - Targets and custom-agent paths never touch a reserved destination (section 6).
 - Every agent named anywhere is built in or declared.
 
-U1 adds the checks that need a machine:
+U1 (built) adds the checks that need a machine. `resolve` runs them for one machine's facts, and
+`validate` runs them through `check_all` (section 11):
 
-- an added item that turns out incomplete
-- a server left with mixed or missing transports
-- cross-layer target collisions
-- one instructions item per agent
-- `windows_problem` on every target that resolves for Windows
-- `reserved::check_path` on every expanded target
+- An added item must be complete in the layer that adds it: an id no broader layer declares for
+  this machine, or a `replace = true`. This includes an item re-added after a removal. A field
+  edit can never clear a field, so every final item is complete.
+- A server left with `command` and `url`, stdio `args` or `env` beside `url`, or `headers` beside
+  `command`, is an error naming the item and every layer that touched it.
+- Expanded collisions, explained below. Two writes collide when they resolve to the same path or
+  when one sits inside the other. Writes are the final file targets, plus what an enabled custom
+  agent receives on that OS: `<skills>/<skill id>` for each skill that reaches it, its
+  instructions file when an instructions item reaches it, and its MCP file when a server reaches
+  it. Paths that built-in agents receive are U5's (section 6).
+- At most one instructions item reaches each agent.
+- `windows_problem` runs on every final Windows write, so a target with no valid Windows path is
+  an error there.
+- Warnings: an item's `agents` list that names an agent the machine doesn't enable; an item that
+  reaches no agent because none is enabled; a `remove = true` with nothing inherited to remove.
+- An enabled custom agent that no applied layer declares is an error.
+
+**Reserved destinations, two ways.** Validate's synthetic machines carry no `Context`, so they
+read nothing from the host. Every final target is a literal that some layer declared, and
+`check_literal` already checked each literal under all three `{config}` meanings, so a synthetic
+re-check would add nothing. The runtime check needs a real `Context` and the active checkout, so
+it is `resolve::check_targets(resolved, context, loadout)`. It runs `reserved::check_path` on
+every expanded file target (`Write`) and every enabled custom agent path for `context.os`
+(`WriteInto`, `Write`, `KeyMerge`), and it errors when a target has no valid path on that OS. U4
+calls it after `resolve` and before observing anything. It doesn't replace the per-read,
+per-backup, and per-write checks in section 6.
+
+`check_all` resolves every listed machine, every unlisted machine name that a `when.machine`
+uses, and one other unlisted machine. Each runs on macOS, Linux, and Windows, on both
+architectures, and on Linux both with no distro and with each distro a `when.distro` names.
+Facts are synthetic. Each diagnostic is reported once, with its machines and OSes appended, for
+example `(on studio: linux; tower: macos, windows)`.
 
 Collisions compare **expanded** paths (`~/.config/x` and `{config}/x` collide on Linux) under the
 target file system's real case behaviour. By default that is case-insensitive on macOS and Windows
@@ -837,7 +865,7 @@ Automatic updates are required, so they are on by default.
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
-| `loadout validate [DIR] [--json]`: strict schema and static checks, plus the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid | foundation | U1 adds resolution across every machine on all three OSes |
+| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes (U1, built) and the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid | foundation; resolution built (U1); template syntax built (U2) | |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
 | `loadout status [--json]` | frozen | U3 |
@@ -902,9 +930,12 @@ impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warni
 // Loadout { root, machines: BTreeMap<String, MachineEntry>, layers: Vec<LayerFile { scope: Scope, file, layer: Layer }> }
 // Scope::{Global, Os(Os), Tag(String), Machine(String)}; layers come global, os, tags, machines, each sorted by name
 
-// resolve (U1; Resolved types foundation)
-pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<Resolved, Diagnostics>;
-pub fn check_all(loadout: &Loadout) -> Diagnostics;   // every listed machine plus an unlisted one, on all three OSes
+// resolve (built, U1; Resolved types foundation)
+pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<(Resolved, Diagnostics /* warnings */), Diagnostics>; // like Loadout::load
+pub fn check_all(loadout: &Loadout) -> Diagnostics;   // every listed machine plus unlisted ones, on all three OSes; synthetic facts only
+pub fn check_targets(resolved: &Resolved, context: &Context, loadout: &Path) -> Diagnostics; // runtime reserved::check_path; `loadout` = active checkout
+// Resolved sources (File, Skill, Instructions) are absolute: the loadout root joined with the declared path.
+// An item's `agents` is the effective list: its own list (an edit of an unset list edits the enabled agents) narrowed to the enabled set.
 
 // template (U2, built)
 pub const SUFFIX: &str;                                  // ".tmpl"
