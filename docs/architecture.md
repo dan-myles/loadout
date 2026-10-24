@@ -858,9 +858,10 @@ impl Run { pub fn begin(context: &Context, plan: &Plan) -> Result<Run, state::Er
 pub fn rollback(context: &Context, run: Option<&str>) -> Result<Vec<Target>, state::Error>;
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
-pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, state: &State) -> Result<Plan, Diagnostics>;
+pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
+// `loadout` = the active checkout root (default clone or --loadout DIR); passed to every reserved::check_path call
 // apply (U4)
-pub fn run(plan: &Plan, context: &Context, options: Options) -> Result<Report, apply::Error>;
+pub fn run(plan: &Plan, context: &Context, loadout: &Path, options: Options) -> Result<Report, apply::Error>; // re-checks reserved paths before each backup and write
 
 // sync (U8)
 pub fn clone(url: &str, context: &Context) -> Result<(), sync::Error>;
