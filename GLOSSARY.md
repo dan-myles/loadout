@@ -31,18 +31,30 @@ What every machine gets.
 _Avoid_: baseline, default, common
 
 **Tag**:
-A named group of machines, such as `work` or `laptop`, with its own layer.
+A named group of machines, such as `work` or `laptop`, with its own layer. The loadout lists each machine's tags.
 _Avoid_: group, profile, role
 
 **Override**:
 A declaration in a narrower layer that adds, removes, replaces, or changes part of an item from a broader layer.
 _Avoid_: patch, exception
 
+**Machine fact**:
+A built-in value describing the machine: machine name, OS, distro, CPU architecture, home path.
+_Avoid_: environment, host info
+
+**Condition**:
+A rule on an item that limits it to machines whose facts match, such as `os = windows`.
+_Avoid_: filter, guard, when-clause
+
 **Template**:
-A user file containing variables and if/else conditions that are filled in per machine.
+A user file marked for rendering, whose variables and if/else blocks are filled in per machine. Unmarked user files are copied unchanged.
 _Avoid_: dynamic file
 
 ### What a loadout declares
+
+**Item**:
+One thing a loadout declares: a user file, skill, global agent instructions, MCP server definition, or program.
+_Avoid_: entry, resource, unit
 
 **User file**:
 A file in the user's home or user config area, such as shell, git, or editor config.
