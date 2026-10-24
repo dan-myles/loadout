@@ -99,8 +99,10 @@ def smoke_test(binary, target, version, required=False):
         print(f"smoke test skipped: this host cannot execute {target}", file=sys.stderr)
         return
     output = run([str(binary), "--version"])
-    if version not in output:
-        raise ReleaseError(f"{binary.name} --version printed {output.strip()!r}, expected {version}")
+    if output.split()[:2] != [PACKAGE, version]:
+        raise ReleaseError(
+            f"{binary.name} --version printed {output.strip()!r}, expected '{PACKAGE} {version}'"
+        )
     print(f"smoke test passed: {output.strip()}", file=sys.stderr)
 
 

@@ -1,10 +1,12 @@
 import hashlib
 import importlib.util
+import os
 import tarfile
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("package", Path(__file__).with_name("package.py"))
 package = importlib.util.module_from_spec(spec)
@@ -70,6 +72,31 @@ class SmokeTest(unittest.TestCase):
 
     def test_optional_smoke_skips_when_host_cannot_run_target(self):
         package.smoke_test(Path("loadout"), "riscv64gc-unknown-none-elf", "0.1.0")
+
+
+@unittest.skipIf(os.name == "nt", "fake binary is a POSIX shell script")
+class SmokeVersionTest(unittest.TestCase):
+    def smoke(self, printed, expected):
+        binary = Path(tempfile.mkdtemp()) / "loadout"
+        binary.write_text(f"#!/bin/sh\necho '{printed}'\n")
+        binary.chmod(0o755)
+        with mock.patch.object(package, "host_can_run", return_value=True):
+            package.smoke_test(binary, "any-target", expected, required=True)
+
+    def test_matching_version_passes(self):
+        self.smoke("loadout 0.1.0", "0.1.0")
+
+    def test_version_with_extra_build_info_passes(self):
+        self.smoke("loadout 0.1.0 (abc1234 2026-10-24)", "0.1.0")
+
+    def test_version_that_only_contains_expected_fails(self):
+        for printed in ("loadout 10.1.0", "loadout 0.1.0-beta.1", "loadout 0.1.01"):
+            with self.subTest(printed=printed), self.assertRaises(package.ReleaseError):
+                self.smoke(printed, "0.1.0")
+
+    def test_wrong_program_name_fails(self):
+        with self.assertRaises(package.ReleaseError):
+            self.smoke("other 0.1.0", "0.1.0")
 
 
 if __name__ == "__main__":
