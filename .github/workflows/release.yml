@@ -62,6 +62,13 @@ jobs:
             args+=(--expect-version "${GITHUB_REF_NAME#v}")
           fi
           python scripts/release/package.py "${args[@]}"
+      - name: Smoke-test the packaged archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ext=tar.gz
+          if [[ $TARGET == *-windows-* ]]; then ext=zip; fi
+          python scripts/release/smoke.py "dist/loadout-$TARGET.$ext"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loadout-${{ matrix.target }}
