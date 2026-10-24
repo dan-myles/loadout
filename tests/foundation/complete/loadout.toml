@@ -1,0 +1,86 @@
+[loadout]
+version = 1
+
+[machines.work-laptop]
+tags = ["work", "laptop"]
+
+[machines.home-desktop]
+tags = ["gaming"]
+
+[variables]
+name = "Dan Myles"
+email = "dan@example.com"
+work = false
+editor_font_size = 13
+
+[update]
+auto = true
+interval_minutes = 60
+cli = true
+
+[agents]
+enabled = ["claude", "codex", "opencode", "pi", "grok", "cursor", "muse", "antigravity", "devin"]
+
+[agents.custom.devin]
+evidence = "https://docs.devin.ai/ (paths declared by the loadout owner)"
+t3_acp_agent = "devin"
+skills = { macos = "~/.devin/skills", linux = "~/.devin/skills" }
+instructions = { linux = "~/.devin/AGENTS.md", macos = "~/.devin/AGENTS.md" }
+
+[agents.custom.devin.mcp]
+linux = "~/.devin/mcp.json"
+macos = "~/.devin/mcp.json"
+format = "json"
+map = "/mcpServers"
+shape = "cursor-json"
+env_syntax = "${VAR}"
+
+[files.gitconfig]
+source = "files/gitconfig.tmpl"
+target = "~/.gitconfig"
+
+[files.git-ignore]
+source = "files/git/ignore"
+target = "~/.config/git/ignore"
+when = { os = ["macos", "linux"] }
+
+[files.vscode-settings]
+source = "files/vscode-settings.json"
+target = "{config}/Code/User/settings.json"
+
+[skills.review]
+source = "skills/review"
+
+[skills.release-notes]
+source = "skills/release-notes"
+agents = ["claude", "codex"]
+
+[instructions.global]
+source = "instructions/AGENTS.md"
+
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "~/Developer"]
+env = { LOG_LEVEL = "warn" }
+
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = { env = "GITHUB_TOKEN", prefix = "Bearer " } }
+agents = ["claude", "codex", "cursor"]
+
+[programs.ripgrep]
+brew = "ripgrep"
+apt = "ripgrep"
+dnf = "ripgrep"
+pacman = "ripgrep"
+winget = "BurntSushi.ripgrep.MSVC"
+scoop = "ripgrep"
+
+[programs.firefox]
+cask = "firefox"
+flatpak = "org.mozilla.firefox"
+winget = "Mozilla.Firefox"
+
+[programs.uv-ruff]
+uv = "ruff"
+pipx = "ruff"

@@ -1,0 +1,8 @@
+[files.git-ignore]
+target = "~/.config/git/ignore"
+
+[programs.fd]
+apt = "fd-find"
+dnf = "fd-find"
+pacman = "fd"
+when = { distro = ["ubuntu", "debian", "fedora", "arch"] }
