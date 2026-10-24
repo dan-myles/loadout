@@ -67,6 +67,10 @@ def build_env(root, target, epoch):
         f"--remap-path-prefix={root}=/build",
         f"--remap-path-prefix={cargo_home}=/cargo",
     ]
+    if target.endswith("-linux-musl"):
+        # The host's cc/ld differ between machines and change the binary's layout; rust-lld ships
+        # with the pinned toolchain, so the same commit links identically everywhere.
+        rustflags += ["-C", "linker=rust-lld"]
     if target.endswith("-windows-msvc"):
         # Static CRT avoids requiring the VC++ redistributable; /Brepro and
         # /PDBALTPATH keep the link timestamp and absolute PDB path out of the exe.

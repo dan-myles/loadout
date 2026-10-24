@@ -34,7 +34,16 @@ Every target builds natively on the matching architecture, using only
 [standard GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 which are free for public repositories. No larger runners are used. Every build runs
 `package.py --require-smoke`, so the packaged binary's `--version` must succeed on its own platform,
-or the job fails. If GitHub retires its Intel macOS images (`macos-15-intel`, `macos-26-intel`),
+or the job fails. `scripts/release/smoke.py` then tests the archive as a user would receive it:
+- it checks the sidecar checksum and extracts the archive
+- it runs `--help`, and checks that an unknown command exits 2
+- it runs `doctor --json` and `validate` on `tests/foundation/complete` (exit 0) and
+  `tests/foundation/invalid` (exit 3), with `LOADOUT_HOME` and `LOADOUT_STATE_DIR` in a throwaway
+  directory
+- `doctor` must report no failed check when `git` is on `PATH`, and only the `git` check failing
+  when it isn't
+
+If GitHub retires its Intel macOS images (`macos-15-intel`, `macos-26-intel`),
 cross-build `x86_64-apple-darwin` on an arm64 `macos-*` runner and drop `--require-smoke` for that
 target.
 
@@ -97,12 +106,13 @@ Prerequisites per host:
 - All: rustup, git, Python 3.8+. Release jobs install Python 3.13 with `actions/setup-python`, the
   oldest line it ships as binaries for every runner above, Windows ARM64 included.
 - Linux: nothing beyond rustup while the crate is pure Rust. Rust's musl targets bring their own
-  C runtime. Cross-linking aarch64 from an x86_64 host also works for pure Rust, with
-  `export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`.
+  C runtime, and `package.py` links them with the toolchain's `rust-lld`, never the host `ld`. That
+  also makes an x86_64-to-aarch64 cross build work with no extra setup.
 - Linux with a C dependency (anything built through the `cc` crate) needs a C compiler that targets
   musl, for the target architecture. Natively, that's Ubuntu's `musl-tools` (`musl-gcc`). For an
   x86_64-to-aarch64 cross build, it's an `aarch64-linux-musl` cross toolchain with
-  `CC_aarch64_unknown_linux_musl` and the linker pointed at it. Ubuntu's `gcc-aarch64-linux-gnu` is
+  `CC_aarch64_unknown_linux_musl`. If that dependency then needs its toolchain's own linker, revisit
+  the `rust-lld` choice in `package.py`. Ubuntu's `gcc-aarch64-linux-gnu` is
   not enough: it builds against glibc. None of this is set up in CI or tested. Validate it against
   the real dependency graph when the first C dependency lands.
 - macOS: Xcode Command Line Tools. To build the other architecture locally, `rustup target add` it.
@@ -120,10 +130,13 @@ The script pins everything it controls:
   neither leaks into the binary.
 - On MSVC targets, `/Brepro` and `/PDBALTPATH:%_PDB%` remove the link timestamp and the absolute
   PDB path.
+- `rust-toolchain.toml` pins `rustc`, and the script prints `rustc -vV` at the top of every build
+  log. Linux musl targets link with that toolchain's `rust-lld`. With the host's `cc`/`ld`, the same
+  commit gave different bytes on Ubuntu 22.04 (binutils 2.38) and the 24.04 runner (2.42).
 
-The same commit built with the same `rustc` gives the same binary, wherever it's checked out. The
-script prints `rustc -vV` at the top of every build log. `rust-toolchain.toml` pins the toolchain,
-so rebuilding a tag on the same target uses the same `rustc`. One thing is not pinned:
+So the same commit gives the same Linux binary on any machine. macOS and Windows binaries still
+link with the runner image's Xcode `ld` and MSVC `link.exe`. Rebuilds on one runner image
+should match, but that isn't verified, and image updates can change the bytes. Also not pinned:
 
 - **Python's zlib.** It can compress the archive differently across Python builds. The binary
   inside stays byte-identical.
