@@ -53,6 +53,10 @@ pub enum Error {
     EntryNeedsMcp { target: String },
     #[error("{target} is a program; programs are installed by the programs module, never written")]
     Program { target: String },
+    #[error(
+        "an action with no target reached {operation}; an item with no destination on this machine is an unsupported plan action, never observed, journaled, or written"
+    )]
+    NoTarget { operation: &'static str },
     #[error("invalid content: {message}")]
     InvalidContent { message: String },
     #[error("{target} is not in this run's journal")]
@@ -108,6 +112,16 @@ pub fn label(target: &Target) -> String {
             file, pointer, key, ..
         } => format!("{}#{pointer}/{key}", file.display()),
         Target::Program { manager, package } => format!("{} {package}", manager.id()),
+        Target::None => "no target".to_owned(),
+    }
+}
+
+/// `Target::None` is valid only on an unsupported plan action, which plan filters out before
+/// state. State refuses one it is handed anyway, before touching the file system.
+pub(super) fn refuse_none(target: &Target, operation: &'static str) -> Result<(), Error> {
+    match target {
+        Target::None => Err(Error::NoTarget { operation }),
+        Target::Path { .. } | Target::Entry { .. } | Target::Program { .. } => Ok(()),
     }
 }
 
@@ -320,6 +334,7 @@ fn tree_files(
 /// store, loadout's own state, or the active checkout (`loadout`) is never opened or hashed.
 /// A symlinked target is followed to the real file or folder.
 pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, Error> {
+    refuse_none(target, "observe")?;
     let path = check_target(context, target)?;
     check_reserved(context, loadout, path)?;
     Ok(observed(disk::read(&disk::real(path)?)?.as_ref()))
@@ -342,6 +357,9 @@ fn path_of(target: &Target) -> Result<&Path, Error> {
         }),
         Target::Program { .. } => Err(Error::Program {
             target: label(target),
+        }),
+        Target::None => Err(Error::NoTarget {
+            operation: "a path lookup",
         }),
     }
 }
@@ -372,7 +390,7 @@ fn valid_observed(observed: &Observed) -> bool {
 fn target_shape(target: &Target) -> bool {
     match target {
         Target::Path { path } | Target::Entry { file: path, .. } => clean_absolute(path),
-        Target::Program { .. } => false,
+        Target::Program { .. } | Target::None => false,
     }
 }
 

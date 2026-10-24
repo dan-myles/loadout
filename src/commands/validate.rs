@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::cli::Exit;
+use crate::context::Context;
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::manifest::{Loadout, Scope};
 use crate::resolve;
@@ -34,11 +35,11 @@ struct Layer<'a> {
     file: &'a PathBuf,
 }
 
-pub fn run(args: &Args) -> anyhow::Result<Exit> {
-    let (loadout, diagnostics) = match Loadout::load(&args.dir) {
+pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
+    let (loadout, diagnostics) = match Loadout::load_guarded(&args.dir, context) {
         Ok((loadout, mut diagnostics)) => {
             diagnostics.extend(resolve::check_all(&loadout));
-            diagnostics.extend(template::check_all(&loadout));
+            diagnostics.extend(template::check_all_guarded(&loadout, context));
             (Some(loadout), diagnostics)
         }
         Err(diagnostics) => (None, diagnostics),

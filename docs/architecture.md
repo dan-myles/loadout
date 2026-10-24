@@ -90,7 +90,8 @@ src/
   template/               mod.rs (API), strict.rs (guards), builtins.rs     [built: U2]
   state/                  hash, disk, journal, run, rollback                [built, U3]
   apply/                                                                    [U4]
-  agents/                 adapter table, skills + instructions targets      [U5]
+  agents/                 mod.rs (materialize, checks), table.rs (adapters), source.rs (skill and
+                          instructions sources), collide.rs (destination collisions), doctor.rs [built, U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [built: U6]
   programs/                                                                 [U7]
   sync/                   git clone/fetch, background service               [U8]
@@ -106,9 +107,9 @@ context                        -> platform
 machine                        -> platform, context, id
 manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
 resolve                        -> manifest, machine, context, reserved, platform, diagnostic
-template                       -> manifest (Loadout, Variable), machine, diagnostic
+template                       -> manifest (Loadout, Variable, Guard, source_guard), machine, context, diagnostic
 mcp                            -> manifest, resolve, reserved, context
-agents                         -> manifest, resolve, mcp, plan (types), machine, context, diagnostic
+agents                         -> manifest, resolve, mcp, reserved, plan (types), context, diagnostic, platform
 programs                       -> manifest, resolve, machine, context, diagnostic
 state                          -> context, plan (types)
 plan                           -> resolve, template, agents, programs, state, context, diagnostic
@@ -160,6 +161,22 @@ sources, and validate ignores them. An unknown key anywhere is an error.
   discovery failure is an error with its path, so a layer is never silently dropped: a permission
   error, a file where the folder should be, or an unreadable entry.
 - `Loadout.root` holds the canonical root.
+- **Two entry points** share this loader and the one Git metadata detector:
+  - `Loadout::load_guarded(root, context)` is the only entry point a command on a real host uses
+    (`validate`, and `plan`/`apply`/`update` once U4 and U8 land). Every manifest (`loadout.toml`
+    and layer files) and every Git pointer (`.git` as a gitfile, `commondir`) passes
+    `reserved::check_source_file` with the active `Context`, as reached and as its canonical
+    file, **before it is opened**. A checkout file that aliases an auth store, private settings,
+    or state is refused with a path-only diagnostic, never parsed. `context` decides only what may
+    be read: layers, resolution, and `check_all`'s synthetic machines are unchanged.
+  - `Loadout::load(root)` is context-free: the same confinement, but no host reservation policy,
+    so it would open such an alias. It exists for synthetic and test use; no host command calls it.
+  - `manifest::source_guard(context, checkout)` is that guard: `check_source_file` on the file as
+    reached and as its canonical file, refusing with the same path-only message. Every reader of
+    checkout content on a real host builds it, so there is one policy and one message.
+  - `resolve::check_all` and `resolve` read no files, so a later validation pass can't reopen
+    anything. The one later pass that reads checkout content, U2's template check, takes the same
+    guard (`template::check_all_guarded`; see Templates below).
 [`tests/foundation/complete/`](../tests/foundation/complete) is a full example that passes
 validation, and [`tests/foundation/invalid/`](../tests/foundation/invalid) collects the mistakes
 validate catches.
@@ -342,7 +359,11 @@ U1 (built) adds the checks that need a machine. `resolve` runs them for one mach
   when one sits inside the other. Writes are the final file targets, plus what an enabled custom
   agent receives on that OS: `<skills>/<skill id>` for each skill that reaches it, its
   instructions file when an instructions item reaches it, and its MCP file when a server reaches
-  it. Paths that built-in agents receive are U5's (section 6).
+  it. Paths that built-in agents receive are U5's (section 6). An MCP file is a key merge, not a
+  whole-file write: several custom agents may merge into one literal path when they all declare
+  the same `format`, and declaring two formats for one path is an error. Their maps and keys,
+  and every alias of the file, are compared by U5 at materialize. An MCP file against any other
+  write still collides as before.
 - At most one instructions item reaches each agent.
 - `windows_problem` runs on every final Windows write, so a target with no valid Windows path is
   an error there.
@@ -576,11 +597,17 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
   are `Syntax`, `Render` (an unknown filter, a type error, printing none, an undefined result, a
   missing attribute in an attribute builtin, division by zero, an engine panic), and `Home`. Every
   error has a line except `Home` and an engine panic.
-- **Validate** (`template::check_all`) runs only after `Loadout::load` accepts the loadout, so every
-  source has already passed the confinement checks in section 3 before its content is read. It
-  then re-canonicalizes each distinct `.tmpl` user-file source from every layer, requires it to sit
-  inside the root and be a regular UTF-8 file, and syntax-checks it with no machine and no
-  variables. Each failure is one error diagnostic on the template file, such as
+- **Validate** (`template::check_all_guarded(loadout, context)`) runs only after
+  `Loadout::load_guarded` accepts the loadout with the same `Context`, so every source has already
+  passed the confinement checks in section 3. It then re-canonicalizes each distinct `.tmpl`
+  user-file source from every layer, requires it to sit inside the root and be a regular file, and
+  only then runs `manifest::source_guard` on the source as reached and as its canonical file. A
+  refused source is never opened: its one diagnostic is the guard's path-only message. Otherwise it
+  reads the file, requires UTF-8, and syntax-checks it with no machine and no variables.
+  `template::check_all(loadout)` is the same pass without the host guard, for synthetic and test
+  use only; no host command calls it. The guard is a check before each open, not an atomic open: a
+  file swapped between the check and the open, or a hard link to a reserved file, is not caught.
+  Each failure is one error diagnostic on the template file, such as
   `files/gitconfig.tmpl: error: line 3: syntax error: …`, with exit 3. Unknown filters and missing
   variables are found only by `render`, because they depend on the machine.
 - **Plan (U4)** reads the confined source and calls `render` with `Resolved.variables` and the
@@ -794,6 +821,21 @@ delegated defaults.
   | `blocked(reason)` | the action needs elevation, or an unowned MCP key with the same name exists |
 
   `plan --json` prints the actions without their content.
+- **Targets.** `Target` is `Path { path }`, `Entry { file, format, pointer, key, shape }`,
+  `Program { manager, package }`, or `None`. `Entry.shape` is required: state passes it unchanged
+  to the `KeyMerge` check and `mcp::edit`, and never infers it from the agent id (a custom agent's
+  shape is whatever it declared). Records written without a shape are invalid, never defaulted.
+  `None` (JSON `{"type":"none"}`) exists only for an `unsupported` action whose item has no
+  destination on this machine, such as Cursor instructions (`Action::unsupported` builds it with
+  `prior: Absent` and no content). U4 rejects any other combination before I/O, and `None` never
+  reaches observe, ownership, backup, the journal, or a write. State rejects a caller-provided
+  `None` with `state::Error::NoTarget { operation }` before touching the file system:
+  `Run::begin` scans every action, journaled or not, before `disk::state_root`, and `observe`,
+  `Run::write`, and `Run::remove` check before anything else. The caller's already-acquired lock is
+  outside that claim. `state::label` shows `None` as `no target`, and a stored record or journal
+  entry holding `None` fails validation (`target_shape` is false) before any destination is
+  touched, so `None` is never persisted. An unsupported action with a real destination keeps that
+  target.
 - **Drift.** A drifted target is left alone and reported, with exit 4. `apply --force` backs it up
   and overwrites it. The background service never forces.
 - **Removal.** An owned target that hasn't changed since loadout wrote it is backed up, then removed.
@@ -948,7 +990,7 @@ delegated defaults.
   `mcp-entry` hash and per-key `Target::Entry` records. Until the follow-up lands, `observe`,
   `Run::write`, and `Run::remove` refuse a `Target::Entry` with `state::Error::EntryNeedsMcp` and
   write nothing, and `status` shows such a record as `unchecked`. This is not the v1 entry feature.
-  The follow-up, after U3 and U6, adds `shape: McpShape` to `Target::Entry`. It then consumes U6's
+  `Target::Entry` now carries `shape: McpShape` (U5), so the follow-up has what it needs. It then consumes U6's
   byte API, with state owning the transaction:
   1. `reserved::check_path` with `KeyMerge`.
   2. `mcp::lock(context, loadout, file)`: Grok's `.config-init.lock`, held to the rename.
@@ -960,7 +1002,7 @@ delegated defaults.
   7. The atomic write, keeping the mode and links.
   8. Rollback restores or removes that one key the same way.
 
-## 6. Agents (frozen, U5 adapters, U6 MCP)
+## 6. Agents (built: U5 adapters, U6 MCP)
 
 Evidence: `reports/agent-inventory.md` (final), T3 Code `4fef307`, and
 [Agent config surfaces](./wayfinder/loadout-v1/tickets/01-agent-config-surfaces.md). `~` is the home
@@ -976,7 +1018,7 @@ install time (U8).
 | grok | `$GROK_HOME` or `~/.grok`, then `/skills` | `…/AGENTS.md` | `…/config.toml`, `/mcp_servers`, `grok-toml`, under Grok's `.config-init.lock` flock | `${VAR}` |
 | opencode | `<xdg_config>/opencode/skills` on every OS | `<xdg_config>/opencode/AGENTS.md` | `<xdg_config>/opencode/opencode.json` or `.jsonc`, `/mcp`, `opencode-json` | `{env:VAR}` |
 | pi | `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, then `/skills` | `…/AGENTS.md` | `…/mcp.json`, `/mcpServers`, `pi-json` | `${VAR}` |
-| muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json`, `/mcp_servers`, `muse-json` | `${VAR}` |
+| muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json` (macOS, Linux), `/mcp_servers`, `muse-json` | `${VAR}` |
 | antigravity | `$GEMINI_HOME` or `~/.gemini`, then `/antigravity-cli/skills` | `…/AGENTS.md` | `…/config/mcp_config.json`, `/mcpServers`, `antigravity-json` | none (undocumented) |
 
 `<xdg_config>` is `Context.xdg_config`: `$XDG_CONFIG_HOME` (outside isolation) or `~/.config` on
@@ -986,10 +1028,51 @@ Windows (`%USERPROFILE%\.config`, not `%APPDATA%`), so their rows never use the 
 and Antigravity are inferred from home-directory joins in their source; Windows VM evidence confirms
 or corrects them.
 
-- **Capabilities are data.** U5 keeps a table of
-  `Capability<T> = Supported(PerOs<T>) | Unsupported(reason) | Unknown(reason)` per agent and kind.
-  An item an agent can't take is an `unsupported` plan action, never a silent skip. There is no
-  plugin framework.
+- **Capabilities are data** (`agents/table.rs`). `table::adapter(agent, os)` is one `match` that
+  returns each kind as `Supported(place)` or `Unsupported(reason)`, with the place as a root
+  (home, an override variable with its default, or `xdg_config`) plus a relative path. Each
+  adapter also records the folders it reads besides its own, its T3 pickup, whether its Windows
+  paths are inferred, and its evidence. An undocumented path is `Unsupported` with that reason, so
+  no separate `Unknown` state exists. An item an agent can't take is an `unsupported` plan action,
+  never a silent skip. There is no plugin framework.
+- **`agents::materialize(resolved, context, loadout)`** (built, U5). For every skill, instructions
+  item, and MCP server, and every agent in its effective `agents` list, it returns either a
+  `Desired` or an `unsupported` action:
+  - Skills: `Target::Path(<skills dir>/<id>)` with `Content::Tree`. Instructions:
+    `Target::Path(<file>)` with `Content::File`, never executable. MCP: `Target::Entry` with the
+    server id as key, the agent's map, format, and shape, and `Content::Entry(mcp::entry(..))`;
+    an `mcp::Unsupported` becomes an unsupported action on that same Entry target.
+  - A kind the agent lacks, or a custom agent that declares no table or no path for this OS, is
+    unsupported with `Target::None`. A skill id that is a Windows device name is unsupported on
+    Windows with its path.
+  - `context` is the only OS input. `loadout` is the active checkout. Every destination runs
+    through `reserved::check_path` (`Write` for skills and instructions, `KeyMerge` for MCP)
+    before any source is read or any other stat, and a conflict is unsupported with that target.
+  - OpenCode: `opencode.jsonc` (format `jsonc`) when it already exists, after its own reserved
+    check, otherwise `opencode.json`.
+  - Sources are read again from the checkout and copied verbatim (never rendered). Each source,
+    and each file a skill walk reaches, must canonicalize inside the checkout and outside its Git
+    metadata (`manifest::git_metadata_guarded`, validate's own detector with a guard). Each Git
+    pointer file the detector would open (`.git` as a gitfile, `commondir`) first passes
+    `reserved::check_source`, as reached and as its canonical file, so a pointer aliasing an auth
+    store, private settings, or state inside the checkout is refused before any read and never
+    as a parse error afterwards. Ordinary pointers, their confinement, and Git's relative bases
+    are unchanged. A skill may hold
+    only regular files, folders, and links to files inside the loadout; a link to a folder, a
+    special file, or a `.git` entry is refused. A skill needs `SKILL.md`. Every source file then
+    passes `reserved::check_source` (below), both as reached and as the file it lands on, before
+    it is opened.
+  - **Collisions** are errors. Every pair with at least one agent destination is compared: agent
+    against user file target, and agent against agent, built-in or custom. Two writes collide when
+    their paths are equal or one is inside the other, compared as written and with links resolved
+    (`reserved::normalize`), with case folded by the OS default as in section 3. Two MCP entries in
+    one file (as written or through an alias) collide when they declare different formats for it,
+    JSON and JSONC included, since those differ in what an edit must preserve and the file's
+    bytes never decide; or when one key address (map pointer plus key) equals or contains the
+    other, with Pi folding `-` and `_`. Equal formats with disjoint maps or keys merge. User file
+    against user file stays with U1 and U4.
+  - Problems with sources or collisions return `agents::Error::Invalid(Diagnostics)`: exit 3, and
+    nothing is planned or written. Materialize never writes; it reads loadout sources and stats.
 - **Skills** are copied into each target agent's skills dir as `Content::Tree`. Validate has already
   confined the folder (section 3), and U5 re-checks it when copying. It copies regular files,
   dereferences file links (the copy gets the file's bytes, not a link), and keeps each file's
@@ -1158,16 +1241,41 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
   - Static validate keeps its lexical default check (`check_literal`). Sibling paths stay allowed in
     both.
+  - **Sources** (U5, `reserved::check_source(context, loadout, path)`). A loadout source that the
+    caller already confined inside the canonical checkout (regular file, outside Git metadata) is
+    checked against **every** table entry, at every root and in both forms. There is no first
+    match, so table order can't hide a later entry. An `auth` entry that equals or holds the
+    source always refuses it, wherever the checkout lives, including through an override root
+    placed inside the checkout and inside a checkout kept in `~/.ssh`. Any other entry that equals
+    or holds the source refuses it unless that same entry also holds the canonical checkout. A user
+    may keep a checkout under `~/.t3/worktrees` or use the default `<state>/loadout` clone, but
+    a reserved file inside a larger checkout (`~/.t3/settings.json`, `.claude.json`, or the
+    state dir from a checkout at `~`) is still refused. The checkout itself is not a reservation
+    here. A path or anchor that can't be resolved refuses (`Unverifiable`). Destination checks are
+    unchanged: they still use `check_path`. `check_source_file(context, loadout, reached, real)`
+    runs it on both identities of one file, and is what the guarded load (section 3) and agents
+    sources both call.
   - **U6 applies the same rule.** Every MCP write calls `check_path` with
     `Use::KeyMerge(Merge { map, format, shape })`, for built-in adapters and custom agents alike, on
     expanded, canonical, and override-alias paths. A shared config reached through an alias still
     accepts only its own map. Validate already checks custom declarations statically.
 - An unowned shared config is never adopted or replaced as a whole file. Only U6's owned keys change.
-- **Doctor diagnostics** (U5): report which overrides are set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
-  `GROK_HOME`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`). Warn when Codex `AGENTS.override.md`
-  shadows `AGENTS.md`. Note that a T3-launched Antigravity sees skills only: T3 gives it a private
-  `GEMINI_HOME`, so user MCP and instructions don't reach it. Report double loading through
-  `~/.claude` compat dirs. Doctor claims nothing about T3 profile settings it doesn't read.
+- **Doctor diagnostics** (built, U5, `agents::checks`): only stats and folder-name listings, never
+  a file's contents, never a write, and never T3's settings.
+  - `agent overrides`: which of `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+    `PI_CODING_AGENT_DIR`, `GEMINI_HOME`, and `XDG_CONFIG_HOME` are set, or that isolation ignores them.
+  - `agent <id>` for each built-in agent: its skills, instructions, and MCP destinations on this
+    machine, unsupported kinds with their reason, its T3 pickup (sync and T3 pickup are separate
+    claims), inferred Windows paths, and its evidence. T3 pickup per driver: Codex, Claude, Grok,
+    OpenCode, Pi, and Muse read the native paths (Codex and Claude only for instances without a
+    custom home); Cursor is inferred; Antigravity is partial, because T3 gives it a private
+    `GEMINI_HOME` with only the skill folders linked in, so user MCP and instructions don't reach
+    T3 sessions. A custom agent's pickup is unverified.
+  - Warnings: `codex override` when `AGENTS.override.md` shadows `AGENTS.md`; `skill duplicates`
+    when an agent loads one skill name from two folders it reads (for example `~/.claude/skills`
+    and `~/.agents/skills` for Cursor, OpenCode, and Muse); `grok instructions` when Grok loads
+    both its `AGENTS.md` and `~/.claude/CLAUDE.md`; `opencode config` when both OpenCode files
+    exist.
 
 ## 7. Programs (frozen, U7)
 
@@ -1238,7 +1346,7 @@ Automatic updates are required, so they are on by default.
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
-| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes (U1, built) and the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid | foundation; resolution built (U1); template syntax built (U2) | |
+| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes (U1, built) and the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid. Loads with `Loadout::load_guarded` and the active `Context`, and reads each template source through the same source guard (`template::check_all_guarded`) | foundation; resolution built (U1); template syntax built (U2); guarded load (U5) | |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
 | `loadout status [--json]`: ownership records with drift, runs with interrupted ones; exit 4 when not healthy; never writes | built | U3 |
@@ -1288,6 +1396,8 @@ pub enum Use<'a> { Write, WriteInto, KeyMerge(Merge<'a>) }   // Merge { map, for
 // Entry { anchor, path, kind, merge: Option<Merge<'static>> }: shared-config entries carry their known MCP map
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
 pub fn check_path(context: &Context, loadout: &Path, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; `loadout` = active checkout root; normalizes both sides itself
+pub fn check_source(context: &Context, loadout: &Path, path: &Path) -> Option<Conflict>; // U5 sources: auth always; other kinds unless the same entry holds the checkout
+pub fn check_source_file(context: &Context, loadout: &Path, reached: &Path, real: &Path) -> Option<Conflict>; // both identities of one file
 pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only
 pub enum Conflict { Reserved { entry: Entry, reserved: String }, Unverifiable { path: PathBuf, error: String } }
 
@@ -1299,7 +1409,12 @@ pub struct Diagnostics(..);              // push, extend, has_errors, count, ite
 pub struct Check { pub name: String, pub status: CheckStatus, pub detail: String }   // Pass | Info | Warn | Fail
 
 // manifest (foundation)
-impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warnings */), Diagnostics>; }
+impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warnings */), Diagnostics>; }   // context-free: synthetic/test use only
+impl Loadout { pub fn load_guarded(root: &Path, context: &Context) -> Result<(Loadout, Diagnostics), Diagnostics>; } // every host command; source policy before each manifest/pointer open
+pub type Guard<'a> = dyn Fn(&Path, &Path) -> Result<(), String> + 'a;   // (reached, canonical) -> refusal
+pub fn source_guard<'a>(context: &'a Context, checkout: &'a Path) -> impl Fn(&Path, &Path) -> Result<(), String> + 'a; // the one host guard: check_source_file on both identities
+pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String>;   // canonical root; validate's Git metadata identification (unguarded)
+pub fn git_metadata_guarded(root: &Path, guard: &dyn Fn(&Path, &Path) -> Result<(), String>) -> Result<Vec<PathBuf>, String>; // guard(reached, canonical) runs before each pointer open; agents passes check_source
 // Loadout { root, machines: BTreeMap<String, MachineEntry>, layers: Vec<LayerFile { scope: Scope, file, layer: Layer }> }
 // Scope::{Global, Os(Os), Tag(String), Machine(String)}; layers come global, os, tags, machines, each sorted by name
 
@@ -1316,7 +1431,8 @@ pub struct Error { pub file: PathBuf, pub line: Option<usize>, pub problem: Prob
 pub enum Problem { Syntax(String), Missing(String /* variable */), Render(String), Home(PathBuf) }
 pub fn render(file: &Path, source: &str, variables: &BTreeMap<String, Variable>, facts: &Facts) -> Result<String, template::Error>;
 pub fn check(file: &Path, source: &str) -> Result<(), template::Error>;   // syntax only; no variables needed
-pub fn check_all(loadout: &Loadout) -> Diagnostics;                       // validate: every .tmpl user-file source, read confined
+pub fn check_all_guarded(loadout: &Loadout, context: &Context) -> Diagnostics; // validate: every .tmpl user-file source; source_guard before each open
+pub fn check_all(loadout: &Loadout) -> Diagnostics;                       // context-free: confined but no host policy; synthetic/test use only
 
 // mcp (U6, built). The frozen path read/write became byte functions plus a guarded read; see section 6.
 pub type Servers = BTreeMap<String, serde_json::Value>;
@@ -1325,10 +1441,11 @@ pub fn parse(bytes: &[u8], format: McpFormat, pointer: &str) -> Result<Servers, 
 pub fn edit(bytes: &[u8], format: McpFormat, pointer: &str, shape: McpShape, set: &Servers, remove: &[String]) -> Result<Vec<u8>, mcp::Error>; // new bytes; preserves everything else
 pub fn read(context: &Context, loadout: &Path, file: &Path, format: McpFormat, pointer: &str, shape: McpShape) -> Result<Servers, mcp::Error>; // check_path(KeyMerge) before any open
 pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::Lock>, mcp::Error>; // Some only for Grok's config.toml
-// Follow-up (U3/U4): plan::Target::Entry needs `shape: McpShape` so state can run the exact KeyMerge check and call edit.
+// plan::Target::Entry carries `shape: McpShape` (U5) so state runs the exact KeyMerge check and calls edit with it.
 
-// agents (U5)
-pub fn materialize(resolved: &Resolved, facts: &Facts, context: &Context) -> Result<(Vec<Desired>, Vec<Action /* unsupported */>), agents::Error>;
+// agents (built, U5). `facts` was dropped (context is the one OS input) and `loadout`, the active checkout, added.
+pub fn materialize(resolved: &Resolved, context: &Context, loadout: &Path) -> Result<(Vec<Desired>, Vec<Action /* Change::Unsupported */>), agents::Error>;
+pub enum Error { Invalid(Diagnostics) }                          // source or collision problems; exit 3, nothing written
 pub fn checks(context: &Context) -> Vec<Check>;
 
 // programs (U7)
@@ -1362,7 +1479,12 @@ pub fn runs(context: &Context) -> Result<Vec<RunSummary>, state::Error>;
 // targets must lie under the target roots (Error::OutsideRoots). plan types gained Deserialize.
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
+// Target::{Path, Entry { .., shape }, Program, None}; Action::unsupported(item, target, reason) builds prior Absent, no content
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
+// U4 contract: the checkout is loaded with Loadout::load_guarded(loadout, context), never Loadout::load, then resolve,
+// check_targets, and agents::materialize(resolved, context, loadout), which re-runs the guarded pointer detection itself.
+// U4/U8 contract: every user-file and template source is read under manifest::source_guard before render(); template::render
+// and check take text and never read. Where the shared guarded reader lives is decided with U4; never re-read through check_all.
 // `loadout` = the active checkout root (default clone or --loadout DIR); passed to every reserved::check_path call
 // apply (U4)
 pub fn run(plan: &Plan, context: &Context, loadout: &Path, options: Options) -> Result<Report, apply::Error>; // re-checks reserved paths before each backup and write

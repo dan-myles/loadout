@@ -266,7 +266,7 @@ impl McpFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum McpShape {
     ClaudeJson,

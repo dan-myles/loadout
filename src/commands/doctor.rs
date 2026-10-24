@@ -2,6 +2,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::agents;
 use crate::cli::Exit;
 use crate::context::{self, Context};
 use crate::diagnostic::{Check, CheckStatus};
@@ -23,7 +24,7 @@ struct Report<'a> {
 }
 
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
-    let checks: Vec<Check> = [foundation(context)].concat();
+    let checks: Vec<Check> = [foundation(context), agents::checks(context)].concat();
 
     let healthy = checks.iter().all(|check| check.status != CheckStatus::Fail);
     if args.json {

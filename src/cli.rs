@@ -63,7 +63,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
     let context = Context::from_env()?;
     match cli.command {
         Command::Doctor(args) => doctor::run(&args, &context),
-        Command::Validate(args) => validate::run(&args),
+        Command::Validate(args) => validate::run(&args, &context),
         Command::Status(args) => status::run(&args, &context),
         Command::Rollback(args) => rollback::run(&args, &context),
     }

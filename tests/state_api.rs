@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use loadout::context::Context;
-use loadout::manifest::McpFormat;
+use loadout::manifest::{McpFormat, McpShape};
 use loadout::plan::{
     Action, Change, Content, FileContent, ItemKind, ItemRef, Observed, Plan, Target,
 };
@@ -628,6 +628,7 @@ fn mcp_entries_are_refused_until_the_mcp_module_lands() {
         format: McpFormat::Json,
         pointer: "/mcpServers".to_owned(),
         key: "github".to_owned(),
+        shape: McpShape::CursorJson,
     };
     let error = state::observe(&machine.context, &machine.loadout, &entry).unwrap_err();
     assert!(matches!(error, Error::EntryNeedsMcp { .. }), "{error}");
@@ -1630,4 +1631,128 @@ fn a_target_outside_every_spelling_of_home_is_refused_untouched() {
     )]
     permissions.set_readonly(false);
     fs::set_permissions(&outside, permissions).unwrap();
+}
+
+fn unsupported_none() -> Action {
+    Action::unsupported(
+        ItemRef {
+            kind: ItemKind::Instructions,
+            id: "global".to_owned(),
+            agent: Some("cursor".to_owned()),
+        },
+        Target::None,
+        "Cursor keeps User Rules in its app settings, not in a file".to_owned(),
+    )
+}
+
+fn forged_none() -> Action {
+    Action {
+        change: Change::Create,
+        content: Some(file("x", false)),
+        ..unsupported_none()
+    }
+}
+
+#[test]
+fn begin_refuses_any_none_target_before_the_state_root_is_touched() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    let ordinary = machine.action(&path, file("x", false));
+    for actions in [
+        vec![unsupported_none()],
+        vec![forged_none()],
+        vec![ordinary.clone(), unsupported_none()],
+    ] {
+        let lock = state::lock(&machine.context).unwrap();
+        let state = State::load(&machine.context).unwrap();
+        let error = Run::begin(
+            &machine.context,
+            &machine.loadout,
+            lock,
+            &state,
+            &Plan { actions },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::NoTarget { operation: "begin" }),
+            "{error}"
+        );
+        assert!(
+            !machine.context.state.join("runs").exists(),
+            "no run folder or journal is created after the refusal"
+        );
+        assert!(!machine.context.state.join("state.json").exists());
+        assert!(!path.exists());
+    }
+
+    let run = machine.apply(&path, &file("x", false));
+    assert_eq!(read(&path), "x", "an ordinary path plan still runs");
+    assert!(machine.run_dir(&run).join("journal.json").is_file());
+}
+
+#[test]
+fn observe_write_and_remove_refuse_a_none_target_without_file_system_access() {
+    let machine = Machine::new();
+    let error = state::observe(&machine.context, &machine.loadout, &Target::None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::NoTarget {
+                operation: "observe"
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(state::label(&Target::None), "no target");
+
+    let path = machine.path(".gitconfig");
+    let content = file("x", false);
+    let action = machine.action(&path, content.clone());
+    let mut run = machine.begin(vec![action.clone()]);
+    for none in [unsupported_none(), forged_none()] {
+        let error = run.write(&none, &content).unwrap_err();
+        assert!(
+            matches!(error, Error::NoTarget { operation: "write" }),
+            "{error}"
+        );
+        let error = run.remove(&none).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::NoTarget {
+                    operation: "remove"
+                }
+            ),
+            "{error}"
+        );
+    }
+    assert!(!path.exists(), "the refusals wrote nothing");
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    run.finish(&mut state).unwrap();
+    assert_eq!(read(&path), "x", "the ordinary action still writes");
+}
+
+#[test]
+fn a_none_target_in_the_state_file_or_a_journal_is_invalid() {
+    let machine = Machine::new();
+    let path = machine.path(".gitconfig");
+    let run = machine.apply(&path, &file("x", false));
+
+    let state_file = machine.context.state.join("state.json");
+    let original = fs::read(&state_file).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    tampered["records"][0]["target"] = json!({ "type": "none" });
+    fs::write(&state_file, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let error = State::load(&machine.context).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert!(error.to_string().contains("no target"), "{error}");
+    fs::write(&state_file, original).unwrap();
+
+    machine.edit_journal(&run, |journal| {
+        journal["entries"][0]["target"] = json!({ "type": "none" });
+    });
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::Invalid { .. }), "{error}");
+    assert_eq!(read(&path), "x", "the destination is untouched");
 }

@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::Context;
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::platform::Os;
+use crate::reserved;
 
 pub use crate::id::is_id;
+pub use check::{git_metadata, git_metadata_guarded};
 pub use schema::*;
 
 pub const ROOT_FILE: &str = "loadout.toml";
@@ -42,17 +45,47 @@ pub struct Loadout {
     pub layers: Vec<LayerFile>,
 }
 
+/// Sees each checkout file a reader is about to open (a manifest, a Git pointer, or a template
+/// source), as reached and as its canonical file, and refuses it with a message instead.
+pub type Guard<'a> = dyn Fn(&Path, &Path) -> Result<(), String> + 'a;
+
+/// The host's guard for checkout content: `reserved::check_source_file` with `context`, on the file
+/// as reached and as its canonical file. `checkout` is the canonical checkout root. Every reader of
+/// checkout content on a real host (manifests, Git pointers, template sources) runs it before the
+/// open.
+pub fn source_guard<'a>(
+    context: &'a Context,
+    checkout: &'a Path,
+) -> impl Fn(&Path, &Path) -> Result<(), String> + 'a {
+    move |reached: &Path, real: &Path| match reserved::check_source_file(
+        context, checkout, reached, real,
+    ) {
+        Some(conflict) => {
+            let shown = reached.strip_prefix(checkout).unwrap_or(reached);
+            Err(format!("{} {}", shown.display(), conflict.message()))
+        }
+        None => Ok(()),
+    }
+}
+
 impl Loadout {
+    /// Context-free: manifests and Git metadata are confined to the checkout, but the host's
+    /// reserved-destination policy is not applied, so a checkout file aliasing an auth store
+    /// would be opened. For synthetic and test use only; a command on a real host loads with
+    /// [`Loadout::load_guarded`].
     pub fn load(root: &Path) -> Result<(Loadout, Diagnostics), Diagnostics> {
-        let mut diagnostics = Diagnostics::default();
-        let loadout = read(root, &mut diagnostics);
-        if let Some(loadout) = &loadout {
-            diagnostics.extend(check::check(loadout));
-        }
-        match loadout {
-            Some(loadout) if !diagnostics.has_errors() => Ok((loadout, diagnostics)),
-            _ => Err(diagnostics),
-        }
+        load_with(root, &|_, _| Ok(()))
+    }
+
+    /// For a real host (validate, plan): every manifest and Git pointer file passes
+    /// `reserved::check_source_file` with `context` before it is opened. `context` decides only
+    /// what may be read; resolution stays machine-independent.
+    pub fn load_guarded(
+        root: &Path,
+        context: &Context,
+    ) -> Result<(Loadout, Diagnostics), Diagnostics> {
+        let checkout = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        load_with(root, &source_guard(context, &checkout))
     }
 
     pub fn layer(&self, scope: &Scope) -> Option<&Layer> {
@@ -103,7 +136,7 @@ struct RootFile {
     programs: BTreeMap<String, ProgramPatch>,
 }
 
-fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
+fn read(root: &Path, guard: &Guard<'_>, diagnostics: &mut Diagnostics) -> Option<Loadout> {
     let error = |file: Option<PathBuf>, message: String| Diagnostic {
         severity: Severity::Error,
         file,
@@ -121,7 +154,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
         }
     };
     let root_file = PathBuf::from(ROOT_FILE);
-    let parsed: RootFile = parse(&real_root, &root_file, diagnostics)?;
+    let parsed: RootFile = parse(&real_root, &root_file, guard, diagnostics)?;
     match &parsed.loadout {
         None => diagnostics.push(error(
             Some(root_file.clone()),
@@ -162,7 +195,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
             ));
             continue;
         };
-        if let Some(layer) = parse(&real_root, &file, diagnostics) {
+        if let Some(layer) = parse(&real_root, &file, guard, diagnostics) {
             layers.push(LayerFile {
                 scope: Scope::Os(os),
                 file,
@@ -182,7 +215,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
                 ));
                 continue;
             }
-            if let Some(layer) = parse(&real_root, &file, diagnostics) {
+            if let Some(layer) = parse(&real_root, &file, guard, diagnostics) {
                 layers.push(LayerFile {
                     scope: scope(name),
                     file,
@@ -197,6 +230,18 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
         machines: parsed.machines,
         layers,
     })
+}
+
+fn load_with(root: &Path, guard: &Guard<'_>) -> Result<(Loadout, Diagnostics), Diagnostics> {
+    let mut diagnostics = Diagnostics::default();
+    let loadout = read(root, guard, &mut diagnostics);
+    if let Some(loadout) = &loadout {
+        diagnostics.extend(check::check(loadout, guard));
+    }
+    match loadout {
+        Some(loadout) if !diagnostics.has_errors() => Ok((loadout, diagnostics)),
+        _ => Err(diagnostics),
+    }
 }
 
 const IGNORED: [&str; 2] = [".DS_Store", ".gitkeep"];
@@ -277,6 +322,7 @@ fn layer_files(root: &Path, dir: &str, diagnostics: &mut Diagnostics) -> Vec<(St
 fn parse<T: for<'de> Deserialize<'de>>(
     root: &Path,
     file: &Path,
+    guard: &Guard<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Option<T> {
     let mut problem = |message: String| {
@@ -300,6 +346,10 @@ fn parse<T: for<'de> Deserialize<'de>>(
     };
     if !fs::metadata(&real).is_ok_and(|metadata| metadata.is_file()) {
         problem("must be a regular file".to_owned());
+        return None;
+    }
+    if let Err(message) = guard(&root.join(file), &real) {
+        problem(message);
         return None;
     }
     let text = match fs::read_to_string(real) {

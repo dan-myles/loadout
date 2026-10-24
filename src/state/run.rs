@@ -7,7 +7,7 @@ use super::disk::{self, Disk, Mode, Node, Planned, Put};
 use super::journal::{self, Backup, BackupKind, Entry, Journal, Status, Step};
 use super::{
     Error, Lock, Record, State, check_reserved, clean_absolute, digest, label, observed, path_of,
-    tree_files, valid_observed, within_roots,
+    refuse_none, tree_files, valid_observed, within_roots,
 };
 use crate::context::Context;
 use crate::plan::{Action, Change, Content, Observed, Plan, Target};
@@ -61,6 +61,9 @@ impl Run {
         state: &State,
         plan: &Plan,
     ) -> Result<Run, Error> {
+        for action in &plan.actions {
+            refuse_none(&action.target, "begin")?;
+        }
         let root = disk::state_root(context)?;
         if root != lock.state {
             return Err(Error::WrongLock {
@@ -163,6 +166,7 @@ impl Run {
     /// The safe write in architecture section 5. The target is re-observed first; if it no
     /// longer matches the plan's `prior`, this returns `Error::Changed` and writes nothing.
     pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), Error> {
+        refuse_none(&action.target, "write")?;
         let index = self.entry(action, false)?;
         let path = path_of(&action.target)?.to_path_buf();
         if matches!(content, Content::Entry(_)) {
@@ -201,6 +205,7 @@ impl Run {
     /// Deletes an owned target the loadout no longer declares, after backing it up. A target
     /// that drifted from its record, or is already gone, is released instead and left in place.
     pub fn remove(&mut self, action: &Action) -> Result<Removal, Error> {
+        refuse_none(&action.target, "remove")?;
         let index = self.entry(action, true)?;
         let path = path_of(&action.target)?.to_path_buf();
         let Some(record) = self.journal.entries[index].record.clone() else {

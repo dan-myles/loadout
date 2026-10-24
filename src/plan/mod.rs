@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{Manager, McpFormat};
+use crate::manifest::{Manager, McpFormat, McpShape};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,11 +33,15 @@ pub enum Target {
         format: McpFormat,
         pointer: String,
         key: String,
+        shape: McpShape,
     },
     Program {
         manager: Manager,
         package: String,
     },
+    /// Only for an unsupported action whose item has no destination on this machine, such as
+    /// Cursor instructions. Never observed, owned, backed up, journaled, or written.
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +98,19 @@ pub struct Action {
     pub content: Option<Content>,
 }
 
+impl Action {
+    /// The one shape an unsupported action takes: nothing was observed and nothing is written.
+    pub fn unsupported(item: ItemRef, target: Target, reason: String) -> Self {
+        Self {
+            item,
+            target,
+            change: Change::Unsupported(reason),
+            prior: Observed::Absent,
+            content: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Plan {
     pub actions: Vec<Action>,
@@ -132,5 +149,36 @@ mod tests {
         assert_eq!(json["prior"]["sha256"], "ab".repeat(32));
         assert!(json.get("content").is_none());
         assert!(!json.to_string().contains("secret-looking"));
+    }
+
+    #[test]
+    fn an_entry_target_names_its_shape_and_a_missing_destination_is_none() {
+        let entry = Target::Entry {
+            file: PathBuf::from("/h/.pi/agent/mcp.json"),
+            format: McpFormat::Json,
+            pointer: "/mcpServers".to_owned(),
+            key: "docs".to_owned(),
+            shape: McpShape::PiJson,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["type"], "entry");
+        assert_eq!(json["shape"], "pi-json");
+        assert_eq!(json["format"], "json");
+
+        let action = Action::unsupported(
+            ItemRef {
+                kind: ItemKind::Instructions,
+                id: "global".to_owned(),
+                agent: Some("cursor".to_owned()),
+            },
+            Target::None,
+            "no file".to_owned(),
+        );
+        assert_eq!(action.prior, Observed::Absent);
+        assert!(action.content.is_none());
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["target"], serde_json::json!({ "type": "none" }));
+        assert_eq!(json["change"], "unsupported");
+        assert_eq!(json["reason"], "no file");
     }
 }

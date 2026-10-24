@@ -13,9 +13,10 @@ use minijinja::machinery::{self, CodeGenerator};
 use minijinja::syntax::SyntaxConfig;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 
+use crate::context::Context;
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::machine::Facts;
-use crate::manifest::{Loadout, Variable};
+use crate::manifest::{self, Guard, Loadout, Variable};
 
 pub const SUFFIX: &str = ".tmpl";
 
@@ -117,9 +118,22 @@ pub fn render(
     }
 }
 
-/// Syntax-checks every `.tmpl` source a user file names, in any layer. Call it only on a loadout
-/// that `Loadout::load` accepted: that is what confines each source before its content is read.
+/// Syntax-checks every `.tmpl` source a user file names, in any layer. Context-free: each source is
+/// confined to the checkout, but the host's reserved-destination policy is not applied, so a
+/// template aliasing an auth store would be opened. For synthetic and test use only; validate on a
+/// real host calls [`check_all_guarded`].
 pub fn check_all(loadout: &Loadout) -> Diagnostics {
+    check_all_with(loadout, &|_, _| Ok(()))
+}
+
+/// [`check_all`] for a real host: each source also passes `manifest::source_guard` with `context`,
+/// as reached and as its canonical file, before it is opened. Call it only on a loadout that
+/// `Loadout::load_guarded` accepted with the same `context`.
+pub fn check_all_guarded(loadout: &Loadout, context: &Context) -> Diagnostics {
+    check_all_with(loadout, &manifest::source_guard(context, &loadout.root))
+}
+
+fn check_all_with(loadout: &Loadout, guard: &Guard<'_>) -> Diagnostics {
     let sources: BTreeSet<&str> = loadout
         .layers
         .iter()
@@ -130,7 +144,7 @@ pub fn check_all(loadout: &Loadout) -> Diagnostics {
     let mut diagnostics = Diagnostics::default();
     for source in sources {
         let file = Path::new(source);
-        let problem = match read(&loadout.root, file) {
+        let problem = match read(&loadout.root, file, guard) {
             Ok(text) => check(file, &text).err().map(|error| match error.line {
                 Some(line) => format!("line {line}: {}", error.problem),
                 None => error.problem.to_string(),
@@ -149,9 +163,9 @@ pub fn check_all(loadout: &Loadout) -> Diagnostics {
     diagnostics
 }
 
-fn read(root: &Path, file: &Path) -> Result<String, String> {
-    let real = root
-        .join(file)
+fn read(root: &Path, file: &Path, guard: &Guard<'_>) -> Result<String, String> {
+    let reached = root.join(file);
+    let real = reached
         .canonicalize()
         .map_err(|error| format!("cannot read: {error}"))?;
     if !real.starts_with(root) {
@@ -160,6 +174,7 @@ fn read(root: &Path, file: &Path) -> Result<String, String> {
     if !fs::metadata(&real).is_ok_and(|metadata| metadata.is_file()) {
         return Err("must be a regular file".to_owned());
     }
+    guard(&reached, &real)?;
     let bytes = fs::read(&real).map_err(|error| format!("cannot read: {error}"))?;
     String::from_utf8(bytes).map_err(|_| "a template must be UTF-8 text".to_owned())
 }
@@ -277,4 +292,97 @@ fn undefined_name(detail: &str) -> Option<&str> {
     let end = detail.find("` is undefined")?;
     let start = detail[..end].rfind('`')? + 1;
     Some(&detail[start..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    const ROOT: &str = "[loadout]\nversion = 1\n\n\
+        [files.a]\nsource = \"files/a.tmpl\"\ntarget = \"~/a\"\n\n\
+        [files.b]\nsource = \"files/b.tmpl\"\ntarget = \"~/b\"\n\n\
+        [files.again]\nsource = \"files/a.tmpl\"\ntarget = \"~/again\"\n\n\
+        [files.plain]\nsource = \"files/plain\"\ntarget = \"~/plain\"\n";
+
+    fn write(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    fn loadout(files: &[(&str, &str)]) -> (tempfile::TempDir, Loadout) {
+        let dir = write(files);
+        let (loadout, _) = Loadout::load(dir.path()).unwrap();
+        (dir, loadout)
+    }
+
+    #[test]
+    fn the_guard_sees_each_template_source_once_before_it_is_read() {
+        let (_dir, loadout) = loadout(&[
+            ("loadout.toml", ROOT),
+            ("files/a.tmpl", "{{ x }}\n"),
+            ("files/b.tmpl", "{% if %}\n"),
+            ("files/plain", "{% if %}\n"),
+        ]);
+        let seen = RefCell::new(Vec::new());
+        let guarded = check_all_with(&loadout, &|reached, real| {
+            seen.borrow_mut()
+                .push((reached.to_path_buf(), real.to_path_buf()));
+            Ok(())
+        });
+        let a = loadout.root.join("files/a.tmpl");
+        let b = loadout.root.join("files/b.tmpl");
+        assert_eq!(seen.into_inner(), [(a.clone(), a), (b.clone(), b)]);
+        assert_eq!(guarded, check_all(&loadout));
+        assert_eq!(guarded.count(Severity::Error), 1, "{guarded:?}");
+    }
+
+    #[test]
+    fn a_refused_template_is_never_read() {
+        let (_dir, loadout) = loadout(&[
+            ("loadout.toml", ROOT),
+            ("files/a.tmpl", "{% if %}\n"),
+            ("files/b.tmpl", "{{ x }}\n"),
+            ("files/plain", "plain\n"),
+        ]);
+        let diagnostics = check_all_with(&loadout, &|reached, _| {
+            if reached.ends_with("a.tmpl") {
+                Err("files/a.tmpl refused".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let refused: Vec<&Diagnostic> = diagnostics.iter().collect();
+        assert_eq!(refused.len(), 1, "{diagnostics:?}");
+        assert_eq!(refused[0].file.as_deref(), Some(Path::new("files/a.tmpl")));
+        assert_eq!(refused[0].message, "files/a.tmpl refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_sees_an_alias_as_reached_and_as_its_canonical_file() {
+        let dir = write(&[
+            ("loadout.toml", ROOT),
+            ("files/real.tmpl", "{{ x }}\n"),
+            ("files/b.tmpl", "{{ x }}\n"),
+            ("files/plain", "plain\n"),
+        ]);
+        std::os::unix::fs::symlink("real.tmpl", dir.path().join("files/a.tmpl")).unwrap();
+        let (loadout, _) = Loadout::load(dir.path()).unwrap();
+        let seen = RefCell::new(Vec::new());
+        check_all_with(&loadout, &|reached, real| {
+            seen.borrow_mut()
+                .push((reached.to_path_buf(), real.to_path_buf()));
+            Ok(())
+        });
+        let alias = loadout.root.join("files/a.tmpl");
+        let real = loadout.root.join("files/real.tmpl");
+        assert_eq!(seen.into_inner()[0], (alias, real));
+    }
 }

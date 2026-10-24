@@ -300,6 +300,7 @@ fn writes(
             path: file.target.clone(),
             file: layer.map(Path::to_path_buf),
             rank: rank(*layer),
+            merge: None,
         })
         .collect();
     for agent in agents {
@@ -310,13 +311,14 @@ fn writes(
         let rank = rank(file.as_deref());
         let key = format!("agents.custom.{id}");
         let reaches = |agents: &Vec<String>| agents.contains(id);
-        let mut push = |owner: String, key: String, path: String| {
+        let mut push = |owner: String, key: String, path: String, merge| {
             writes.push(Write {
                 owner,
                 key,
                 path,
                 file: file.clone(),
                 rank,
+                merge,
             });
         };
         if let Some(dir) = declaration
@@ -329,6 +331,7 @@ fn writes(
                     format!("skills.{skill} for {id}"),
                     format!("{key}.skills.{}", facts.os),
                     format!("{dir}/{skill}"),
+                    None,
                 );
             }
         }
@@ -344,18 +347,18 @@ fn writes(
                 format!("instructions.{item} for {id}"),
                 format!("{key}.instructions.{}", facts.os),
                 path.to_owned(),
+                None,
             );
         }
-        if let Some(path) = declaration
-            .mcp
-            .as_ref()
-            .and_then(|declared| declared.paths().get(facts.os).map(str::to_owned))
+        if let Some(declared) = &declaration.mcp
+            && let Some(path) = declared.paths().get(facts.os).map(str::to_owned)
             && mcp.values().any(|server| reaches(&server.agents))
         {
             push(
                 format!("the MCP servers for {id}"),
                 format!("{key}.mcp.{}", facts.os),
                 path,
+                Some(declared.format),
             );
         }
     }
