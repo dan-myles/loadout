@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::platform::Os;
 
+pub use check::git_metadata;
 pub use crate::id::is_id;
 pub use schema::*;
 

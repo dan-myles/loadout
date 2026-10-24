@@ -718,7 +718,8 @@ fn names_git(path: &Path) -> bool {
 
 const MAX_GIT_POINTER: u64 = 4096;
 
-fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
+/// `root` must be canonical. Returns every canonical path that is the loadout's Git metadata.
+pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let dot = root.join(GIT_DIR);
     match fs::symlink_metadata(&dot) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
