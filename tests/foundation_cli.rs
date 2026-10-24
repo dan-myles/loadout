@@ -1157,6 +1157,104 @@ fn a_worktree_admin_dir_reserves_its_common_dir_in_every_form() {
     assert!(text.contains("unsupported Git metadata layout"), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn git_pointers_outside_the_loadout_are_refused_without_being_opened() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let outside = scratch.join("home/.codex");
+    fs::create_dir_all(&outside).unwrap();
+    let fifo = outside.join("auth.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let validate = |root: &Path| {
+        let sandbox = Sandbox::new();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+        command
+            .args(["validate", root.to_str().unwrap()])
+            .env("LOADOUT_HOME", &sandbox.home)
+            .env("LOADOUT_STATE_DIR", &sandbox.state);
+        let output = run_with_deadline(command);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let case = |name: &str| {
+        let root = scratch.join(name);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+        root
+    };
+
+    let dot = case("dot-link");
+    symlink(&fifo, dot.join(".git")).unwrap();
+    let (code, text) = validate(&dot);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("resolves outside the loadout, which loadout never reads"),
+        "{text}"
+    );
+
+    let common = case("commondir-link");
+    fs::create_dir(common.join("admin")).unwrap();
+    fs::write(common.join(".git"), "gitdir: admin\n").unwrap();
+    symlink(&fifo, common.join("admin/commondir")).unwrap();
+    let (code, text) = validate(&common);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("resolves outside the loadout, which loadout never reads"),
+        "{text}"
+    );
+
+    let pointer_dir = scratch.join("outside-meta");
+    fs::create_dir_all(&pointer_dir).unwrap();
+    fs::write(
+        scratch.join("outside-pointer"),
+        format!("gitdir: {}\n", pointer_dir.display()),
+    )
+    .unwrap();
+    let generic = case("generic-outside-pointer");
+    symlink(scratch.join("outside-pointer"), generic.join(".git")).unwrap();
+    let (code, text) = validate(&generic);
+    assert_eq!(
+        code, 3,
+        "a valid-looking outside pointer is still never read: {text}"
+    );
+
+    let inside = case("inside-pointer-link");
+    fs::create_dir(inside.join("meta")).unwrap();
+    fs::write(inside.join("pointer"), "gitdir: meta\n").unwrap();
+    symlink(inside.join("pointer"), inside.join(".git")).unwrap();
+    let (code, text) = validate(&inside);
+    assert_eq!(
+        code, 0,
+        "a pointer link inside the loadout stays readable: {text}"
+    );
+
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let worktree = scratch.join("worktree");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::write(worktree.join("loadout.toml"), "[loadout]\nversion = 1\n").unwrap();
+    let (code, text) = validate(&worktree);
+    assert_eq!(code, 0, "an ordinary worktree checkout stays valid: {text}");
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

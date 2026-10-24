@@ -728,35 +728,62 @@ fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let real = dot
         .canonicalize()
         .map_err(|error| format!("cannot resolve .git: {error}"))?;
+    if !real.starts_with(root) {
+        return unsupported(
+            &dot,
+            "it resolves outside the loadout, which loadout never reads",
+        );
+    }
     let (gitdir, mut metadata) = if real.is_dir() {
         (real.clone(), vec![real])
     } else {
-        let gitdir = git_pointer(&real, "gitdir: ")?;
+        let gitdir = git_pointer(root, &real, "gitdir: ")?;
         (gitdir.clone(), vec![real, gitdir])
     };
+    if !gitdir.starts_with(root) {
+        return Ok(metadata);
+    }
     let common = gitdir.join("commondir");
     match fs::symlink_metadata(&common) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot inspect {}: {error}", common.display())),
-        Ok(_) => metadata.push(git_pointer(&common, "")?),
+        Ok(_) => {
+            let real = common
+                .canonicalize()
+                .map_err(|error| format!("cannot resolve {}: {error}", common.display()))?;
+            if !real.starts_with(root) {
+                return unsupported(
+                    &common,
+                    "it resolves outside the loadout, which loadout never reads",
+                );
+            }
+            metadata.push(git_pointer(root, &real, "")?);
+        }
     }
     Ok(metadata)
 }
 
-fn git_pointer(file: &Path, prefix: &str) -> Result<PathBuf, String> {
-    let unsupported = |why: &str| {
-        Err(format!(
-            "unsupported Git metadata layout at {}: {why}; loadout will not certify it",
-            file.display()
-        ))
-    };
+fn unsupported<T>(file: &Path, why: &str) -> Result<T, String> {
+    Err(format!(
+        "unsupported Git metadata layout at {}: {why}; loadout will not certify it",
+        file.display()
+    ))
+}
+
+fn git_pointer(root: &Path, file: &Path, prefix: &str) -> Result<PathBuf, String> {
+    if !file.starts_with(root) {
+        return unsupported(
+            file,
+            "it resolves outside the loadout, which loadout never reads",
+        );
+    }
     match fs::metadata(file) {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_GIT_POINTER => {}
-        Ok(_) => return unsupported("not a small regular pointer file"),
-        Err(error) => return unsupported(&error.to_string()),
+        Ok(_) => return unsupported(file, "not a small regular pointer file"),
+        Err(error) => return unsupported(file, &error.to_string()),
     }
     let Ok(text) = fs::read_to_string(file) else {
-        return unsupported("not readable as text");
+        return unsupported(file, "not readable as text");
     };
     let Some(target) = text
         .lines()
@@ -765,12 +792,12 @@ fn git_pointer(file: &Path, prefix: &str) -> Result<PathBuf, String> {
         .map(str::trim)
         .filter(|target| !target.is_empty())
     else {
-        return unsupported("no pointer line");
+        return unsupported(file, "no pointer line");
     };
     let base = file.parent().unwrap_or(Path::new("/"));
     match base.join(target).canonicalize() {
         Ok(dir) if dir.is_dir() => Ok(dir),
-        _ => unsupported("its pointer does not name a folder"),
+        _ => unsupported(file, "its pointer does not name a folder"),
     }
 }
 
