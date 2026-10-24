@@ -6,8 +6,9 @@ use super::schema::{
     McpFormat, McpPatch, OneOrMany, PerOs, Value,
 };
 use super::{LayerFile, Loadout, Scope, is_id};
-use crate::context::split_base;
+use crate::context::{split_base, windows_problem};
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
+use crate::platform::Os;
 
 const TEMPLATE_SUFFIX: &str = ".tmpl";
 const SKILL_FILE: &str = "SKILL.md";
@@ -40,6 +41,24 @@ struct Checker {
     custom: BTreeSet<String>,
     diagnostics: Diagnostics,
     file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Never,
+    Possible,
+    Certain,
+}
+
+fn windows_reach(scope: &Scope, when: Option<&Condition>) -> Reach {
+    let os = when.and_then(|condition| condition.os.as_ref());
+    match (scope, os) {
+        (Scope::Os(Os::Windows), _) => Reach::Certain,
+        (Scope::Os(_), _) => Reach::Never,
+        (_, Some(os)) if !os.contains(&Os::Windows) => Reach::Never,
+        (_, Some(os)) if os.values().iter().all(|os| *os == Os::Windows) => Reach::Certain,
+        _ => Reach::Possible,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -166,7 +185,8 @@ impl Checker {
                 self.source(&format!("{key}.source"), source, Source::File);
             }
             if let Some(target) = &item.target {
-                self.target(&format!("{key}.target"), target);
+                let reach = windows_reach(&file.scope, item.when.as_ref());
+                self.target(&format!("{key}.target"), target, reach);
                 if let Some(other) = targets.insert(target.clone(), id.clone()) {
                     self.error(
                         format!("{key}.target"),
@@ -329,12 +349,24 @@ impl Checker {
         }
     }
 
-    fn target(&mut self, key: &str, target: &str) {
-        if split_base(target).is_none() {
+    fn target(&mut self, key: &str, target: &str, windows: Reach) {
+        let Some((_, rest)) = split_base(target) else {
             self.error(
                 key,
-                format!("{target:?} must start with ~/ or {{config}}/ and may not contain .. or empty parts"),
+                format!("{target:?} must start with ~/ or {{config}}/ and may not contain .., NUL, or empty parts"),
             );
+            return;
+        };
+        let Some(problem) = windows_problem(rest) else {
+            return;
+        };
+        match windows {
+            Reach::Certain => self.error(key, problem),
+            Reach::Possible => self.warn(
+                key,
+                format!("{problem}; on Windows this target is refused, so override or remove it in os/windows.toml or add a when condition"),
+            ),
+            Reach::Never => {}
         }
     }
 
@@ -461,7 +493,12 @@ impl Checker {
         let mut any = false;
         for (os, path) in paths.paths() {
             any = true;
-            self.target(&format!("{key}.{os}"), path);
+            let reach = if os == Os::Windows {
+                Reach::Certain
+            } else {
+                Reach::Never
+            };
+            self.target(&format!("{key}.{os}"), path, reach);
         }
         if !any {
             self.error(key, "name a path for at least one of macos, linux, windows");

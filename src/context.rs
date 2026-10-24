@@ -99,6 +99,9 @@ impl Context {
 
     pub fn expand(&self, path: &str) -> Option<PathBuf> {
         let (base, rest) = split_base(path)?;
+        if self.os == Os::Windows && windows_problem(rest).is_some() {
+            return None;
+        }
         let base = match base {
             Base::Home => &self.home,
             Base::Config => &self.config,
@@ -127,11 +130,34 @@ pub fn split_base(path: &str) -> Option<(Base, &str)> {
         None => (Base::Config, path.strip_prefix("{config}/")?),
     };
     let clean = !rest.is_empty()
-        && !rest.contains('\\')
+        && !rest.contains(['\\', '\0'])
         && rest
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..");
     clean.then_some((base, rest))
+}
+
+const WINDOWS_DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+
+pub fn windows_problem(rest: &str) -> Option<String> {
+    rest.split('/').find_map(|part| {
+        let stem = part.split('.').next().unwrap_or_default().trim_end();
+        let numbered = ["COM", "LPT"].iter().any(|prefix| {
+            stem.get(..3).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                && stem.get(3..).is_some_and(|tail| {
+                    matches!(tail, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}")
+                })
+        });
+        if let Some(c) = part.chars().find(|c| "<>:\"|?*".contains(*c) || c.is_control()) {
+            Some(format!("{part:?} contains {c:?}, which Windows paths cannot hold (drive, stream, or reserved character)"))
+        } else if part.ends_with(['.', ' ']) {
+            Some(format!("{part:?} ends with a dot or space, which Windows drops"))
+        } else if numbered || WINDOWS_DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device)) {
+            Some(format!("{part:?} is a Windows device name"))
+        } else {
+            None
+        }
+    })
 }
 
 fn join(base: &Path, parts: &[&str]) -> PathBuf {
@@ -304,6 +330,7 @@ mod tests {
             Some(PathBuf::from("/home/a/.config/Code/User/settings.json"))
         );
         for bad in [
+            "~/a\0b",
             "/etc/passwd",
             "~/../x",
             "~/",
@@ -313,6 +340,40 @@ mod tests {
             "{data}/x",
         ] {
             assert_eq!(context.expand(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn colons_and_device_names_are_fine_on_posix_but_refused_on_windows() {
+        let posix = Context::resolve(Os::Linux, vars(&[]), Some("/home/a".into())).unwrap();
+        let windows = Context::resolve(Os::Windows, vars(&[]), Some("/c/u".into())).unwrap();
+        for path in [
+            "~/C:/Windows/x",
+            "~/foo:bar",
+            "~/NUL",
+            "~/nul.txt",
+            "~/com1",
+            "~/LPT9.log",
+            "~/a?b",
+            "~/trailing.",
+            "~/space ",
+            "{config}/D:/evil",
+        ] {
+            assert!(posix.expand(path).is_some(), "posix keeps {path}");
+            assert_eq!(windows.expand(path), None, "windows refuses {path}");
+        }
+        for path in [
+            "~/.config/nu/config.nu",
+            "~/console",
+            "~/com10",
+            "~/Documents/My Notes.md",
+        ] {
+            assert!(windows.expand(path).is_some(), "windows keeps {path}");
+            assert_eq!(
+                windows_problem(path.split_once('/').unwrap().1),
+                None,
+                "{path}"
+            );
         }
     }
 }

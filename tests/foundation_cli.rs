@@ -264,6 +264,76 @@ fn unknown_keys_and_wrong_types_are_rejected() {
     assert!(text.contains("made-up"), "{text}");
 }
 
+fn validate_tree(files: &[(&str, &str)]) -> (i32, String) {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, text) in files {
+        let path = dir.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap()]);
+    (output.status.code().unwrap(), stdout(&output))
+}
+
+#[test]
+fn nul_in_a_target_is_rejected_everywhere() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[files.x]\nsource = \"f\"\ntarget = \"~/a\\u0000b\"\n",
+        ),
+        ("f", "x"),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("files.x.target"), "{text}");
+}
+
+#[test]
+fn windows_path_rules_apply_only_where_windows_is_reached() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[files.anywhere]\nsource = \"f\"\ntarget = \"~/C:/Windows/x\"\n[files.unix]\nsource = \"f\"\ntarget = \"~/notes:2026\"\nwhen = { os = [\"linux\", \"macos\"] }\n",
+        ),
+        ("f", "x"),
+        (
+            "os/linux.toml",
+            "[files.colon]\nsource = \"f\"\ntarget = \"~/.local/share/a:b\"\n",
+        ),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("warning: files.anywhere.target: \"C:\" contains ':'"),
+        "{text}"
+    );
+    assert!(!text.contains("files.unix"), "{text}");
+    assert!(!text.contains("files.colon"), "{text}");
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[agents.custom.dv]\nevidence = \"e\"\nskills = { windows = \"{config}/D:/evil\", linux = \"~/dv:skills\" }\n",
+        ),
+        ("f", "x"),
+        (
+            "os/windows.toml",
+            "[files.device]\nsource = \"f\"\ntarget = \"~/Documents/NUL.txt\"\n",
+        ),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("error: agents.custom.dv.skills.windows: \"D:\" contains ':'"),
+        "{text}"
+    );
+    assert!(!text.contains("skills.linux"), "{text}");
+    assert!(
+        text.contains(
+            "os/windows.toml: error: files.device.target: \"NUL.txt\" is a Windows device name"
+        ),
+        "{text}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_source_cannot_escape_the_loadout() {

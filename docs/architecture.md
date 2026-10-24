@@ -254,7 +254,8 @@ What validate enforces today, before any machine is known:
 - Every agent named anywhere is built in or declared.
 
 U1 adds the checks that need a machine: an added item that turns out incomplete, cross-layer target
-collisions, and one instructions item per agent.
+collisions, one instructions item per agent, and `windows_problem` on every target that resolves for
+Windows.
 
 ### Conditions
 
@@ -283,10 +284,28 @@ files are rendered.
 
 ### Paths
 
-`target` and custom-agent paths start with `~/` (home) or `{config}/` (the OS user config dir), use
-`/`, and contain no `..` or empty parts. `source` is relative to the loadout root and stays inside
-it. `{config}` is `$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on
-macOS, and `~\AppData\Roaming` on Windows.
+`target` and custom-agent paths start with `~/` (home) or `{config}/` (the OS user config dir).
+They use `/`, and contain no `\`, `..`, `.`, empty parts, or NUL on any OS (`context::split_base`).
+`{config}` is `$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on macOS,
+and `~\AppData\Roaming` on Windows.
+
+**Windows rules** (`context::windows_problem`) cover what a Windows join would otherwise reinterpret:
+
+- a part holding `<>:"|?*` or a control character (this catches drive letters such as `C:` and
+  alternate streams such as `a:b`)
+- a part ending in a dot or space
+- a device name such as `CON`, `NUL`, `COM1`, or `LPT9`, with or without an extension
+
+`Context::expand` returns `None` for such a path when running on Windows, so a join can never leave
+the base dir. Validate applies the rules by reach. A declaration that certainly reaches Windows (in
+`os/windows.toml`, under `when.os` naming only windows, or a custom agent's `windows` path) gets an
+error. One that only might (global, tag, or machine layer, with no `when.os` excluding windows) gets
+a warning, because a narrower layer may still override or remove it. A declaration that never
+reaches Windows keeps valid POSIX names such as `notes:2026`. U1's per-OS resolution turns the final
+Windows target into an error.
+
+`source` is relative to the loadout root and stays inside it after symlinks are resolved
+(section 3, What validate enforces).
 
 ### Secret references
 
