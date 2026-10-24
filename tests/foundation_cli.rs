@@ -301,6 +301,7 @@ fn windows_path_rules_apply_only_where_windows_is_reached() {
             "os/linux.toml",
             "[files.colon]\nsource = \"f\"\ntarget = \"~/.local/share/a:b\"\n",
         ),
+        ("os/windows.toml", "[files.anywhere]\nremove = true\n"),
     ]);
     assert_eq!(code, 0, "{text}");
     assert!(

@@ -1,0 +1,8 @@
+[variables]
+email = "me@laptop.example"
+
+[agents]
+enabled = { remove = ["codex"] }
+
+[update]
+interval_minutes = 240

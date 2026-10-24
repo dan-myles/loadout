@@ -1,0 +1,9 @@
+[files.cfg-native]
+source = "f"
+target = "{config}/app/settings"
+
+[mcp.tools]
+url = "https://tools.example/mcp"
+
+[instructions.work]
+source = "AGENTS.md"

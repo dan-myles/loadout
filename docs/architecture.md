@@ -23,6 +23,9 @@ async would buy v1 nothing.
 | `thiserror` | each module's error enum |
 | `anyhow` | command-level errors with context |
 | `gethostname` | the default machine name |
+| `toml_edit` | mcp: format-preserving TOML key merges (U6) |
+| `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
+| `process-wrap` (std, process-group, job-object) | programs: queries killed as a whole process tree at their deadline (U7) |
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -74,7 +77,8 @@ src/
   reserved.rs             reserved destinations: auth, shared configs, state [foundation]
   machine.rs              Facts, machine name                               [foundation]
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
-  resolve/mod.rs          Resolved model                                    [types: foundation; resolve(): U1]
+  resolve/                mod.rs (API, Resolved), merge.rs (layer folding), finish.rs (agents,
+                          transports, reach), paths.rs (Windows, collisions, reserved), all.rs [built, U1]
   plan/mod.rs             Desired, Content, Target, Action, Plan            [types: foundation; build(): U4]
   commands/
     doctor.rs             loadout doctor                                    [foundation, contended]
@@ -87,8 +91,9 @@ src/
   state/                                                                    [U3]
   apply/                                                                    [U4]
   agents/                 adapter table, skills + instructions targets      [U5]
-  mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [U6]
-  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries) [built, U7]
+  mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [built: U6]
+  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries),
+                          process.rs (subprocesses)                         [built, U7]
   sync/                   git clone/fetch, background service               [U8]
   release/                self-update                                       [U9]
 ```
@@ -101,9 +106,9 @@ reserved                       -> context, platform
 context                        -> platform
 machine                        -> platform, context, id
 manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
-resolve                        -> manifest, machine, diagnostic
+resolve                        -> manifest, machine, context, reserved, platform, diagnostic
 template                       -> resolve, machine
-mcp                            -> manifest, resolve, plan (types)
+mcp                            -> manifest, resolve, reserved, context
 agents                         -> manifest, resolve, mcp, plan (types), machine, context, diagnostic
 programs                       -> manifest, resolve, machine, context, diagnostic
 state                          -> context, plan (types)
@@ -113,8 +118,8 @@ sync                           -> context, manifest, diagnostic
 release                        -> context, diagnostic
 ```
 
-`plan/mod.rs` holds only data types until U4 adds `build`. `agents`, `mcp`, and `state` import those
-types and never call `plan::build`, which keeps the graph acyclic.
+`plan/mod.rs` holds only data types until U4 adds `build`. `agents` and `state` import those
+types and never call `plan::build`, which keeps the graph acyclic. `mcp` imports no `plan` type.
 
 ### Contended files
 
@@ -326,14 +331,41 @@ What validate enforces today, before any machine is known:
 - Targets and custom-agent paths never touch a reserved destination (section 6).
 - Every agent named anywhere is built in or declared.
 
-U1 adds the checks that need a machine:
+U1 (built) adds the checks that need a machine. `resolve` runs them for one machine's facts, and
+`validate` runs them through `check_all` (section 11):
 
-- an added item that turns out incomplete
-- a server left with mixed or missing transports
-- cross-layer target collisions
-- one instructions item per agent
-- `windows_problem` on every target that resolves for Windows
-- `reserved::check_path` on every expanded target
+- An added item must be complete in the layer that adds it: an id no broader layer declares for
+  this machine, or a `replace = true`. This includes an item re-added after a removal. A field
+  edit can never clear a field, so every final item is complete.
+- A server left with `command` and `url`, stdio `args` or `env` beside `url`, or `headers` beside
+  `command`, is an error naming the item and every layer that touched it.
+- Expanded collisions, explained below. Two writes collide when they resolve to the same path or
+  when one sits inside the other. Writes are the final file targets, plus what an enabled custom
+  agent receives on that OS: `<skills>/<skill id>` for each skill that reaches it, its
+  instructions file when an instructions item reaches it, and its MCP file when a server reaches
+  it. Paths that built-in agents receive are U5's (section 6).
+- At most one instructions item reaches each agent.
+- `windows_problem` runs on every final Windows write, so a target with no valid Windows path is
+  an error there.
+- Warnings: an item's `agents` list that names an agent the machine doesn't enable; an item that
+  reaches no agent because none is enabled; a `remove = true` with nothing inherited to remove.
+- An enabled custom agent that no applied layer declares is an error.
+
+**Reserved destinations, two ways.** Validate's synthetic machines carry no `Context`, so they
+read nothing from the host. Every final target is a literal that some layer declared, and
+`check_literal` already checked each literal under all three `{config}` meanings, so a synthetic
+re-check would add nothing. The runtime check needs a real `Context` and the active checkout, so
+it is `resolve::check_targets(resolved, context, loadout)`. It runs `reserved::check_path` on
+every expanded file target (`Write`) and every enabled custom agent path for `context.os`
+(`WriteInto`, `Write`, `KeyMerge`), and it errors when a target has no valid path on that OS. U4
+calls it after `resolve` and before observing anything. It doesn't replace the per-read,
+per-backup, and per-write checks in section 6.
+
+`check_all` resolves every listed machine, every unlisted machine name that a `when.machine`
+uses, and one other unlisted machine. Each runs on macOS, Linux, and Windows, on both
+architectures, and on Linux both with no distro and with each distro a `when.distro` names.
+Facts are synthetic. Each diagnostic is reported once, with its machines and OSes appended, for
+example `(on studio: linux; tower: macos, windows)`.
 
 Collisions compare **expanded** paths (`~/.config/x` and `{config}/x` collide on Linux) under the
 target file system's real case behaviour. By default that is case-insensitive on macOS and Windows
@@ -513,7 +545,7 @@ delegated defaults.
     The canonical JSON is produced by one helper, never by ad hoc formatting. It rebuilds the
     `serde_json::Value` with every object's keys sorted by byte order, recursively through arrays
     and nested objects. It then serializes with `serde_json::to_vec`: compact, no whitespace, and
-    serde_json's own escaping and number formatting. The sort is explicit because U6 may enable
+    serde_json's own escaping and number formatting. The sort is explicit because U6 enables
     serde_json's `preserve_order`, under which `Map` keeps insertion order. A value read from TOML
     is first converted to `serde_json::Value`, so both formats hash the same way.
 
@@ -579,19 +611,70 @@ or corrects them.
   executable bit (`FileContent.executable`). A skills dir loadout doesn't own is never deleted.
 - **Instructions**: at most one `instructions` item may reach each agent; U1 makes a second one a
   resolve error. The file is owned whole.
-- **MCP is a key merge, never a file write** (U6). Parse the file, change only the server names
-  loadout owns, and keep every other key, comment, and format detail.
-  - TOML goes through `toml_edit`. JSONC goes through a comment-preserving editor; OpenCode's
-    `opencode.jsonc` is supported, not refused.
+- **MCP is a key merge, never a file write** (U6, built). Parse the file, change only the server
+  names loadout owns, and keep every other key, comment, and format detail.
+  - TOML goes through `toml_edit`. A server is written as a `[map.name]` table with nested values
+    inline, or inline when the map or the replaced entry was inline. A replaced table keeps its
+    place and the comment above its header.
+  - JSON and JSONC go through `jsonc-parser`'s CST. `json` is strict (no comments, no trailing
+    commas, no JSON5 forms), so `.claude.json` and Antigravity's file are never written into a form
+    the agent rejects. `jsonc` allows comments and trailing commas; OpenCode's `opencode.jsonc` is
+    supported, not refused. Inserted values follow the file's indent, newline kind, and
+    trailing-comma style. A UTF-8 BOM survives. A TOML edit keeps CRLF line endings and a missing
+    final newline (toml_edit itself writes LF); a TOML file that mixes CRLF and LF is refused
+    (`Error::MixedNewlines`) rather than rewritten.
+  - `edit` parses the whole server map first. An edit that sets nothing and removes no existing
+    name returns the input bytes unchanged. A comment attached to a removed owned server goes with
+    it. Missing parent tables are created only to set a server.
+  - A value is read only when it converts to JSON exactly, so `parse` never retypes. These are
+    errors, never a silent rewrite: a map location (or an ancestor) holding anything but a table;
+    a duplicate key anywhere on the path or inside the server map, at any depth; a JSON number
+    serde_json can't hold (`1e400`, or an integer past 64 bits), which jsonc-parser would turn
+    into a string or a float; a TOML datetime,
+    which would read the same as a string; a non-finite TOML float; and a `null` bound for TOML.
   - Agent-written state in `~/.claude.json` (`oauthAccount`, `projects`) and `~/.codex/config.toml`
     (`projects`, `tui`) is never touched.
-  - An existing server name that loadout doesn't own is `blocked`, not overwritten.
-  - Muse needs `"schema_version": 1`. Antigravity takes `serverUrl` and rejects SSE.
+  - An existing server name that loadout doesn't own is `blocked`, not overwritten (U4 decides;
+    `mcp::edit` changes only the names it is given).
+  - Muse needs `"schema_version": 1`: `edit` inserts it first when it sets a server. It refuses a
+    file that declares any other version for every edit, removal included. Antigravity takes `serverUrl` and rejects SSE (the schema has no SSE
+    transport). Pi treats `-` and `_` in names as the same character, so `edit` refuses a set name
+    that collides with another kept name (`Error::Collision`).
+  - **Entry fixtures** (`mcp::entry`), from the inventory:
+
+    | Shape | stdio | remote |
+    | --- | --- | --- |
+    | `claude-json` | `type = "stdio"`, `command`, `args`, `env` | `type = "http"`, `url`, `headers` |
+    | `codex-toml` | `command`, `args`, `env` (literals), `env_vars` | `url`, `bearer_token_env_var`, `http_headers` (literals) |
+    | `cursor-json`, `pi-json` | `command`, `args`, `env` | `url`, `headers` |
+    | `grok-toml` | `command`, `args`, `env` | `url`, `headers` |
+    | `opencode-json` | `type = "local"`, `command = [command, ...args]`, `environment` | `type = "remote"`, `url`, `headers` |
+    | `muse-json` | `transport = "stdio"`, `command`, `args`, `env` | `transport = "streamable_http"`, `url`, `headers` |
+    | `antigravity-json` | `command`, `args`, `env` | `serverUrl`, `headers` |
+
+    JSON shapes always write their `args` (where the shape has it), env, and headers fields, even
+    when empty, as the fixtures do. TOML shapes leave out an empty table or list other than `args`. An env reference renders as
+    `prefix` plus `${VAR}`, `${env:VAR}`, or `{env:VAR}`. With `none` (Antigravity, or a custom
+    agent), any reference is `Unsupported::NoEnvSyntax` naming the field; literal values still work.
   - Codex's `codex-env-vars` passes a variable through only under its own name (`env_vars`), and
     takes a bearer token only as `bearer_token_env_var`. So a stdio `env = { K = { env = "OTHER" } }`
-    whose key differs from the variable has no Codex form. The same holds for a header other than
-    `Authorization` with prefix `Bearer `. U6 returns `mcp::Unsupported` for these, and the plan
-    shows an `unsupported` action for Codex; nothing is renamed or resolved.
+    whose key differs from the variable, or carries a prefix, has no Codex form. The same holds for a
+    header other than `Authorization` (any case) with prefix `Bearer `. U6 returns
+    `mcp::Unsupported` for these, and the plan shows an `unsupported` action for Codex; nothing is
+    renamed or resolved. `codex-env-vars` with any shape but `codex-toml` is also `Unsupported`.
+  - **Transaction boundary** (agreed with U3). `mcp` works on bytes; `state` owns the read, the
+    re-observe, and the atomic rename, and imports `mcp`, never the reverse. Before reading a shared
+    config, the caller runs `reserved::check_path(.., KeyMerge { map, format, shape })`;
+    `mcp::read` is the guarded path form that does so before any open, and refuses a FIFO or a
+    folder. For Grok's `config.toml`, `mcp::lock` runs the same check, then takes Grok's exclusive
+    `flock` on `<grok home>/.config-init.lock`, with Grok's own policy (create the dir and file,
+    retry 50 times 20 ms). Grok's config is recognized by identity, as `check_path` recognizes it:
+    the given path and its parent-normalized form are compared with both forms of
+    `<GROK_HOME or ~/.grok>/config.toml`. So a file alias, a folder alias, an override home, and
+    the physical file behind a linked config all take the same lock in the owning home. A path
+    that can't be resolved is an error, not `None`. It refuses a linked or special lock file. The caller holds the guard
+    across read, re-observe, and rename. The lock creates a file, so it is taken only at apply time,
+    never at plan.
 - **Custom agents** get exactly the declared paths, their declared `format`, `map`, `shape`, and
   `env_syntax`, and copy-only skills.
 - **Never touched**: OS keychains, every path in the reserved table below, and T3's private profiles
@@ -904,7 +987,7 @@ Automatic updates are required, so they are on by default.
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
-| `loadout validate [DIR] [--json]`: strict schema and static checks; exit 3 when invalid | foundation | U1 adds resolution across every machine on all three OSes, U2 adds template syntax |
+| `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes; exit 3 when invalid | foundation; resolution built (U1) | U2 adds template syntax |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
 | `loadout status [--json]` | frozen | U3 |
@@ -969,18 +1052,25 @@ impl Loadout { pub fn load(root: &Path) -> Result<(Loadout, Diagnostics /* warni
 // Loadout { root, machines: BTreeMap<String, MachineEntry>, layers: Vec<LayerFile { scope: Scope, file, layer: Layer }> }
 // Scope::{Global, Os(Os), Tag(String), Machine(String)}; layers come global, os, tags, machines, each sorted by name
 
-// resolve (U1; Resolved types foundation)
-pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<Resolved, Diagnostics>;
-pub fn check_all(loadout: &Loadout) -> Diagnostics;   // every listed machine plus an unlisted one, on all three OSes
+// resolve (built, U1; Resolved types foundation)
+pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<(Resolved, Diagnostics /* warnings */), Diagnostics>; // like Loadout::load
+pub fn check_all(loadout: &Loadout) -> Diagnostics;   // every listed machine plus unlisted ones, on all three OSes; synthetic facts only
+pub fn check_targets(resolved: &Resolved, context: &Context, loadout: &Path) -> Diagnostics; // runtime reserved::check_path; `loadout` = active checkout
+// Resolved sources (File, Skill, Instructions) are absolute: the loadout root joined with the declared path.
+// An item's `agents` is the effective list: its own list (an edit of an unset list edits the enabled agents) narrowed to the enabled set.
 
 // template (U2)
 pub fn render(file: &Path, source: &str, variables: &BTreeMap<String, Variable>, facts: &Facts) -> Result<String, template::Error>;
 pub fn check(file: &Path, source: &str) -> Result<(), template::Error>;
 
-// mcp (U6)
+// mcp (U6, built). The frozen path read/write became byte functions plus a guarded read; see section 6.
+pub type Servers = BTreeMap<String, serde_json::Value>;
 pub fn entry(server: &McpServer, shape: McpShape, env: EnvSyntax) -> Result<serde_json::Value, mcp::Unsupported>;
-pub fn read(file: &Path, format: McpFormat, pointer: &str) -> Result<BTreeMap<String, serde_json::Value>, mcp::Error>;
-pub fn write(file: &Path, format: McpFormat, pointer: &str, set: &BTreeMap<String, serde_json::Value>, remove: &[String]) -> Result<Vec<u8>, mcp::Error>; // returns new bytes; preserves everything else
+pub fn parse(bytes: &[u8], format: McpFormat, pointer: &str) -> Result<Servers, mcp::Error>;      // empty bytes = absent file
+pub fn edit(bytes: &[u8], format: McpFormat, pointer: &str, shape: McpShape, set: &Servers, remove: &[String]) -> Result<Vec<u8>, mcp::Error>; // new bytes; preserves everything else
+pub fn read(context: &Context, loadout: &Path, file: &Path, format: McpFormat, pointer: &str, shape: McpShape) -> Result<Servers, mcp::Error>; // check_path(KeyMerge) before any open
+pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::Lock>, mcp::Error>; // Some only for Grok's config.toml
+// Follow-up (U3/U4): plan::Target::Entry needs `shape: McpShape` so state can run the exact KeyMerge check and call edit.
 
 // agents (U5)
 pub fn materialize(resolved: &Resolved, facts: &Facts, context: &Context) -> Result<(Vec<Desired>, Vec<Action /* unsupported */>), agents::Error>;
