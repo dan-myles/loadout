@@ -544,19 +544,61 @@ fn path_parts(path: &Path) -> Vec<String> {
 }
 
 fn prefix_name(prefix: Prefix<'_>) -> String {
-    match prefix {
-        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
-            format!("{}:", char::from(drive).to_ascii_lowercase())
+    match prefix_part(prefix, true) {
+        Part::Disk(drive) => format!("{}:", char::from(drive)),
+        Part::Share(server, share) => {
+            format!("//{}/{}", server.to_string_lossy(), share.to_string_lossy())
         }
-        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
-            "//{}/{}",
-            server.to_string_lossy().to_ascii_lowercase(),
-            share.to_string_lossy().to_ascii_lowercase()
-        ),
-        Prefix::Verbatim(name) | Prefix::DeviceNS(name) => {
-            format!("//?/{}", name.to_string_lossy().to_ascii_lowercase())
-        }
+        Part::Device(name) => format!("//?/{}", name.to_string_lossy()),
+        Part::Root | Part::Name(_) => unreachable!("a prefix is never a root or a name"),
     }
+}
+
+/// One component of a path's identity, as `identity` builds it. Names are kept as `OsString`, so
+/// two distinct names never compare equal, even when neither is valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    /// A drive, whether written `C:` or `\\?\C:`; the letter is always lowercase.
+    Disk(u8),
+    /// A network share, whether written `\\srv\share` or `\\?\UNC\srv\share`. An admin share
+    /// such as `\\localhost\c$` is a share, never the drive it maps to.
+    Share(OsString, OsString),
+    /// Any other verbatim or device prefix.
+    Device(OsString),
+    Root,
+    Name(OsString),
+}
+
+fn fold(name: &std::ffi::OsStr, fold_case: bool) -> OsString {
+    if fold_case {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn prefix_part(prefix: Prefix<'_>, fold_case: bool) -> Part {
+    match prefix {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Part::Disk(drive.to_ascii_lowercase()),
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            Part::Share(fold(server, fold_case), fold(share, fold_case))
+        }
+        Prefix::Verbatim(name) | Prefix::DeviceNS(name) => Part::Device(fold(name, fold_case)),
+    }
+}
+
+/// The identity of a path under the same prefix rules the reserved checks use: the verbatim and
+/// plain spellings of a drive or share are one place. With `fold_case`, ASCII letters in names
+/// compare case-insensitively, as Windows does; without it, names compare exactly. Nothing is
+/// converted to a string, so the result is lossless.
+pub fn identity(path: &Path, fold_case: bool) -> Vec<Part> {
+    path.components()
+        .map(|component| match component {
+            Component::Prefix(prefix) => prefix_part(prefix.kind(), fold_case),
+            Component::RootDir => Part::Root,
+            other => Part::Name(fold(other.as_os_str(), fold_case)),
+        })
+        .collect()
 }
 
 fn join(base: &Path, relative: &str) -> PathBuf {
@@ -839,6 +881,44 @@ mod tests {
         assert_eq!(
             path_parts(Path::new(r"\\?\C:\Users\a\.codex\auth.json")),
             path_parts(Path::new(r"c:\Users\a\.codex\auth.json"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_folds_prefixes_and_optionally_case() {
+        let parts = |path: &str, fold| identity(Path::new(path), fold);
+        assert_eq!(parts(r"\\?\C:\Users\a", true), parts(r"c:\users\A", true));
+        assert_eq!(parts(r"\\?\C:\Users\a", false), parts(r"c:\Users\a", false));
+        assert_ne!(parts(r"C:\Users\a", false), parts(r"C:\users\a", false));
+        assert_eq!(
+            parts(r"\\?\UNC\Srv\Share\x", true),
+            parts(r"\\srv\share\x", true)
+        );
+        assert_ne!(
+            parts(r"\\localhost\c$\Users\a", true),
+            parts(r"C:\Users\a", true),
+            "an admin share is not the drive it maps to"
+        );
+        assert_ne!(parts(r"\\?\D:\Users\a", true), parts(r"C:\Users\a", true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_keeps_distinct_non_utf8_names_apart() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = Path::new(std::ffi::OsStr::from_bytes(b"/home/\xff"));
+        let b = Path::new(std::ffi::OsStr::from_bytes(b"/home/\xfe"));
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "lossy forms collide"
+        );
+        assert_ne!(identity(a, false), identity(b, false));
+        assert_ne!(identity(a, true), identity(b, true));
+        assert_ne!(
+            identity(Path::new("/home/U"), false),
+            identity(Path::new("/home/u"), false)
         );
     }
 
