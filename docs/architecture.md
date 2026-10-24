@@ -705,6 +705,13 @@ delegated defaults.
       like any other later change.
     - Rollback's own `…-rollback.old` holding `after` proves an earlier rollback stopped
       mid-swap, whatever the action's step.
+  - **Rollback's own scratch names.** A restore or delete writes through rollback's own scratch
+    names, which preflight checks before any change:
+    - `…-rollback.tmp` must be free, or verify as the prior.
+    - `…-rollback.old` must be free, or verify as `after` while the target is absent.
+
+    Anything else there blocks the whole rollback, and the occupant is kept. A target that needs
+    no restore only reports such an occupant.
   - **Scratch handling.** A scratch name is deleted only when it verifies as the run's own: `.tmp`
     must hash to `after`, and `.old` to `prior`. Rollback's own scratch, `…-rollback.tmp` and
     `.old`, is verified the same way, so a rollback that stopped can be rerun. Anything else is

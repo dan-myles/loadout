@@ -1218,6 +1218,38 @@ fn a_backup_mode_changed_in_the_journal_alone_is_refused() {
 }
 
 #[test]
+fn a_foreign_file_on_a_rollback_staging_name_blocks_before_any_restore() {
+    let machine = Machine::new();
+    let (a, b, id) = two_target_run(&machine);
+    let marker = a.with_file_name(format!("..a.loadout-{id}-0-rollback.tmp"));
+    fs::write(&marker, "someone else's").unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
+    assert!(error.to_string().contains("in the way"), "{error}");
+    assert_eq!(read(&a), "a-after");
+    assert_eq!(
+        read(&b),
+        "b-after",
+        "B comes first in rollback order and stays untouched"
+    );
+    assert_eq!(read(&marker), "someone else's");
+}
+
+#[test]
+fn a_foreign_rollback_staging_name_beside_a_target_needing_no_restore_is_only_reported() {
+    let machine = Machine::new();
+    let (a, b, id) = two_target_run(&machine);
+    fs::write(&a, "a-before").unwrap();
+    let marker = a.with_file_name(format!("..a.loadout-{id}-0-rollback.tmp"));
+    fs::write(&marker, "someone else's").unwrap();
+    let rolled = machine.rollback(None).unwrap();
+    assert_eq!(rolled.restored, vec![target(&b)]);
+    assert_eq!(rolled.leftovers, vec![marker.clone()]);
+    assert_eq!(read(&b), "b-before");
+    assert_eq!(read(&marker), "someone else's");
+}
+
+#[test]
 fn a_leftover_old_beside_a_done_action_never_overrides_a_later_deletion() {
     let machine = Machine::new();
     let dir = machine.path(".agents/skills/review");
@@ -1247,4 +1279,81 @@ fn a_rollback_that_stopped_mid_swap_is_recovered_from_its_own_old() {
         !reold.exists(),
         "the verified rollback scratch is cleaned up"
     );
+}
+
+#[test]
+fn an_occupied_rollback_old_blocks_a_restore_that_must_move_the_target_aside() {
+    let machine = Machine::new();
+    let (dir, run) = tree_run(&machine);
+    let reold = dir.with_file_name(format!(".review.loadout-{run}-0-rollback.old"));
+    write_skill(&reold, "#!/bin/sh\necho someone else\n");
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
+    assert!(error.to_string().contains("in the way"), "{error}");
+    assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho loadout\n");
+    assert_eq!(
+        read(&reold.join("bin/run.sh")),
+        "#!/bin/sh\necho someone else\n"
+    );
+}
+
+#[test]
+fn rollback_restores_use_exact_modes_so_occupied_probe_names_never_matter() {
+    let machine = Machine::new();
+    let (dir, run) = tree_run(&machine);
+    let stage = dir.with_file_name(format!(".review.loadout-{run}-0-rollback.tmp"));
+    let mut probes = Vec::new();
+    for suffix in [".mode", ".fmode", ".dmode"] {
+        let mut name = stage.as_os_str().to_owned();
+        name.push(suffix);
+        let probe = PathBuf::from(name);
+        fs::write(&probe, "someone else's").unwrap();
+        probes.push(probe);
+    }
+    machine.rollback(None).unwrap();
+    assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho mine\n");
+    for probe in &probes {
+        assert_eq!(read(probe), "someone else's", "{}", probe.display());
+    }
+
+    let (a, b, id) = two_target_run(&machine);
+    let probe = a.with_file_name(format!("..a.loadout-{id}-0-rollback.tmp.mode"));
+    fs::write(&probe, "someone else's").unwrap();
+    machine.rollback(None).unwrap();
+    assert_eq!(
+        (read(&a), read(&b)),
+        ("a-before".to_owned(), "b-before".to_owned())
+    );
+    assert_eq!(read(&probe), "someone else's");
+}
+
+#[test]
+fn an_occupied_rollback_old_blocks_deleting_a_created_folder() {
+    let machine = Machine::new();
+    let dir = machine.path(".agents/skills/review");
+    let run = machine.apply(&dir, &skill("#!/bin/sh\necho new\n"));
+    let reold = dir.with_file_name(format!(".review.loadout-{run}-0-rollback.old"));
+    fs::write(&reold, "someone else's").unwrap();
+    let error = machine.rollback(None).unwrap_err();
+    assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
+    assert_eq!(read(&dir.join("bin/run.sh")), "#!/bin/sh\necho new\n");
+    assert_eq!(read(&reold), "someone else's");
+}
+
+#[test]
+fn a_rollback_tmp_that_verifies_as_the_prior_is_reused() {
+    let machine = Machine::new();
+    let (a, b, id) = two_target_run(&machine);
+    let stale = a.with_file_name(format!("..a.loadout-{id}-0-rollback.tmp"));
+    fs::write(&stale, "a-before").unwrap();
+    let rolled = machine.rollback(None).unwrap();
+    assert_eq!(
+        (read(&a), read(&b)),
+        ("a-before".to_owned(), "b-before".to_owned())
+    );
+    assert!(
+        !stale.exists(),
+        "a verified stale staging file is cleared and its name reused"
+    );
+    assert!(rolled.leftovers.is_empty());
 }

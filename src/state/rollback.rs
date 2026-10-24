@@ -212,6 +212,7 @@ fn preflight<'a>(
         (disk::scratch(&real, &retag, "old")?, entry.after.clone()),
     ];
     let old_holds_prior = inspect(&scratch[1].0, scratch[1].1.as_ref())? == Scratch::Matches;
+    let retmp = inspect(&rescratch[0].0, rescratch[0].1.as_ref())?;
     let reold = inspect(&rescratch[1].0, rescratch[1].1.as_ref())?;
 
     // The run's own `.old` proves a swap that stopped between its renames only while the action
@@ -251,6 +252,24 @@ fn preflight<'a>(
             label(&entry.target)
         )));
     };
+    // A restore writes through rollback's own scratch names, which must be free or verifiably
+    // its own; anything else there would make the write fail after other targets changed.
+    if !matches!(fix, Fix::Keep) {
+        let in_way = [
+            (retmp == Scratch::Foreign, &rescratch[0].0),
+            (
+                reold == Scratch::Foreign || (reold == Scratch::Matches && now != Observed::Absent),
+                &rescratch[1].0,
+            ),
+        ];
+        if let Some((_, path)) = in_way.iter().find(|(blocked, _)| *blocked) {
+            return Ok(Err(format!(
+                "{} is in the way of restoring {}; it isn't verifiably this rollback's own, so it is left for you to move",
+                path.display(),
+                label(&entry.target)
+            )));
+        }
+    }
     Ok(Ok(Undo {
         index,
         entry,
