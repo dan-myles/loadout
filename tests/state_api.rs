@@ -21,7 +21,22 @@ struct Machine {
 
 impl Machine {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::at(tempfile::tempdir().unwrap())
+    }
+
+    /// Unix socket paths are limited to about 100 bytes (`SUN_LEN`), and a macOS temp dir alone
+    /// takes most of that, so socket fixtures get a short root in `/tmp` whatever `TMPDIR` is.
+    #[cfg(unix)]
+    fn short() -> Self {
+        Self::at(
+            tempfile::Builder::new()
+                .prefix("lo")
+                .tempdir_in("/tmp")
+                .unwrap(),
+        )
+    }
+
+    fn at(dir: tempfile::TempDir) -> Self {
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
         let loadout = home.join("checkout");
@@ -550,7 +565,7 @@ fn a_dangling_symlink_target_is_created_at_its_real_destination() {
 fn a_special_file_target_or_child_is_refused_without_opening_it() {
     // A socket stands in for a FIFO here because creating one needs no child process, and this
     // test binary must not fork while other tests hold state locks. The guest E2E covers a FIFO.
-    let machine = Machine::new();
+    let machine = Machine::short();
     let path = machine.path(".socket");
     let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let error = state::observe(&machine.context, &machine.loadout, &target(&path)).unwrap_err();
