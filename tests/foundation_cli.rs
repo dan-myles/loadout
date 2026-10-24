@@ -62,9 +62,9 @@ fn help_lists_only_working_commands() {
     let help = stdout(&output);
     assert!(help.contains("doctor"), "{help}");
     assert!(help.contains("validate"), "{help}");
-    for future in [
-        "apply", "plan", "status", "rollback", "update", "service", "init",
-    ] {
+    assert!(help.contains("status"), "{help}");
+    assert!(help.contains("rollback"), "{help}");
+    for future in ["apply", "plan", "update", "service", "init"] {
         assert!(
             !help
                 .lines()
