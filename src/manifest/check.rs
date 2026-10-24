@@ -609,10 +609,8 @@ impl Checker {
         {
             self.error(format!("{key}.command"), "is empty");
         }
-        if let Some(url) = &item.url
-            && !(url.starts_with("https://") || url.starts_with("http://"))
-        {
-            self.error(format!("{key}.url"), "must start with https:// or http://");
+        if let Some(problem) = item.url.as_deref().and_then(url_problem) {
+            self.error(format!("{key}.url"), problem);
         }
         if global && matches!(item.args, Some(List::Edit(_))) {
             self.error(
@@ -659,9 +657,77 @@ fn is_variable(name: &str) -> bool {
 }
 
 fn is_pointer(pointer: &str) -> bool {
-    pointer
-        .strip_prefix('/')
-        .is_some_and(|rest| rest.split('/').all(|part| !part.is_empty()))
+    pointer.strip_prefix('/').is_some_and(|rest| {
+        rest.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .split('~')
+                    .skip(1)
+                    .all(|after| after.starts_with(['0', '1']))
+        })
+    })
+}
+
+fn url_problem(url: &str) -> Option<String> {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return Some("must start with https:// or http://".to_owned());
+    };
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("must not contain spaces or control characters".to_owned());
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Some(
+            "must not carry credentials; send them in headers with { env = \"VARIABLE\" }"
+                .to_owned(),
+        );
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((host, after)) = bracketed.split_once(']') else {
+                return Some("has an unclosed [ in its host".to_owned());
+            };
+            if host.is_empty()
+                || !host
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+            {
+                return Some(format!("host [{host}] is not an IPv6 address"));
+            }
+            match after {
+                "" => (host, None),
+                _ => match after.strip_prefix(':') {
+                    Some(port) => (host, Some(port)),
+                    None => return Some("has text after its [IPv6] host".to_owned()),
+                },
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    let bracketed = authority.starts_with('[');
+    let host_ok = bracketed
+        || (!host.is_empty()
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }));
+    if !host_ok {
+        return Some(format!("needs a host name, got {host:?}"));
+    }
+    if let Some(port) = port
+        && !port.parse::<u16>().is_ok_and(|port| port > 0)
+    {
+        return Some(format!("port {port:?} is not a number from 1 to 65535"));
+    }
+    None
 }
 
 fn looks_secret(name: &str) -> bool {
@@ -690,6 +756,44 @@ mod tests {
         assert!(!is_pointer("mcpServers"));
         assert!(!is_pointer("/"));
         assert!(!is_pointer("/a//b"));
+    }
+
+    #[test]
+    fn pointer_escapes_follow_json_pointer() {
+        assert!(is_pointer("/mcp~1servers"));
+        assert!(is_pointer("/a~0b"));
+        assert!(!is_pointer("/mcp~2servers"));
+        assert!(!is_pointer("/trailing~"));
+    }
+
+    #[test]
+    fn urls_need_a_scheme_host_and_valid_port() {
+        for good in [
+            "https://api.githubcopilot.com/mcp/",
+            "http://localhost:8080/mcp",
+            "https://mcp.example.com",
+            "http://127.0.0.1:3000",
+            "https://[::1]:8443/x",
+            "https://example.com?x=1",
+        ] {
+            assert_eq!(url_problem(good), None, "{good}");
+        }
+        for bad in [
+            "https://",
+            "https:///path",
+            "ftp://example.com",
+            "https://exa mple.com",
+            "https://user:pass@example.com",
+            "https://example.com:0",
+            "https://example.com:99999",
+            "https://example.com:",
+            "https://-bad-.com",
+            "https://a..b",
+            "https://[]/",
+            "https://[::1",
+        ] {
+            assert!(url_problem(bad).is_some(), "{bad}");
+        }
     }
 
     #[test]

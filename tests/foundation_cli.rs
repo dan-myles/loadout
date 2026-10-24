@@ -565,6 +565,19 @@ fn machine_tags_must_be_ids_that_name_a_loaded_layer() {
 }
 
 #[test]
+fn remote_urls_and_map_pointers_must_be_well_formed() {
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n[mcp.x]\nurl = \"https://\"\n[agents.custom.c]\nevidence = \"e\"\nmcp = { linux = \"~/c.json\", format = \"json\", map = \"/mcp~2servers\", shape = \"cursor-json\", env_syntax = \"none\" }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("mcp.x.url: needs a host name"), "{text}");
+    assert!(
+        text.contains("agents.custom.c.mcp.map: must be a pointer"),
+        "{text}"
+    );
+}
+
+#[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["doctor", "--json"]);

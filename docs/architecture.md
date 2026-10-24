@@ -260,6 +260,10 @@ What validate enforces today, before any machine is known:
 - `remove = true` stands alone.
 - A `replace = true` item must be complete.
 - A server is stdio (`command`, `args`, `env`) or remote (`url`, `headers`), never both.
+- A remote `url` is `http://` or `https://` with a real host (a DNS name, IPv4, or `[IPv6]`) and an
+  optional port from 1 to 65535. It has no whitespace and no `user:pass@` credentials.
+- A custom MCP `map` is an RFC 6901 pointer with non-empty parts, where `~` appears only as `~0` or
+  `~1`.
 - Ids are lowercase `[a-z0-9][a-z0-9_-]*`.
 - Sources exist inside the loadout, with symlinks resolved.
 - A skill folder is walked in full. A link inside it may point only to a file inside the loadout.
