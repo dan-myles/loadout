@@ -587,7 +587,24 @@ kinds:
   or is an ancestor of one. Replacing `~/.codex` would replace `auth.json`.
 - `WriteInto`: write children into a dir, as with a skills dir. Blocked only when the dir equals or
   sits inside an entry, so `~/.claude/skills` beside `~/.claude/.credentials.json` is fine.
-- `KeyMerge`: U6 MCP merge. Allowed into `shared-config` and blocked everywhere else.
+- `KeyMerge(Merge { map, format, shape })`: U6 MCP merge. Allowed only when the target **equals** a
+  `shared-config` entry **and** the declared map, format, and shape exactly equal that entry's known
+  MCP map:
+
+  | Shared config | Map | Format | Shape |
+  | --- | --- | --- | --- |
+  | `.claude.json` | `/mcpServers` | json | `claude-json` |
+  | Codex `config.toml` | `/mcp_servers` | toml | `codex-toml` |
+  | `~/.cursor/mcp.json` | `/mcpServers` | json | `cursor-json` |
+  | Grok `config.toml` | `/mcp_servers` | toml | `grok-toml` |
+  | OpenCode `opencode.json` / `opencode.jsonc` | `/mcp` | json / jsonc | `opencode-json` |
+  | Pi `mcp.json` | `/mcpServers` | json | `pi-json` |
+  | Muse `settings.json` | `/mcp_servers` | json | `muse-json` |
+  | Antigravity `mcp_config.json` | `/mcpServers` | json | `antigravity-json` |
+
+  A path alone never authorizes a merge. `/oauthAccount` or `/projects` in `~/.claude.json`, or
+  `/projects` in Codex `config.toml`, is blocked. A custom MCP file that isn't reserved keeps any
+  valid map.
 
 Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocked on every OS.
 
@@ -617,6 +634,10 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     never opened, hashed, or backed up. U5 checks each `<skills dir>/<skill id>` with `Write`.
   - Static validate keeps its lexical default check (`check_literal`). Sibling paths stay allowed in
     both.
+  - **U6 applies the same rule.** Every MCP write calls `check_path` with
+    `Use::KeyMerge(Merge { map, format, shape })`, for built-in adapters and custom agents alike, on
+    expanded, canonical, and override-alias paths. A shared config reached through an alias still
+    accepts only its own map. Validate already checks custom declarations statically.
 - An unowned shared config is never adopted or replaced as a whole file. Only U6's owned keys change.
 - **Doctor diagnostics** (U5): report which overrides are set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
   `GROK_HOME`, `PI_CODING_AGENT_DIR`, `XDG_CONFIG_HOME`). Warn when Codex `AGENTS.override.md`
@@ -739,7 +760,8 @@ pub fn which(program: &str) -> Option<PathBuf>;                 // executable fi
 // reserved (foundation)
 pub const TABLE: &[Entry];                                      // Entry { anchor: Anchor, path, kind: Kind }
 pub enum Kind { Auth, SharedConfig, LoadoutState, Private }
-pub enum Use { Write, WriteInto, KeyMerge }
+pub enum Use<'a> { Write, WriteInto, KeyMerge(Merge<'a>) }   // Merge { map, format, shape } as ids
+// Entry { anchor, path, kind, merge: Option<Merge<'static>> }: shared-config entries carry their known MCP map
 pub fn check_literal(path: &str, how: Use) -> Option<Conflict>;                 // validate, static
 pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict>; // U1/U4/U5; normalizes target and every reserved root itself
 pub fn normalize(path: &Path) -> io::Result<PathBuf>;                         // canonical existing ancestor + missing tail; stats only

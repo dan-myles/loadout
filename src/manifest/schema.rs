@@ -256,6 +256,16 @@ pub enum McpFormat {
     Toml,
 }
 
+impl McpFormat {
+    pub fn id(self) -> &'static str {
+        match self {
+            McpFormat::Json => "json",
+            McpFormat::Jsonc => "jsonc",
+            McpFormat::Toml => "toml",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum McpShape {

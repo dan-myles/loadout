@@ -844,6 +844,34 @@ fn git_metadata_is_never_loadout_content() {
 }
 
 #[test]
+fn shared_configs_accept_only_their_own_mcp_map_from_custom_agents() {
+    let custom = |file: &str, map: &str, format: &str, shape: &str| {
+        format!(
+            "[loadout]\nversion = 1\n[agents]\nenabled = [\"test\"]\n[agents.custom.test]\nevidence = \"e\"\nmcp = {{ linux = \"{file}\", format = \"{format}\", map = \"{map}\", shape = \"{shape}\", env_syntax = \"none\" }}\n[mcp.x]\ncommand = \"c\"\n"
+        )
+    };
+    for (file, map, format, shape) in [
+        ("~/.claude.json", "/oauthAccount", "json", "claude-json"),
+        ("~/.claude.json", "/projects", "json", "claude-json"),
+        ("~/.codex/config.toml", "/projects", "toml", "codex-toml"),
+        ("~/.claude.json", "/mcpServers", "json", "cursor-json"),
+    ] {
+        let (code, text) = validate_text(&custom(file, map, format, shape));
+        assert_eq!(code, 3, "{file} {map} {shape}: {text}");
+        assert!(text.contains("agents.custom.test.mcp.linux"), "{text}");
+        assert!(text.contains("shared config"), "{text}");
+    }
+    for (file, map, format, shape) in [
+        ("~/.claude.json", "/mcpServers", "json", "claude-json"),
+        ("~/.codex/config.toml", "/mcp_servers", "toml", "codex-toml"),
+        ("~/.test/mcp.json", "/customMap", "json", "cursor-json"),
+    ] {
+        let (code, text) = validate_text(&custom(file, map, format, shape));
+        assert_eq!(code, 0, "{file} {map}: {text}");
+    }
+}
+
+#[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["doctor", "--json"]);

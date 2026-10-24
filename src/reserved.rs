@@ -95,56 +95,120 @@ pub struct Entry {
     pub anchor: Anchor,
     pub path: &'static str,
     pub kind: Kind,
+    pub merge: Option<Merge<'static>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Merge<'a> {
+    pub map: &'a str,
+    pub format: &'a str,
+    pub shape: &'a str,
 }
 
 const fn entry(anchor: Anchor, path: &'static str, kind: Kind) -> Entry {
-    Entry { anchor, path, kind }
+    Entry {
+        anchor,
+        path,
+        kind,
+        merge: None,
+    }
+}
+
+const fn shared(
+    anchor: Anchor,
+    path: &'static str,
+    map: &'static str,
+    format: &'static str,
+    shape: &'static str,
+) -> Entry {
+    Entry {
+        anchor,
+        path,
+        kind: Kind::SharedConfig,
+        merge: Some(Merge { map, format, shape }),
+    }
 }
 
 pub const TABLE: &[Entry] = &[
     entry(Anchor::ClaudeDir, ".credentials.json", Kind::Auth),
     entry(Anchor::ClaudeDir, "mcp-needs-auth-cache.json", Kind::Auth),
     entry(Anchor::ClaudeDir, "backups", Kind::Private),
-    entry(Anchor::ClaudeRoot, ".claude.json", Kind::SharedConfig),
+    shared(
+        Anchor::ClaudeRoot,
+        ".claude.json",
+        "/mcpServers",
+        "json",
+        "claude-json",
+    ),
     entry(Anchor::CodexHome, "auth.json", Kind::Auth),
     entry(Anchor::CodexHome, ".credentials.json", Kind::Auth),
     entry(Anchor::CodexHome, "mcp-oauth-locks", Kind::Auth),
-    entry(Anchor::CodexHome, "config.toml", Kind::SharedConfig),
+    shared(
+        Anchor::CodexHome,
+        "config.toml",
+        "/mcp_servers",
+        "toml",
+        "codex-toml",
+    ),
     entry(Anchor::Home, ".cursor/auth.json", Kind::Auth),
     entry(Anchor::Home, ".config/cursor/auth.json", Kind::Auth),
     entry(Anchor::Home, "AppData/Roaming/Cursor/auth.json", Kind::Auth),
-    entry(Anchor::Home, ".cursor/mcp.json", Kind::SharedConfig),
+    shared(
+        Anchor::Home,
+        ".cursor/mcp.json",
+        "/mcpServers",
+        "json",
+        "cursor-json",
+    ),
     entry(Anchor::GrokHome, "auth.json", Kind::Auth),
     entry(Anchor::GrokHome, "mcp_credentials.json", Kind::Auth),
     entry(Anchor::GrokHome, ".config-init.lock", Kind::Private),
-    entry(Anchor::GrokHome, "config.toml", Kind::SharedConfig),
+    shared(
+        Anchor::GrokHome,
+        "config.toml",
+        "/mcp_servers",
+        "toml",
+        "grok-toml",
+    ),
     entry(Anchor::Home, ".local/share/opencode", Kind::Auth),
-    entry(
+    shared(
         Anchor::XdgConfig,
         "opencode/opencode.json",
-        Kind::SharedConfig,
+        "/mcp",
+        "json",
+        "opencode-json",
     ),
-    entry(
+    shared(
         Anchor::XdgConfig,
         "opencode/opencode.jsonc",
-        Kind::SharedConfig,
+        "/mcp",
+        "jsonc",
+        "opencode-json",
     ),
     entry(Anchor::PiDir, "auth.json", Kind::Auth),
     entry(Anchor::PiDir, "mcp-auth.json", Kind::Auth),
-    entry(Anchor::PiDir, "mcp.json", Kind::SharedConfig),
+    shared(Anchor::PiDir, "mcp.json", "/mcpServers", "json", "pi-json"),
     entry(Anchor::XdgConfig, "muse/auth.json", Kind::Auth),
     entry(Anchor::XdgConfig, "muse/trust.json", Kind::Auth),
-    entry(Anchor::XdgConfig, "muse/settings.json", Kind::SharedConfig),
+    shared(
+        Anchor::XdgConfig,
+        "muse/settings.json",
+        "/mcp_servers",
+        "json",
+        "muse-json",
+    ),
     entry(
         Anchor::Home,
         ".gemini/antigravity/mcp_oauth_tokens.json",
         Kind::Auth,
     ),
     entry(Anchor::Home, ".gemini/antigravity-cli/mcp", Kind::Private),
-    entry(
+    shared(
         Anchor::Home,
         ".gemini/config/mcp_config.json",
-        Kind::SharedConfig,
+        "/mcpServers",
+        "json",
+        "antigravity-json",
     ),
     entry(Anchor::Home, ".t3", Kind::Private),
     entry(Anchor::State, "", Kind::LoadoutState),
@@ -152,10 +216,10 @@ pub const TABLE: &[Entry] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Use {
+pub enum Use<'a> {
     Write,
     WriteInto,
-    KeyMerge,
+    KeyMerge(Merge<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,11 +249,38 @@ impl Conflict {
     }
 }
 
-fn blocks(kind: Kind, how: Use) -> bool {
-    !(how == Use::KeyMerge && kind == Kind::SharedConfig)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    Equal,
+    Inside,
+    Ancestor,
 }
 
-pub fn check_literal(path: &str, how: Use) -> Option<Conflict> {
+fn relation(target: &[String], reserved: &[String]) -> Option<Relation> {
+    if target == reserved {
+        Some(Relation::Equal)
+    } else if target.len() > reserved.len() && target[..reserved.len()] == *reserved {
+        Some(Relation::Inside)
+    } else if reserved.len() > target.len() && reserved[..target.len()] == *target {
+        Some(Relation::Ancestor)
+    } else {
+        None
+    }
+}
+
+fn blocked(entry: &Entry, relation: Relation, how: Use<'_>) -> bool {
+    match how {
+        Use::Write => true,
+        Use::WriteInto => relation != Relation::Ancestor,
+        Use::KeyMerge(merge) => !(relation == Relation::Equal && entry.merge == Some(merge)),
+    }
+}
+
+fn conflicts(target: &[String], reserved: &[String], entry: &Entry, how: Use<'_>) -> bool {
+    relation(target, reserved).is_some_and(|relation| blocked(entry, relation, how))
+}
+
+pub fn check_literal(path: &str, how: Use<'_>) -> Option<Conflict> {
     let (base, rest) = split_base(path)?;
     let candidates: Vec<String> = match base {
         Base::Home => vec![rest.to_owned()],
@@ -198,29 +289,26 @@ pub fn check_literal(path: &str, how: Use) -> Option<Conflict> {
             .map(|dir| format!("{dir}/{rest}"))
             .collect(),
     };
-    TABLE
-        .iter()
-        .filter(|entry| blocks(entry.kind, how))
-        .find_map(|entry| {
-            entry.anchor.defaults().iter().find_map(|anchor| {
-                let reserved = [*anchor, entry.path]
-                    .iter()
-                    .filter(|part| !part.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                candidates
-                    .iter()
-                    .any(|candidate| overlaps(&parts(candidate), &parts(&reserved), how))
-                    .then(|| Conflict::Reserved {
-                        entry: *entry,
-                        reserved: format!("~/{reserved}"),
-                    })
-            })
+    TABLE.iter().find_map(|entry| {
+        entry.anchor.defaults().iter().find_map(|anchor| {
+            let reserved = [*anchor, entry.path]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/");
+            candidates
+                .iter()
+                .any(|candidate| conflicts(&parts(candidate), &parts(&reserved), entry, how))
+                .then(|| Conflict::Reserved {
+                    entry: *entry,
+                    reserved: format!("~/{reserved}"),
+                })
         })
+    })
 }
 
-pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict> {
+pub fn check_path(context: &Context, path: &Path, how: Use<'_>) -> Option<Conflict> {
     let unverifiable = |path: &Path, error: io::Error| Conflict::Unverifiable {
         path: path.to_path_buf(),
         error: error.to_string(),
@@ -229,7 +317,7 @@ pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict> 
         Ok(real) => [path_parts(path), path_parts(&real)],
         Err(error) => return Some(unverifiable(path, error)),
     };
-    for entry in TABLE.iter().filter(|entry| blocks(entry.kind, how)) {
+    for entry in TABLE {
         for root in entry.anchor.roots(context) {
             let reserved = join(&root, entry.path);
             let real = match normalize(&reserved) {
@@ -239,7 +327,7 @@ pub fn check_path(context: &Context, path: &Path, how: Use) -> Option<Conflict> 
             let forms = [path_parts(&reserved), path_parts(&real)];
             let hit = targets
                 .iter()
-                .any(|target| forms.iter().any(|form| overlaps(target, form, how)));
+                .any(|target| forms.iter().any(|form| conflicts(target, form, entry, how)));
             if hit {
                 return Some(Conflict::Reserved {
                     entry: *entry,
@@ -316,12 +404,6 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
-fn overlaps(target: &[String], reserved: &[String], how: Use) -> bool {
-    let inside = target.len() >= reserved.len() && target[..reserved.len()] == *reserved;
-    let ancestor = reserved.len() > target.len() && reserved[..target.len()] == *target;
-    inside || (ancestor && how != Use::WriteInto)
-}
-
 fn parts(path: &str) -> Vec<String> {
     path.split('/')
         .filter(|part| !part.is_empty())
@@ -349,7 +431,13 @@ mod tests {
     use super::*;
     use crate::platform::Os;
 
-    fn conflict(path: &str, how: Use) -> Option<Kind> {
+    const CLAUDE_MCP: Use<'static> = Use::KeyMerge(Merge {
+        map: "/mcpServers",
+        format: "json",
+        shape: "claude-json",
+    });
+
+    fn conflict(path: &str, how: Use<'_>) -> Option<Kind> {
         check_literal(path, how).and_then(|conflict| conflict.kind())
     }
 
@@ -371,23 +459,60 @@ mod tests {
     }
 
     #[test]
-    fn shared_configs_are_blocked_except_for_key_merges() {
-        for path in [
-            "~/.claude.json",
-            "~/.codex/config.toml",
-            "{config}/opencode/opencode.jsonc",
-            "~/.gemini/config/mcp_config.json",
+    fn shared_configs_take_only_their_known_mcp_map_format_and_shape() {
+        let merge = |map, format, shape| Use::KeyMerge(Merge { map, format, shape });
+        for (path, ok) in [
+            (
+                "~/.claude.json",
+                merge("/mcpServers", "json", "claude-json"),
+            ),
+            (
+                "~/.codex/config.toml",
+                merge("/mcp_servers", "toml", "codex-toml"),
+            ),
+            (
+                "{config}/opencode/opencode.jsonc",
+                merge("/mcp", "jsonc", "opencode-json"),
+            ),
+            (
+                "~/.gemini/config/mcp_config.json",
+                merge("/mcpServers", "json", "antigravity-json"),
+            ),
         ] {
             assert_eq!(
                 conflict(path, Use::Write),
                 Some(Kind::SharedConfig),
                 "{path}"
             );
-            assert_eq!(conflict(path, Use::KeyMerge), None, "{path}");
+            assert_eq!(conflict(path, ok), None, "{path}");
+        }
+        for bad in [
+            merge("/oauthAccount", "json", "claude-json"),
+            merge("/projects", "json", "claude-json"),
+            merge("/mcpServers", "jsonc", "claude-json"),
+            merge("/mcpServers", "json", "cursor-json"),
+        ] {
+            assert_eq!(
+                conflict("~/.claude.json", bad),
+                Some(Kind::SharedConfig),
+                "{bad:?}"
+            );
         }
         assert_eq!(
-            conflict("~/.codex/auth.json", Use::KeyMerge),
-            Some(Kind::Auth)
+            conflict(
+                "~/.codex/config.toml",
+                merge("/projects", "toml", "codex-toml")
+            ),
+            Some(Kind::SharedConfig)
+        );
+        assert_eq!(conflict("~/.codex/auth.json", CLAUDE_MCP), Some(Kind::Auth));
+        assert_eq!(conflict("~/.claude", CLAUDE_MCP), Some(Kind::Auth));
+        assert_eq!(
+            conflict(
+                "~/.test/mcp.json",
+                merge("/customMap", "json", "cursor-json")
+            ),
+            None
         );
     }
 

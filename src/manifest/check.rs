@@ -11,7 +11,7 @@ use super::{LayerFile, Loadout, Scope, is_id};
 use crate::context::{split_base, windows_problem};
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::platform::Os;
-use crate::reserved::{self, Use};
+use crate::reserved::{self, Merge, Use};
 
 const TEMPLATE_SUFFIX: &str = ".tmpl";
 const SKILL_FILE: &str = "SKILL.md";
@@ -448,7 +448,7 @@ impl Checker {
         }
     }
 
-    fn target(&mut self, key: &str, target: &str, windows: Reach, how: Use) {
+    fn target(&mut self, key: &str, target: &str, windows: Reach, how: Use<'_>) {
         let Some((_, rest)) = split_base(target) else {
             self.error(
                 key,
@@ -559,7 +559,12 @@ impl Checker {
         }
         if let Some(mcp) = &agent.mcp {
             let key = format!("{key}.mcp");
-            self.per_os(&key, &mcp.paths(), Use::KeyMerge);
+            let merge = Use::KeyMerge(Merge {
+                map: &mcp.map,
+                format: mcp.format.id(),
+                shape: mcp.shape.id(),
+            });
+            self.per_os(&key, &mcp.paths(), merge);
             if mcp.shape.is_toml() != (mcp.format == McpFormat::Toml) {
                 self.error(
                     format!("{key}.format"),
@@ -591,7 +596,7 @@ impl Checker {
         }
     }
 
-    fn per_os(&mut self, key: &str, paths: &PerOs, how: Use) {
+    fn per_os(&mut self, key: &str, paths: &PerOs, how: Use<'_>) {
         let mut any = false;
         for (os, path) in paths.paths() {
             any = true;
