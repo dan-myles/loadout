@@ -640,11 +640,14 @@ delegated defaults.
   3. The backup is taken, and the journal marks the action `started` with its `after` hash and the
      folders it will create, before the target changes.
   4. The new content is staged privately in `.<name>.loadout-<run>-<n>.tmp`:
-     - Each file is created empty with mode `0o666`, so the kernel applies the umask and its mode
-       reveals the process default. It is set to `0600` before the first byte, and given its
-       final mode only after its bytes are written and fsynced.
-     - A staged tree's folders are `0700` until every file is written. They then get their final
-       modes, deepest first.
+     - Each file that will hold bytes is created with owner-only bits (`0600`) from its first
+       open. Nobody else can open it and keep a descriptor that would read the bytes after a
+       later chmod. The process default for a new file or folder (the umask and any default
+       ACL) comes from separate empty probes (`….mode`, `….fmode`, `….dmode`), which are created
+       and removed at once and never hold data. The file gets its final mode only after its
+       bytes are written and fsynced.
+     - A staged tree's folders are `0700` from their creation until every file is written.
+       They then get their final modes, deepest first.
      - Final modes never widen past the rule above.
   5. The target is observed once more just before the rename, and any difference aborts with
      `Changed`.

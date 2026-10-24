@@ -348,18 +348,63 @@ pub(super) fn remove(real: &Path, tag: &str) -> Result<(), Error> {
     sync_parent(real)
 }
 
-/// Creates `path` and writes its bytes while only the owner can read it. The file is created
-/// empty with `0o666`, so the kernel applies the umask and its mode is the process default for
-/// a new file; it is made `0o600` before the first byte. Returns the final mode to apply.
-fn stage_file(path: &Path, planned: &Planned) -> Result<(File, u32), Error> {
+/// Creates the file that will hold staged bytes with only owner bits from its first open, so
+/// nobody else can open it and keep a descriptor that would still read the bytes after any later
+/// chmod. A umask can only narrow `0o600`, and the chmod puts owner read and write back.
+fn create_private_file(path: &Path) -> Result<File, Error> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path).map_err(io("create", path))?;
+    #[cfg(unix)]
+    chmod_file(&file, path, 0o600)?;
+    Ok(file)
+}
+
+fn needs_default(mode: Mode) -> bool {
+    matches!(mode, Mode::Executable { base: None, .. })
+}
+
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The mode the kernel gives a new file in `probe`'s folder (the umask, and any default ACL),
+/// which `Mode::Executable { base: None }` starts from. It comes from an empty probe that is
+/// created and removed here and never holds data. Windows has no modes.
+fn probe_file_mode(probe: &Path) -> Result<u32, Error> {
+    if !cfg!(unix) {
+        return Ok(0);
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o666);
-    let mut file = options.open(path).map_err(io("create", path))?;
-    let default = mode_of(&file.metadata().map_err(io("inspect", path))?);
-    #[cfg(unix)]
-    chmod_file(&file, path, 0o600)?;
+    let file = options.open(probe).map_err(io("create", probe))?;
+    let mode = file.metadata().map(|metadata| mode_of(&metadata));
+    drop(file);
+    fs::remove_file(probe).map_err(io("remove", probe))?;
+    mode.map_err(io("inspect", probe))
+}
+
+/// The mode the kernel gives a new folder there, from an empty probe folder, as above.
+fn probe_dir_mode(probe: &Path) -> Result<u32, Error> {
+    if !cfg!(unix) {
+        return Ok(0);
+    }
+    fs::create_dir(probe).map_err(io("create", probe))?;
+    let mode = fs::symlink_metadata(probe).map(|metadata| mode_of(&metadata));
+    fs::remove_dir(probe).map_err(io("remove", probe))?;
+    mode.map_err(io("inspect", probe))
+}
+
+/// Writes the bytes into a private new file and returns it with the final mode to apply.
+/// `default` is the new-file mode from `probe_file_mode`, used when the mode has no base.
+fn stage_file(path: &Path, planned: &Planned, default: u32) -> Result<(File, u32), Error> {
+    let mut file = create_private_file(path)?;
     file.write_all(&planned.bytes).map_err(io("write", path))?;
     file.sync_all().map_err(io("sync", path))?;
     let bits = match planned.mode {
@@ -370,7 +415,16 @@ fn stage_file(path: &Path, planned: &Planned) -> Result<(File, u32), Error> {
 }
 
 fn write_file(path: &Path, planned: &Planned) -> Result<(), Error> {
-    let (file, bits) = stage_file(path, planned)?;
+    let default = if needs_default(planned.mode) {
+        probe_file_mode(&suffixed(path, ".mode"))?
+    } else {
+        0
+    };
+    write_staged(path, planned, default)
+}
+
+fn write_staged(path: &Path, planned: &Planned, default: u32) -> Result<(), Error> {
+    let (file, bits) = stage_file(path, planned, default)?;
     #[cfg(unix)]
     chmod_file(&file, path, bits)?;
     #[cfg(not(unix))]
@@ -385,28 +439,35 @@ fn chmod_file(file: &File, path: &Path, bits: u32) -> Result<(), Error> {
         .map_err(io("set the mode of", path))
 }
 
-/// Builds a tree under `root` with every folder `0o700` while files are written, so nothing in
-/// it is reachable by others before it is complete. Files get their final modes as they are
-/// written. Returns the folders' final modes, deepest first, for `finish_tree`.
+/// Builds a tree under `root` with every folder `0o700` from its creation while files are
+/// written, so nothing in it is reachable by others before it is complete. Default modes come
+/// from empty probes beside the root. Files get their final modes as they are written. Returns
+/// the folders' final modes, deepest first, for `finish_tree`.
 fn stage_tree(
     root: &Path,
     dirs: &BTreeMap<String, Option<u32>>,
     files: &BTreeMap<String, Planned>,
 ) -> Result<Vec<(PathBuf, u32)>, Error> {
-    fs::create_dir(root).map_err(io("create", root))?;
-    let default = mode_of(&fs::symlink_metadata(root).map_err(io("inspect", root))?);
-    #[cfg(unix)]
-    chmod_dir(root, 0o700)?;
+    let dir_default = if dirs.values().any(Option::is_none) {
+        probe_dir_mode(&suffixed(root, ".dmode"))?
+    } else {
+        0
+    };
+    let file_default = if files.values().any(|planned| needs_default(planned.mode)) {
+        probe_file_mode(&suffixed(root, ".fmode"))?
+    } else {
+        0
+    };
     let mut modes = Vec::new();
     for (key, mode) in dirs {
-        let dir = join_key(root, key)?;
-        if !key.is_empty() {
-            create_private_dir(&dir)?;
-        }
-        modes.push((dir, mode.map_or(default, |mode| mode & 0o777)));
+        create_private_dir(&join_key(root, key)?)?;
+        modes.push((
+            join_key(root, key)?,
+            mode.map_or(dir_default, |mode| mode & 0o777),
+        ));
     }
     for (key, planned) in files {
-        write_file(&join_key(root, key)?, planned)?;
+        write_staged(&join_key(root, key)?, planned, file_default)?;
     }
     modes.reverse();
     Ok(modes)
@@ -467,13 +528,18 @@ fn finish_tree(modes: &[(PathBuf, u32)]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Creates a folder with only owner bits from its creation; a umask can only narrow `0o700`,
+/// and the chmod puts the owner bits back.
 fn create_private_dir(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     let created =
         std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(path);
     #[cfg(not(unix))]
     let created = fs::create_dir(path);
-    created.map_err(io("create", path))
+    created.map_err(io("create", path))?;
+    #[cfg(unix)]
+    chmod_dir(path, 0o700)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -687,7 +753,7 @@ mod tests {
             bytes: b"secret-ish".to_vec(),
             mode: Mode::Exact(0o644),
         };
-        let (file, bits) = stage_file(&path, &planned).unwrap();
+        let (file, bits) = stage_file(&path, &planned, 0o644).unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
             b"secret-ish",
@@ -697,6 +763,57 @@ mod tests {
         assert_eq!(bits, 0o644);
         chmod_file(&file, &path, bits).unwrap();
         assert_eq!(mode(&path), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_data_file_is_owner_only_from_its_first_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".scratch");
+        let file = create_private_file(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0, "before any byte");
+        assert_eq!(mode(&path), 0o600, "already private when it first exists");
+        drop(file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_modes_come_from_empty_probes_that_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control");
+        fs::write(&control, "").unwrap();
+        let control_dir = dir.path().join("control-dir");
+        fs::create_dir(&control_dir).unwrap();
+        let probe = dir.path().join("probe");
+        assert_eq!(probe_file_mode(&probe).unwrap(), mode(&control));
+        assert!(!probe.exists());
+        assert_eq!(probe_dir_mode(&probe).unwrap(), mode(&control_dir));
+        assert!(!probe.exists());
+        fs::write(&probe, "taken").unwrap();
+        assert!(
+            probe_file_mode(&probe).is_err(),
+            "never reuses a taken name"
+        );
+        assert_eq!(fs::read_to_string(&probe).unwrap(), "taken");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_without_a_base_still_gets_the_default_mode_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control");
+        fs::write(&control, "").unwrap();
+        let path = dir.path().join("new");
+        let planned = Planned {
+            bytes: b"#!/bin/sh\n".to_vec(),
+            mode: Mode::Executable {
+                base: None,
+                executable: true,
+            },
+        };
+        write_file(&path, &planned).unwrap();
+        assert_eq!(mode(&path), x_rule(mode(&control), true));
+        assert!(!suffixed(&path, ".mode").exists());
     }
 
     #[cfg(unix)]
