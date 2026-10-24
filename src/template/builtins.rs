@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use minijinja::value::ValueKind;
-use minijinja::value::{Kwargs, Rest, ValueOrKwargs, from_args};
-use minijinja::{Environment, Error, ErrorKind, State, Value, filters, tests};
+use minijinja::value::{DynObject, Kwargs, Rest, ValueOrKwargs, from_args};
+use minijinja::{Environment, Error, ErrorKind, State, Value, filters, functions, tests};
 
 use super::strict::{ACYCLIC, CYCLE, STORE, UNPACK, Undefined, is_current_loop};
 
@@ -28,6 +28,7 @@ pub(super) fn install(environment: &mut Environment<'_>) {
     environment.add_filter("dictsort", dictsort);
     environment.add_filter("chain", chain);
     environment.add_function(CYCLE, cycle);
+    environment.add_function("namespace", namespace);
     environment.add_function(ACYCLIC, acyclic);
     environment.add_function(UNPACK, unpack);
     environment.add_function(STORE, store);
@@ -91,27 +92,114 @@ fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, E
     ))
 }
 
-// Every `{% set ns.x = value %}` passes through here between evaluating `ns` and storing. A value
-// that reaches the receiver would make the namespace contain itself, and rendering, comparing, or
-// sorting it would then recurse without end; so the store is refused before it happens.
-fn acyclic(value: &Value, receiver: &Value, target: &str) -> Result<Value, Error> {
-    if receiver.as_object().is_some() && reaches(value, receiver) {
-        let owner = target.rsplit_once('.').map_or(target, |(owner, _)| owner);
-        return Err(Error::new(
-            ErrorKind::InvalidOperation,
-            format!("assigning to `{target}` would make `{owner}` contain itself"),
-        ));
-    }
-    Ok(value.clone())
+// The namespaces created in this render. minijinja's `Namespace` type is private and its global
+// `namespace` is the only thing that makes one, so the global is wrapped to record each new
+// namespace; an alias of the global is this same function, so provenance survives aliasing. Kept
+// in the render's `State`, so it starts empty for every render.
+struct Namespaces(Vec<Value>);
+
+fn namespace(state: &mut State, defaults: Option<ValueOrKwargs>) -> Result<Value, Error> {
+    let created = functions::namespace(defaults)?;
+    state
+        .get_or_insert_extension(Namespaces(Vec::new()))
+        .0
+        .push(created.clone());
+    Ok(created)
 }
 
-// minijinja's unpacking of a target list (`vm::unpack_list`): an object's items, checked, exactly
-// `count` of them, with minijinja's own errors.
-fn unpack(value: &Value, count: usize) -> Result<Value, Error> {
-    if value.as_object().is_none() {
-        return Err(Error::new(ErrorKind::CannotUnpack, "value is not iterable"));
+fn is_namespace(state: &State, value: &Value) -> bool {
+    state.get_extension::<Namespaces>().is_some_and(|known| {
+        known
+            .0
+            .iter()
+            .any(|namespace| tests::is_sameas(namespace, value))
+    })
+}
+
+// Every `{% set ns.x = value %}` passes through here between evaluating `ns` and storing. Only a
+// real namespace is checked; any other receiver goes on to minijinja's own SetAttr error. Two
+// stores are refused before they happen:
+// - a value that reaches the receiver, which would make the namespace contain itself, so that
+//   rendering, comparing, or sorting it recurses without end;
+// - a value holding a lazy sequence anywhere, because a lazy sequence keeps references it does not
+//   yield yet (a `zip` cut short, an empty slice) that could reach the receiver once it is stored.
+fn acyclic(state: &State, value: &Value, receiver: &Value, target: &str) -> Result<Value, Error> {
+    if !is_namespace(state, receiver) {
+        return Ok(value.clone());
     }
-    let items = value
+    match stored(value, receiver) {
+        Stored::Plain => Ok(value.clone()),
+        Stored::Cycle => {
+            let owner = target.rsplit_once('.').map_or(target, |(owner, _)| owner);
+            Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("assigning to `{target}` would make `{owner}` contain itself"),
+            ))
+        }
+        Stored::Lazy => Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!("`{target}` cannot hold a lazy sequence; store a list instead, with `| list`"),
+        )),
+    }
+}
+
+enum Stored {
+    Plain,
+    Cycle,
+    Lazy,
+}
+
+// Walks what `start` holds, by object identity only: no rendering, hashing, structural comparison,
+// or call. A map gives its keys and values and a sequence its items, all of what each holds (the
+// pinned producers of both kinds expose every reference they keep). A lazy sequence is never
+// iterated: it is noted, and refused unless the receiver is reached. A plain object (a function)
+// holds no template value. Each object is entered once.
+fn stored(start: &Value, receiver: &Value) -> Stored {
+    let mut pending = vec![start.clone()];
+    let mut seen: Vec<Value> = Vec::new();
+    let mut lazy = false;
+    while let Some(value) = pending.pop() {
+        if value.as_object().is_none() {
+            continue;
+        }
+        if tests::is_sameas(&value, receiver) {
+            return Stored::Cycle;
+        }
+        if seen.iter().any(|known| tests::is_sameas(known, &value)) {
+            continue;
+        }
+        seen.push(value.clone());
+        match value.kind() {
+            ValueKind::Map => {
+                if let Ok(keys) = value.try_iter() {
+                    for key in keys {
+                        if let Ok(item) = value.get_item(&key) {
+                            pending.push(item);
+                        }
+                        pending.push(key);
+                    }
+                }
+            }
+            ValueKind::Seq => {
+                if let Ok(items) = value.try_iter() {
+                    pending.extend(items);
+                }
+            }
+            ValueKind::Iterable => lazy = true,
+            _ => {}
+        }
+    }
+    if lazy { Stored::Lazy } else { Stored::Plain }
+}
+
+// minijinja's unpacking of a target list (`vm::unpack_list`): the object-level items (so a scalar
+// and a non-enumerable object such as a function both fail as `value is not iterable`), each
+// checked, exactly `count` of them, with minijinja's own error kinds and messages.
+fn unpack(value: &Value, count: usize) -> Result<Value, Error> {
+    let Some(items) = value.as_object().and_then(DynObject::try_iter) else {
+        return Err(Error::new(ErrorKind::CannotUnpack, "value is not iterable"));
+    };
+    let items = Value::from(items.collect::<Vec<Value>>())
         .try_iter()?
         .checked()
         .collect::<Result<Vec<Value>, Error>>()?;
@@ -141,48 +229,8 @@ fn store(known: &Value, number: usize, items: Value) -> Result<Value, Error> {
     Ok(Value::from(lists))
 }
 
-// Walks what `start` holds by object identity only: no rendering, hashing, structural comparison,
-// or call. Maps give their keys and values, sequences and iterables their items; every iterable a
-// template can hold is re-iterable (minijinja's builtins make no one-shot iterators), and a plain
-// object (a function) holds no template value. Each object is entered once.
-fn reaches(start: &Value, target: &Value) -> bool {
-    let mut pending = vec![start.clone()];
-    let mut seen: Vec<Value> = Vec::new();
-    while let Some(value) = pending.pop() {
-        if value.as_object().is_none() {
-            continue;
-        }
-        if tests::is_sameas(&value, target) {
-            return true;
-        }
-        if seen.iter().any(|known| tests::is_sameas(known, &value)) {
-            continue;
-        }
-        seen.push(value.clone());
-        match value.kind() {
-            ValueKind::Map => {
-                if let Ok(keys) = value.try_iter() {
-                    for key in keys {
-                        if let Ok(item) = value.get_item(&key) {
-                            pending.push(item);
-                        }
-                        pending.push(key);
-                    }
-                }
-            }
-            ValueKind::Seq | ValueKind::Iterable => {
-                if let Ok(items) = value.try_iter() {
-                    pending.extend(items);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 // minijinja chains maps into a live view that hides which maps it reads, so a namespace behind it
-// would be invisible to `reaches`. The maps are merged into an ordinary map instead, with the same
+// would be invisible to `stored`. The maps are merged into an ordinary map instead, with the same
 // precedence (the last map holding a key wins); it no longer follows later namespace changes.
 fn chain(state: &State, value: &Value, others: Rest<Value>) -> Result<Value, Error> {
     let chained = filters::chain(state, value.clone(), others)?;

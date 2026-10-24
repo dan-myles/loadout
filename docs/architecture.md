@@ -450,16 +450,35 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     templates must not use it), in minijinja's own order. The value is evaluated once and bound.
     Each target list is unpacked exactly once, when it is reached (the top list first, a nested
     list only after the targets before it are stored), through `__loadout_unpack` (minijinja's
-    unpacking: an object's items, exactly as many as the list, with minijinja's errors). Its items
+    unpacking: an object's own items, so a scalar or a function fails as `value is not iterable`,
+    exactly as many as the list, with minijinja's error kinds and messages). Its items
     are kept as a snapshot in `__loadout_parts` under the list's number, so a later target reads
     that snapshot and never re-reads a live value. For each target in order, its receiver is
     evaluated once and bound, `__loadout_acyclic` checks the target's part, and only then is it
     stored. There is no limit on the number of targets or on nesting.
-  - The check walks what the value holds by object identity only, with an explicit stack and each
-    object entered once: map keys and values, sequence items, and iterable items. Nothing is
-    rendered, hashed, compared structurally, or called. Every iterable a template can hold is
-    re-iterable (no enabled builtin makes a one-shot iterator), and the remaining plain objects
-    (functions) hold no template value.
+  - Only a **real namespace** receiver is checked. minijinja's `Namespace` type is private, and
+    its global `namespace` is the only thing that makes one, so the global is wrapped: it calls the
+    pinned constructor and records the new object's identity in the render's `State` (an alias of
+    the global is the same wrapper). Any other receiver (a map, a sequence, a number) goes straight
+    on to minijinja's own `can only assign to namespaces, not …` error, with its line.
+  - The check walks what the value holds by object identity, with an explicit stack and each
+    object entered once: map keys and values, and sequence items. Nothing is rendered, hashed,
+    compared structurally, or called, and a lazy sequence is **never iterated**.
+  - **Lazy sequences** (a third deliberate contract revision): a namespace attribute may not hold
+    a lazy (`Iterable`-kind) value anywhere in what it stores, because a lazy view keeps
+    references it does not yield yet (`[ns] | zip(ns)` while `ns` is empty, `[ns, 1][1:]`) that
+    could reach the receiver once stored. The store is refused at its line, before it happens:
+    ``` `ns.v` cannot hold a lazy sequence; store a list instead, with `| list` ```. Locals,
+    loops, filters, and a namespace built with `namespace(r=range(2))` keep minijinja's lazy
+    behaviour; only a store into a namespace attribute is checked.
+  - Representations, from the pinned producers. **Lazy:** `range`, `zip`, `reverse` of a sequence
+    or map, slicing a list or iterable, repeating a non-tuple sequence a nonzero number of times,
+    `+` of sequences, a `chain` that mixes maps and sequences or iterables, and groupby's `list`
+    view. **Transparent:** maps (literals, `dict`, namespaces, keyword arguments, the loop object),
+    lists, tuples (a tuple slice or repeat is a new tuple), a `chain` of only sequences, groupby's
+    group tuple (whose `list` is itself lazy), and `* 0` or repeating an empty sequence (an
+    empty list). The loop object's remembered `changed()` arguments are never exposed as a value,
+    so they cannot form a reachable cycle. No enabled builtin makes a one-shot iterator.
   - Opaque container: minijinja's `chain` of maps is a live view that hides which maps it reads.
     `chain` is wrapped to merge maps into an ordinary map with the same precedence (the last map
     with a key wins), so nothing can hide a namespace. This is a second deliberate contract

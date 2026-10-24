@@ -1006,21 +1006,9 @@ fn an_assignment_that_would_make_a_namespace_contain_itself_is_refused_first() {
             "ns",
         ),
         (
-            "{% set ns = namespace() %}\n{% set ns.z = [ns] | zip([1]) %}",
-            2,
-            "ns.z",
-            "ns",
-        ),
-        (
             "{% set ns = namespace() %}\n{% set ns.c = [ns] | chain([1]) %}",
             2,
             "ns.c",
-            "ns",
-        ),
-        (
-            "{% set ns = namespace() %}\n{% set ns.g = [ns] | groupby(\"n\", default=1) %}",
-            2,
-            "ns.g",
             "ns",
         ),
         (
@@ -1058,12 +1046,6 @@ fn an_assignment_that_would_make_a_namespace_contain_itself_is_refused_first() {
             2,
             "ns.inner.up",
             "ns.inner",
-        ),
-        (
-            "{% set ns = namespace() %}\n{% set ns.z | zip([ns]) %}ab{% endset %}",
-            2,
-            "ns.z",
-            "ns",
         ),
         (
             "{% set ns = namespace() %}{% set d = dict(n=ns) %}\n{% set ns.copy = namespace(d) %}",
@@ -1120,7 +1102,7 @@ fn acyclic_namespaces_aliases_and_shared_values_still_assign() {
             "5",
         ),
         (
-            "{% set ns = namespace() %}{% set ns.r = range(3) %}{{ ns.r | list | length }}",
+            "{% set ns = namespace() %}{% set ns.r = range(3) | list %}{{ ns.r | length }}",
             "3",
         ),
         (
@@ -1298,5 +1280,170 @@ fn each_target_list_is_unpacked_once_when_reached_as_minijinja_does() {
             ..
         }) => assert_eq!(message, "value is not iterable"),
         other => panic!("a scalar must keep minijinja's error, got {other:?}"),
+    }
+}
+
+fn refused_as_lazy(source: &str, target: &str) {
+    match render(source, &linux()) {
+        Err(Error {
+            line: Some(2),
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(
+            message,
+            format!("`{target}` cannot hold a lazy sequence; store a list instead, with `| list`"),
+            "{source:?}"
+        ),
+        other => panic!("{source:?} must refuse the lazy value at line 2, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_namespace_attribute_cannot_hold_a_lazy_sequence() {
+    let ns = "{% set ns = namespace() %}\n";
+    for value in [
+        "range(3)",
+        "[1] | zip([2])",
+        "[ns] | zip(ns)",
+        "[ns] | zip([])",
+        "[ns, 1][1:]",
+        "[ns] * 2",
+        "[1, 2] | reverse",
+        "[1] | chain(range(2))",
+        "ns | chain([])",
+        "[1] + [2]",
+        "[{\"a\": 1}] | groupby(\"a\")",
+        "([{}] | groupby(\"k\", default=ns) | first).list",
+        "[[1] | zip([2])]",
+        "{\"k\": range(2)}",
+        "namespace(r=range(2))",
+        "dict(z=[ns] | zip(ns))",
+    ] {
+        refused_as_lazy(
+            &format!("{ns}{{% set ns.v = {value} %}}{{{{ ns.v | list | pprint }}}}"),
+            "ns.v",
+        );
+    }
+    refused_as_lazy(
+        &format!("{ns}{{% set ns.z | zip([ns]) %}}ab{{% endset %}}"),
+        "ns.z",
+    );
+    refused_as_lazy(&format!("{ns}{{% set ns.a, ns.b = 1, range(2) %}}"), "ns.b");
+    renders(&[
+        (
+            "{% set ns = namespace() %}{% set ns.r = range(3) | list %}{{ ns.r | length }}",
+            "3",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.z = [1] | zip([2]) | list %}{{ ns.z | length }}",
+            "1",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = ([1, 2] | reverse) | list %}{{ ns.v | join }}",
+            "21",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = ([1] + [2]) | list %}{{ ns.v | join }}",
+            "12",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = [1, 2] | chain([3]) %}{{ ns.v | join }}",
+            "123",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = [ns] * 0 %}{{ ns.v | length }}",
+            "0",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = (ns, 1)[1:] %}{{ ns.v | join }}",
+            "1",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = [ns, 1][1:] | list %}{{ ns.v | join }}",
+            "1",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.v = (1, 2) * 2 %}{{ ns.v | length }}",
+            "4",
+        ),
+        (
+            "{% set z = [1, 2] | zip([3, 4]) %}{% for a, b in z %}{{ a }}{{ b }}{% endfor %}{{ z | list | length }}",
+            "13242",
+        ),
+        (
+            "{% set ns = namespace() %}{% set z = [ns] | zip([]) %}{{ z | list | length }}",
+            "0",
+        ),
+        (
+            "{% set held = namespace(r=range(2)) %}{{ held.r | list | length }}",
+            "2",
+        ),
+        (
+            "{% for x in range(2) %}{% set ns = namespace(r=[1][x:]) %}{{ ns.r | list | length }}{% endfor %}",
+            "10",
+        ),
+    ]);
+}
+
+#[test]
+fn only_a_real_namespace_receiver_is_checked_and_others_keep_minijinjas_error() {
+    for (source, kind) in [
+        ("{% set x = {} %}\n{% set x.y = x %}", "map"),
+        ("{% set s = [1] %}\n{% set s.y = s %}", "sequence"),
+        ("{% set x = {} %}\n{% set x.y = {\"a\": 1} %}", "map"),
+        ("{% set x = {} %}\n{% set x.y = range(2) %}", "map"),
+        ("{% set x = 1 %}\n{% set x.y = 2 %}", "number"),
+    ] {
+        match render(source, &linux()) {
+            Err(Error {
+                line: Some(2),
+                problem: Problem::Render(message),
+                ..
+            }) => assert_eq!(
+                message,
+                format!("can only assign to namespaces, not {kind}"),
+                "{source:?}"
+            ),
+            other => panic!("{source:?} must keep minijinja's error, got {other:?}"),
+        }
+    }
+    cyclic_at(
+        "{% set make = namespace %}{% set ns = make() %}\n{% set ns.self = ns %}",
+        2,
+        "ns.self",
+        "ns",
+    );
+    refused_as_lazy(
+        "{% set ns = {\"f\": namespace}.f() %}\n{% set ns.r = range(2) %}",
+        "ns.r",
+    );
+    renders(&[
+        (
+            "{% set ns = namespace() %}{% set other = namespace(v=1) %}{% set ns.o = other %}{{ ns.o.v }}",
+            "1",
+        ),
+        (
+            "{% set make = namespace %}{% set ns = make(n=1) %}{% set ns.n = ns.n + 1 %}{{ ns.n }}",
+            "2",
+        ),
+    ]);
+}
+
+#[test]
+fn unpacking_a_function_keeps_minijinjas_not_iterable_error() {
+    for source in [
+        "{% set ns = namespace() %}\n{% set ns.a, ns.b = dict %}",
+        "{% set f = dict %}{% set ns = namespace() %}\n{% set ns.a, ns.b = f %}",
+        "{% set ns = namespace() %}\n{% set ns.a, (ns.b, ns.c) = 1, dict %}",
+        "{% set ns = namespace() %}\n{% set x, ns.a = namespace %}",
+    ] {
+        match render(source, &linux()) {
+            Err(Error {
+                line: Some(2),
+                problem: Problem::Render(message),
+                ..
+            }) => assert_eq!(message, "value is not iterable", "{source:?}"),
+            other => panic!("{source:?} must keep minijinja's unpack error, got {other:?}"),
+        }
     }
 }
