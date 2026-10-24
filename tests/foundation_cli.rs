@@ -898,6 +898,72 @@ fn doctor_reads_a_saved_machine_name() {
     assert!(text.contains("work-laptop (saved in"), "{text}");
 }
 
+fn run_with_deadline(mut command: Command) -> Output {
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            panic!("{command:?} hung");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_non_regular_machine_file_instead_of_hanging() {
+    use std::os::unix::fs::symlink;
+
+    let mkfifo =
+        |path: &Path| assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
+    for layout in ["fifo", "link-to-fifo", "dir"] {
+        let sandbox = Sandbox::new();
+        fs::create_dir(&sandbox.state).unwrap();
+        let file = sandbox.state.join("machine.toml");
+        match layout {
+            "fifo" => mkfifo(&file),
+            "link-to-fifo" => {
+                mkfifo(&sandbox.state.join("pipe"));
+                symlink(sandbox.state.join("pipe"), &file).unwrap();
+            }
+            _ => fs::create_dir(&file).unwrap(),
+        }
+        for json in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
+            command
+                .arg("doctor")
+                .args(json.then_some("--json"))
+                .env("LOADOUT_HOME", &sandbox.home)
+                .env("LOADOUT_STATE_DIR", &sandbox.state);
+            let output = run_with_deadline(command);
+            assert_eq!(output.status.code(), Some(4), "{layout} json={json}");
+            assert!(
+                stdout(&output).contains("must be a regular file"),
+                "{layout}"
+            );
+        }
+    }
+
+    let sandbox = Sandbox::new();
+    fs::create_dir(&sandbox.state).unwrap();
+    fs::write(sandbox.state.join("saved.toml"), "name = \"linked-box\"\n").unwrap();
+    symlink(
+        sandbox.state.join("saved.toml"),
+        sandbox.state.join("machine.toml"),
+    )
+    .unwrap();
+    let text = stdout(&sandbox.run(&["doctor"]));
+    assert!(text.contains("linked-box (saved in"), "{text}");
+}
+
 #[test]
 fn doctor_fails_on_a_broken_machine_file_or_missing_home() {
     let sandbox = Sandbox::new();

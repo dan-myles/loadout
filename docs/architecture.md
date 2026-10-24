@@ -429,7 +429,9 @@ absolute when set; an empty value counts as unset.
 <state>/lock               held for one plan+apply                             state (U3)
 ```
 
-`machine::name` (foundation) reads `machine.toml`. When the file is absent, the machine name
+`machine::name` (foundation) reads `machine.toml` only after checking that it resolves to a regular
+file. A FIFO, a folder, or a link to one is an invalid identity: doctor reports a failed check and
+exits 4, and never blocks. When the file is absent, the machine name
 defaults to the hostname, cut at the first `.`, lowercased, with other characters mapped to `-`.
 Once the file is written, renaming the computer doesn't change the name.
 

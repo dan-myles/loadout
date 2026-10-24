@@ -67,8 +67,7 @@ struct MachineFile {
 
 pub fn name(context: &Context) -> Result<Name, Error> {
     let path = context.machine_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(Name {
                 name: from_hostname(&gethostname::gethostname().to_string_lossy()),
@@ -76,7 +75,22 @@ pub fn name(context: &Context) -> Result<Name, Error> {
             });
         }
         Err(source) => return Err(Error::Read { path, source }),
-    };
+        Ok(_) => {}
+    }
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(Error::Invalid {
+                path,
+                message: "must be a regular file".to_owned(),
+            });
+        }
+        Err(source) => return Err(Error::Read { path, source }),
+    }
+    let text = fs::read_to_string(&path).map_err(|source| Error::Read {
+        path: path.clone(),
+        source,
+    })?;
     let file: MachineFile = toml::from_str(&text).map_err(|error| Error::Invalid {
         path: path.clone(),
         message: error.message().to_owned(),
