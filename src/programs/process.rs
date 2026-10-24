@@ -342,7 +342,10 @@ impl Query {
         trace: &mut Trace,
     ) -> Result<(), String> {
         let mut problem = None;
-        first(&mut problem, self.kill_group(trace).map(|()| true), "");
+        let first_kill = self.signal(Some(Signal::SIGKILL), Call::FirstKill, trace);
+        if let Some(detail) = first_kill_problem(first_kill) {
+            problem.get_or_insert(detail);
+        }
         let reaped = until(limit, || {
             self.child
                 .try_wait()
@@ -358,19 +361,33 @@ impl Query {
             note(trace, Event::ReadersDone);
         }
         first(&mut problem, drain, "its output is still held open");
-        first(&mut problem, self.kill_group(trace).map(|()| true), "");
+        let second = self.signal(Some(Signal::SIGKILL), Call::SecondKill, trace);
+        let pending = match second_kill(second) {
+            Ok(pending) => pending,
+            Err(detail) => {
+                problem.get_or_insert(detail);
+                None
+            }
+        };
         let input = self.anchor_input.take();
         if let Err(detail) = release_anchor(&mut self.anchor, input, limit, trace) {
             problem.get_or_insert(detail);
         }
-        let group = self.group;
-        let empty = until(limit, || group_empty(group));
+        let mut last = Probe::Members;
+        let freed = until(limit, || {
+            last = probe(self.signal(None, Call::Probe, trace))?;
+            Ok(last == Probe::Freed)
+        });
         note(trace, Event::Probed);
-        first(
-            &mut problem,
-            empty,
-            "processes it started are still running",
-        );
+        match freed {
+            Ok(true) => {}
+            Ok(false) => {
+                problem.get_or_insert(still_present(last, pending));
+            }
+            Err(detail) => {
+                problem.get_or_insert(detail);
+            }
+        }
         match problem {
             None => Ok(()),
             Some(detail) => Err(format!(
@@ -380,10 +397,19 @@ impl Query {
         }
     }
 
-    /// SIGKILL to the whole group. Only called while the anchor is unreaped, so the id is ours.
-    fn kill_group(&self, trace: &mut Trace) -> Result<(), String> {
-        note(trace, Event::KilledGroup);
-        killed(killpg(self.group, Signal::SIGKILL).map_err(io::Error::from))
+    /// One signal to the whole group, returning the raw result, which tests record after the
+    /// call. `settle` sends SIGKILL only while the anchor is unreaped, so the id is still ours;
+    /// after the anchor's reap it sends only signal 0 (`None`).
+    fn signal(&self, signal: Option<Signal>, call: Call, trace: &mut Trace) -> Result<(), Errno> {
+        if signal.is_some() {
+            note(trace, Event::KilledGroup);
+        }
+        let result = killpg(self.group, signal);
+        #[cfg(test)]
+        note(trace, Event::Signal(call, result));
+        #[cfg(not(test))]
+        let _ = call;
+        result
     }
 }
 
@@ -436,26 +462,82 @@ fn release_anchor(
     problem.map_or(Ok(()), Err)
 }
 
-/// The result of killing the group or job. On Unix, `ESRCH` means the group is already gone;
-/// every other error is real.
-fn killed(result: io::Result<()>) -> Result<(), String> {
+/// Which group signal a result came from.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    FirstKill,
+    SecondKill,
+    Probe,
+}
+
+/// What a signal-0 probe of the group says once the anchor is reaped.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// Some member took the signal: something is still running.
+    Members,
+    /// The group exists but has no member loadout may signal. On macOS a group whose members
+    /// are all zombies answers this way (XNU skips zombies and then returns EPERM), and so does
+    /// a group holding another user's process.
+    Unsignalable,
+    /// `ESRCH`: the group was freed, so every member has been reaped. The only "gone".
+    Freed,
+}
+
+/// The first SIGKILL is sent while the anchor is alive and loadout's own, so the group has a
+/// member loadout may signal. Any error here, `ESRCH` and `EPERM` included, is real.
+#[cfg(unix)]
+fn first_kill_problem(result: Result<(), Errno>) -> Option<String> {
+    result.err().map(|error| {
+        format!("cannot stop it: the first kill of its process group failed ({error})")
+    })
+}
+
+/// By the second SIGKILL the anchor (still unreaped) may already be a zombie, and a group of
+/// only zombies answers `EPERM` on macOS. That is inconclusive, never success: it stays pending
+/// until a later probe finds the group freed. Every other error is real.
+#[cfg(unix)]
+fn second_kill(result: Result<(), Errno>) -> Result<Option<Errno>, String> {
     match result {
-        Ok(()) => Ok(()),
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => Ok(()),
-        Err(error) => Err(format!("cannot stop it: {error}")),
+        Ok(()) => Ok(None),
+        Err(Errno::EPERM) => Ok(Some(Errno::EPERM)),
+        Err(error) => Err(format!(
+            "cannot stop it: the second kill of its process group failed ({error})"
+        )),
     }
 }
 
-/// Whether the group has no members left. Signal 0 delivers nothing, so a reused id can only
-/// make this answer "not empty", never harm another group.
+/// One signal-0 probe of the group. Only `ESRCH` means it is gone; `Ok` and `EPERM` mean wait.
+/// Signal 0 delivers nothing, so a reused id can only make cleanup fail, never harm a group.
 #[cfg(unix)]
-fn group_empty(group: Pid) -> Result<bool, String> {
-    match killpg(group, None) {
-        Ok(()) => Ok(false),
-        Err(Errno::ESRCH) => Ok(true),
-        Err(error) => Err(format!("cannot check process group {group}: {error}")),
+fn probe(result: Result<(), Errno>) -> Result<Probe, String> {
+    match result {
+        Ok(()) => Ok(Probe::Members),
+        Err(Errno::EPERM) => Ok(Probe::Unsignalable),
+        Err(Errno::ESRCH) => Ok(Probe::Freed),
+        Err(error) => Err(format!("cannot check its process group: {error}")),
     }
+}
+
+/// Why the group still exists when the cleanup limit runs out, with any pending second-kill
+/// refusal that no `ESRCH` cleared.
+#[cfg(unix)]
+fn still_present(last: Probe, pending: Option<Errno>) -> String {
+    let what = match last {
+        Probe::Unsignalable => "its process group still has members loadout can't signal (EPERM)",
+        Probe::Members | Probe::Freed => "processes it started are still running",
+    };
+    match pending {
+        Some(error) => format!("{what}, and the second kill of the group was refused ({error})"),
+        None => what.to_owned(),
+    }
+}
+
+/// The result of terminating the job. Every error is real.
+#[cfg(windows)]
+fn killed(result: io::Result<()>) -> Result<(), String> {
+    result.map_err(|error| format!("cannot stop it: {error}"))
 }
 
 /// On Windows the query runs in a job object, addressed through loadout's own handle, so there
@@ -539,6 +621,9 @@ enum Event {
     Anchor(u32),
     #[cfg(test)]
     Query(u32),
+    /// A group signal's raw result, recorded after the call.
+    #[cfg(test)]
+    Signal(Call, Result<(), Errno>),
     KilledGroup,
     ReapedQuery,
     ReadersDone,
@@ -903,22 +988,70 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_group_counts_as_already_stopped() {
-        use nix::errno::Errno;
-
-        assert_eq!(killed(Ok(())), Ok(()));
+    fn group_signal_results_are_judged_by_when_they_were_sent() {
+        assert_eq!(first_kill_problem(Ok(())), None);
+        for error in [Errno::EPERM, Errno::ESRCH, Errno::EINVAL] {
+            let detail = first_kill_problem(Err(error)).unwrap();
+            assert!(detail.contains("first kill"), "{error}: {detail}");
+        }
+        assert_eq!(second_kill(Ok(())), Ok(None));
+        assert_eq!(second_kill(Err(Errno::EPERM)), Ok(Some(Errno::EPERM)));
+        for error in [Errno::ESRCH, Errno::EINVAL] {
+            assert!(second_kill(Err(error)).is_err(), "{error}");
+        }
+        assert_eq!(probe(Ok(())), Ok(Probe::Members));
+        assert_eq!(probe(Err(Errno::EPERM)), Ok(Probe::Unsignalable));
+        assert_eq!(probe(Err(Errno::ESRCH)), Ok(Probe::Freed));
+        assert!(probe(Err(Errno::EINVAL)).is_err());
         assert_eq!(
-            killed(Err(io::Error::from_raw_os_error(Errno::ESRCH as i32))),
-            Ok(())
+            still_present(Probe::Members, None),
+            "processes it started are still running"
         );
-        assert!(killed(Err(io::Error::from_raw_os_error(Errno::EPERM as i32))).is_err());
+        let refused = still_present(Probe::Unsignalable, Some(Errno::EPERM));
+        assert!(refused.contains("can't signal"), "{refused}");
+        assert!(refused.contains("second kill of the group was refused"), "{refused}");
         let error = QueryError::Cleanup {
             cause: Some(Box::new(QueryError::TimedOut(QUERY_DEADLINE))),
-            detail: "its output is still held open 5 seconds after loadout stopped it".to_owned(),
+            detail: "its output is still held open (within the 5 second cleanup limit)".to_owned(),
         };
         let text = error.to_string();
         assert!(text.contains("could not confirm"), "{text}");
         assert!(text.contains("did not finish within 10 minutes"), "{text}");
+    }
+
+    /// The platform behaviour behind R6, reproduced deterministically: a process group whose
+    /// only member is an unreaped zombie. Linux signals zombies successfully; macOS's XNU skips
+    /// them and answers EPERM. Either way, only reaping frees the group (ESRCH).
+    #[test]
+    fn a_zombie_only_group_answers_as_the_platform_does_until_it_is_freed() {
+        let mut anchor = spawn_anchor(ANCHOR_SHELL).unwrap();
+        let group = Pid::from_raw(i32::try_from(anchor.id()).unwrap());
+        anchor.kill().unwrap();
+        let pid = anchor.id().to_string();
+        let zombie = until(Instant::now() + Duration::from_secs(5), || {
+            let stat = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .map_err(|error| error.to_string())?;
+            Ok(String::from_utf8_lossy(&stat.stdout).trim_start().starts_with('Z'))
+        });
+        let kill = killpg(group, Signal::SIGKILL);
+        let signal_zero = killpg(group, None);
+        anchor.wait().unwrap();
+        assert_eq!(zombie, Ok(true), "the anchor {pid} never became a zombie");
+        if cfg!(target_os = "macos") {
+            assert_eq!(kill, Err(Errno::EPERM));
+            assert_eq!(signal_zero, Err(Errno::EPERM));
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(kill, Ok(()));
+            assert_eq!(signal_zero, Ok(()));
+        }
+        assert_eq!(second_kill(kill).map(|_| ()), Ok(()));
+        assert!(matches!(
+            probe(signal_zero),
+            Ok(Probe::Members | Probe::Unsignalable)
+        ));
+        assert_eq!(probe(killpg(group, None)), Ok(Probe::Freed));
     }
 
     #[test]
@@ -1024,6 +1157,40 @@ mod tests {
             "a SIGKILL after the anchor was reaped: {events:?}"
         );
         assert_eq!(events.last(), Some(&Event::Probed), "{events:?}");
+        let results: Vec<(usize, Call, Result<(), Errno>)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                Event::Signal(call, result) => Some((index, *call, *result)),
+                _ => None,
+            })
+            .collect();
+        match results.as_slice() {
+            [
+                (first_at, Call::FirstKill, first),
+                (second_at, Call::SecondKill, second),
+                probes @ ..,
+            ] => {
+                assert_eq!(*first, Ok(()), "the first kill has a live anchor: {events:?}");
+                assert!(
+                    matches!(second, Ok(()) | Err(Errno::EPERM)),
+                    "{events:?}"
+                );
+                assert!(*first_at < reaped_query && *second_at < reaped_anchor);
+                assert!(
+                    probes
+                        .iter()
+                        .all(|(at, call, _)| *call == Call::Probe && *at > reaped_anchor),
+                    "only signal-0 probes after the anchor reap: {events:?}"
+                );
+                assert_eq!(
+                    probes.last().map(|(_, _, result)| *result),
+                    Some(Err(Errno::ESRCH)),
+                    "a settled query ends with its group freed: {events:?}"
+                );
+            }
+            _ => panic!("expected two kills then probes: {events:?}"),
+        }
     }
 
     fn assert_gone(events: &[Event]) {

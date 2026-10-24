@@ -933,14 +933,24 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
 
   While loadout hasn't reaped the anchor, alive or as a zombie, the group id can't be reused, so:
   - **Phase A (anchor unreaped)**, the only time a destructive signal is sent:
-    1. `killpg(SIGKILL)` to the group, with the result checked (only `ESRCH`, "already gone", is
-       accepted).
+    1. `killpg(SIGKILL)` to the group. The anchor is alive and loadout's own, so **any** error,
+       `ESRCH` and `EPERM` included, is a cleanup failure.
     2. Reap the query's own pid.
     3. Wait for both readers' EOF.
-    4. `killpg(SIGKILL)` again, for processes forked during the first kill.
+    4. `killpg(SIGKILL)` again, for processes forked during the first kill. The anchor may be a
+       zombie by now, and on macOS a group whose members are all zombies answers `EPERM` (XNU's
+       `killpg1` skips zombies, then returns `EPERM`). So `EPERM` here is **pending**, never
+       success. Any other error is a failure.
     5. Kill and reap the anchor by its own pid; an anchor that ended any other way is an error.
-  - **Phase B:** signal 0 only, until the group is empty. A reused id can then only make cleanup
+  - **Phase B:** signal 0 only, polled within the same cleanup limit. `Ok` (members remain) and
+    `EPERM` (zombies awaiting their reaper, or members loadout can't signal) mean wait. Only
+    `ESRCH`, the group freed because every member has been reaped, means the group is gone, and
+    only that clears a pending second-kill `EPERM`. If the limit runs out first, cleanup fails and
+    says which. An earlier, unrelated failure is never cleared. A reused id can only make cleanup
     fail, never kill another group.
+
+  Which macOS call returns `EPERM` in practice, and the zombie state behind it, come from XNU's
+  source and the CI failure pattern. They still need native confirmation.
 
   Only each child's own pid is ever waited on, never the group, so nothing reaps the anchor
   early. A query that fails to start, after its anchor started, still has its anchor killed and
