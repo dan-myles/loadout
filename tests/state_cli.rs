@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use loadout::context::Context;
 use loadout::plan::{
@@ -10,6 +11,18 @@ use loadout::plan::{
 use loadout::platform::Os;
 use loadout::state::{self, Run, State};
 use serde_json::Value;
+
+/// Serializes spawning the CLI against holding a state lock in this process. A child forked by
+/// another test thread inherits every open descriptor until its exec closes the close-on-exec
+/// ones, and a lock descriptor inherited that way keeps the flock held after this process drops
+/// it. So a test that locks, unlocks, and locks again (or runs the CLI) could see `Locked`.
+/// `Command::spawn` returns only after the child's exec, so holding this across `spawn` (not
+/// the wait) and across each in-process lock's whole life keeps the two from overlapping.
+static FORKS: Mutex<()> = Mutex::new(());
+
+fn forks() -> MutexGuard<'static, ()> {
+    FORKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 struct Machine {
     _dir: tempfile::TempDir,
@@ -40,12 +53,18 @@ impl Machine {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_loadout"))
-            .args(args)
-            .env("LOADOUT_HOME", &self.home)
-            .env("LOADOUT_STATE_DIR", &self.state)
-            .output()
-            .unwrap()
+        let child = {
+            let _forks = forks();
+            Command::new(env!("CARGO_BIN_EXE_loadout"))
+                .args(args)
+                .env("LOADOUT_HOME", &self.home)
+                .env("LOADOUT_STATE_DIR", &self.state)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        child.wait_with_output().unwrap()
     }
 
     fn checkout(&self) -> PathBuf {
@@ -86,6 +105,7 @@ impl Machine {
                 (self.action(path, &content), content)
             })
             .collect();
+        let _forks = forks();
         let lock = state::lock(&self.context).unwrap();
         let mut state = State::load(&self.context).unwrap();
         let plan = Plan {

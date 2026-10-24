@@ -547,15 +547,19 @@ fn a_dangling_symlink_target_is_created_at_its_real_destination() {
 
 #[cfg(unix)]
 #[test]
-fn a_fifo_target_is_refused_without_blocking() {
+fn a_special_file_target_or_child_is_refused_without_opening_it() {
+    // A socket stands in for a FIFO here because creating one needs no child process, and this
+    // test binary must not fork while other tests hold state locks. The guest E2E covers a FIFO.
     let machine = Machine::new();
-    let path = machine.path(".fifo");
-    let status = std::process::Command::new("mkfifo")
-        .arg(&path)
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let path = machine.path(".socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let error = state::observe(&machine.context, &machine.loadout, &target(&path)).unwrap_err();
+    assert!(matches!(error, Error::Special { .. }), "{error}");
+
+    let dir = machine.path(".agents/skills/review");
+    write_skill(&dir, "#!/bin/sh\n");
+    let _inner = std::os::unix::net::UnixListener::bind(dir.join("bin/agent.sock")).unwrap();
+    let error = state::observe(&machine.context, &machine.loadout, &target(&dir)).unwrap_err();
     assert!(matches!(error, Error::Special { .. }), "{error}");
 }
 
