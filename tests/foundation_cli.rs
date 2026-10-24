@@ -1091,6 +1091,72 @@ fn a_skill_folder_holding_the_real_git_metadata_is_rejected() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_worktree_admin_dir_reserves_its_common_dir_in_every_form() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let root = scratch.join("case");
+    let main = root.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    git(
+        scratch,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            scratch.join("wt").to_str().unwrap(),
+        ],
+    );
+    fs::rename(main.join(".git"), root.join("common")).unwrap();
+    let admin = fs::read_dir(root.join("common/worktrees"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(
+        root.join("loadout.toml"),
+        "[loadout]\nversion = 1\n[files.a]\nsource = \"common/config\"\ntarget = \"~/.a\"\n",
+    )
+    .unwrap();
+    let run = |json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    symlink(&admin, root.join(".git")).unwrap();
+    for json in [false, true] {
+        let (code, text) = run(json);
+        assert_eq!(code, 3, "directory-form .git json={json}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    fs::remove_file(root.join(".git")).unwrap();
+    fs::write(root.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    for json in [false, true] {
+        assert_eq!(run(json).0, 3, "gitfile-form .git json={json}");
+    }
+
+    fs::write(admin.join("commondir"), "garbage-not-a-dir\n").unwrap();
+    let (code, text) = run(false);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("unsupported Git metadata layout"), "{text}");
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

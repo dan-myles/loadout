@@ -728,13 +728,17 @@ fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let real = dot
         .canonicalize()
         .map_err(|error| format!("cannot resolve .git: {error}"))?;
-    if real.is_dir() {
-        return Ok(vec![real]);
-    }
-    let gitdir = git_pointer(&real, "gitdir: ")?;
-    let mut metadata = vec![real, gitdir.clone()];
-    if gitdir.join("commondir").exists() {
-        metadata.push(git_pointer(&gitdir.join("commondir"), "")?);
+    let (gitdir, mut metadata) = if real.is_dir() {
+        (real.clone(), vec![real])
+    } else {
+        let gitdir = git_pointer(&real, "gitdir: ")?;
+        (gitdir.clone(), vec![real, gitdir])
+    };
+    let common = gitdir.join("commondir");
+    match fs::symlink_metadata(&common) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect {}: {error}", common.display())),
+        Ok(_) => metadata.push(git_pointer(&common, "")?),
     }
     Ok(metadata)
 }
