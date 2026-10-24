@@ -1,9 +1,11 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
+use minijinja::value::ValueKind;
 use minijinja::value::{Kwargs, Rest, ValueOrKwargs, from_args};
 use minijinja::{Environment, Error, ErrorKind, State, Value, filters, tests};
 
-use super::strict::{CYCLE, Undefined, is_loop};
+use super::strict::{ACYCLIC, CYCLE, STORE, UNPACK, Undefined, is_current_loop};
 
 const ESCAPE_TESTS: [&str; 2] = ["defined", "undefined"];
 
@@ -24,7 +26,11 @@ pub(super) fn install(environment: &mut Environment<'_>) {
     environment.add_filter("rejectattr", rejectattr);
     environment.add_filter("items", items);
     environment.add_filter("dictsort", dictsort);
+    environment.add_filter("chain", chain);
     environment.add_function(CYCLE, cycle);
+    environment.add_function(ACYCLIC, acyclic);
+    environment.add_function(UNPACK, unpack);
+    environment.add_function(STORE, store);
 }
 
 // minijinja's test computes `a % b` unchecked on its integer path (neither operand a float), which
@@ -60,17 +66,135 @@ fn divisible_by(value: &Value, divisor: &Value) -> Result<bool, Error> {
     Ok(tests::is_divisibleby(value, divisor))
 }
 
-// The loop object's `cycle` computes `index % args.len()`, which panics with no arguments. Only
-// that object is intercepted (see `strict::is_loop`); every other receiver's `cycle` method is
-// called unchanged.
+// The loop object's `cycle` computes `index % args.len()`, which panics with no arguments. With
+// no arguments, only the running loop gets that error; a receiver with a `cycle` member keeps
+// minijinja's call of that member; anything else gets minijinja's own unknown-method error, built
+// here without calling into the receiver, because an aliased outer loop would still divide by
+// zero. With arguments, every receiver is called unchanged.
 fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, Error> {
-    if args.is_empty() && is_loop(receiver) {
+    if !args.is_empty()
+        || receiver
+            .as_object()
+            .is_some_and(|object| object.get_value(&Value::from("cycle")).is_some())
+    {
+        return receiver.call_method(state, "cycle", args);
+    }
+    if is_current_loop(state, receiver) {
         return Err(Error::new(
             ErrorKind::MissingArgument,
             "loop.cycle() needs at least one value to cycle through",
         ));
     }
-    receiver.call_method(state, "cycle", args)
+    Err(Error::new(
+        ErrorKind::UnknownMethod,
+        format!("{} has no method named cycle", receiver.kind()),
+    ))
+}
+
+// Every `{% set ns.x = value %}` passes through here between evaluating `ns` and storing. A value
+// that reaches the receiver would make the namespace contain itself, and rendering, comparing, or
+// sorting it would then recurse without end; so the store is refused before it happens.
+fn acyclic(value: &Value, receiver: &Value, target: &str) -> Result<Value, Error> {
+    if receiver.as_object().is_some() && reaches(value, receiver) {
+        let owner = target.rsplit_once('.').map_or(target, |(owner, _)| owner);
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!("assigning to `{target}` would make `{owner}` contain itself"),
+        ));
+    }
+    Ok(value.clone())
+}
+
+// minijinja's unpacking of a target list (`vm::unpack_list`): an object's items, checked, exactly
+// `count` of them, with minijinja's own errors.
+fn unpack(value: &Value, count: usize) -> Result<Value, Error> {
+    if value.as_object().is_none() {
+        return Err(Error::new(ErrorKind::CannotUnpack, "value is not iterable"));
+    }
+    let items = value
+        .try_iter()?
+        .checked()
+        .collect::<Result<Vec<Value>, Error>>()?;
+    if items.len() != count {
+        return Err(Error::new(
+            ErrorKind::CannotUnpack,
+            format!(
+                "sequence of wrong length (expected {count}, got {})",
+                items.len()
+            ),
+        ));
+    }
+    Ok(Value::from(items))
+}
+
+// The snapshots of a set statement's target lists so far, plus list `number`'s items: a new map,
+// so each list is unpacked exactly once and later targets read its items, not the live value.
+fn store(known: &Value, number: usize, items: Value) -> Result<Value, Error> {
+    let mut lists = BTreeMap::new();
+    if !known.is_none() {
+        for key in known.try_iter()? {
+            let snapshot = known.get_item(&key)?;
+            lists.insert(key, snapshot);
+        }
+    }
+    lists.insert(Value::from(number), items);
+    Ok(Value::from(lists))
+}
+
+// Walks what `start` holds by object identity only: no rendering, hashing, structural comparison,
+// or call. Maps give their keys and values, sequences and iterables their items; every iterable a
+// template can hold is re-iterable (minijinja's builtins make no one-shot iterators), and a plain
+// object (a function) holds no template value. Each object is entered once.
+fn reaches(start: &Value, target: &Value) -> bool {
+    let mut pending = vec![start.clone()];
+    let mut seen: Vec<Value> = Vec::new();
+    while let Some(value) = pending.pop() {
+        if value.as_object().is_none() {
+            continue;
+        }
+        if tests::is_sameas(&value, target) {
+            return true;
+        }
+        if seen.iter().any(|known| tests::is_sameas(known, &value)) {
+            continue;
+        }
+        seen.push(value.clone());
+        match value.kind() {
+            ValueKind::Map => {
+                if let Ok(keys) = value.try_iter() {
+                    for key in keys {
+                        if let Ok(item) = value.get_item(&key) {
+                            pending.push(item);
+                        }
+                        pending.push(key);
+                    }
+                }
+            }
+            ValueKind::Seq | ValueKind::Iterable => {
+                if let Ok(items) = value.try_iter() {
+                    pending.extend(items);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+// minijinja chains maps into a live view that hides which maps it reads, so a namespace behind it
+// would be invisible to `reaches`. The maps are merged into an ordinary map instead, with the same
+// precedence (the last map holding a key wins); it no longer follows later namespace changes.
+fn chain(state: &State, value: &Value, others: Rest<Value>) -> Result<Value, Error> {
+    let chained = filters::chain(state, value.clone(), others)?;
+    if chained.kind() != ValueKind::Map {
+        return Ok(chained);
+    }
+    let mut merged = BTreeMap::new();
+    for key in chained.try_iter()? {
+        let item = chained.get_item(&key)?;
+        merged.insert(key, item);
+    }
+    Ok(Value::from(merged))
 }
 
 fn min(state: &State, value: &Value, kwargs: Kwargs) -> Result<Value, Error> {
@@ -121,13 +245,13 @@ fn map(state: &mut State, value: &Value, args: Rest<ValueOrKwargs>) -> Result<Ve
             None => {}
         }
     }
-    let label = match (&named, positional.first()) {
-        (Some(named), _) => format!("map(attribute=\"{named}\")"),
-        (None, Some(filter)) => format!("map(\"{filter}\")"),
-        (None, None) => "map()".to_owned(),
-    };
     let mapped = filters::map(state, Value::from(items), args)?;
     if mapped.iter().any(Value::is_undefined) {
+        let label = match (&named, positional.first()) {
+            (Some(named), _) => format!("map(attribute={})", shown(named)),
+            (None, Some(filter)) => format!("map({})", shown(filter)),
+            (None, None) => "map()".to_owned(),
+        };
         return Err(undefined(format!("{label}: an item's result is undefined")));
     }
     Ok(mapped)
@@ -188,7 +312,8 @@ fn paired(pairs: &[Value], filter: &str) -> Result<(), Error> {
         if pair.get_item_by_index(1)?.is_undefined() {
             let key = pair.get_item_by_index(0)?;
             return Err(undefined(format!(
-                "{filter}: the value of \"{key}\" is undefined"
+                "{filter}: the value of {} is undefined",
+                shown(&key)
             )));
         }
     }
@@ -247,7 +372,8 @@ fn indexed(items: &[Value], key: &Value) -> Result<(), Error> {
             .map_or(true, |found| found.is_undefined())
         {
             return Err(undefined(format!(
-                "map(attribute={key}): an item has no item {key}"
+                "map(attribute={key}): an item has no item {key}",
+                key = shown(key)
             )));
         }
     }
@@ -261,4 +387,13 @@ fn undefined(message: String) -> Error {
         line: None,
     };
     Error::new(ErrorKind::UndefinedError, message).with_source(source)
+}
+
+// Names a value in a message without rendering it: a string is quoted, anything else is its kind,
+// so a deep or self-referring value can never make an error message recurse.
+fn shown(value: &Value) -> String {
+    match value.as_str() {
+        Some(text) => format!("\"{text}\""),
+        None => format!("a {}", value.kind()),
+    }
 }

@@ -435,12 +435,42 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
   assignment, a container item, a filter or test operand, and printing. Read through, it works:
   `loop.index`, `loop["first"]`, `loop.changed(c)`, `loop.cycle(…)`, `loop.length |
   default("?")`, and recursive `loop(…)`. A loop of known length is used whole normally. The loop
-  object is recognised as a map-kind object that renders as `<loop …>` and lists exactly its nine
-  keys in order; a map or namespace renders as `{…}` and sorts its keys. Kind is checked before
-  anything is iterated, so an iterator is never consumed.
+  is recognised only by object identity (`tests::is_sameas`) with what `loop` names in the
+  innermost running loop; nothing is rendered, iterated, or called. That suffices, because every
+  alias, copy, or container of a loop is made from a whole value while that loop is current.
+- **Namespace cycles** (a deliberate contract revision, not pinned minijinja behaviour). A namespace
+  is the only object a template can change, and only `{% set ns.attr = value %}` changes it (also
+  unpacked, as in `{% set ns.a, x = … %}`, and as a block, `{% set ns.attr %}…{% endset %}`).
+  minijinja accepts `{% set ns.self = ns %}`, and then rendering, comparing, or sorting `ns`
+  recurses until the process aborts. Loadout refuses an assignment whose value reaches its
+  receiver: ``assigning to `ns.self` would make `ns` contain itself``, at the assignment's line,
+  before the store. Self-reference is no longer supported.
+  - The rewrite spells such a statement out with three locals, `__loadout_value`,
+    `__loadout_parts`, and `__loadout_receiver` (reserved, with the whole `__loadout_` prefix;
+    templates must not use it), in minijinja's own order. The value is evaluated once and bound.
+    Each target list is unpacked exactly once, when it is reached (the top list first, a nested
+    list only after the targets before it are stored), through `__loadout_unpack` (minijinja's
+    unpacking: an object's items, exactly as many as the list, with minijinja's errors). Its items
+    are kept as a snapshot in `__loadout_parts` under the list's number, so a later target reads
+    that snapshot and never re-reads a live value. For each target in order, its receiver is
+    evaluated once and bound, `__loadout_acyclic` checks the target's part, and only then is it
+    stored. There is no limit on the number of targets or on nesting.
+  - The check walks what the value holds by object identity only, with an explicit stack and each
+    object entered once: map keys and values, sequence items, and iterable items. Nothing is
+    rendered, hashed, compared structurally, or called. Every iterable a template can hold is
+    re-iterable (no enabled builtin makes a one-shot iterator), and the remaining plain objects
+    (functions) hold no template value.
+  - Opaque container: minijinja's `chain` of maps is a live view that hides which maps it reads.
+    `chain` is wrapped to merge maps into an ordinary map with the same precedence (the last map
+    with a key wins), so nothing can hide a namespace. This is a second deliberate contract
+    revision: the merged map is a snapshot and no longer follows later changes to a chained
+    namespace. A `chain` of sequences or iterables is unchanged.
+  - Acyclic aliases, shared values (a DAG), repeated assignments, and nested namespaces assign as
+    before.
+
 - **Builtins** (`src/template/builtins.rs`). Some builtins compute or consume values inside Rust,
   where no guard runs. Every filter, test, and global minijinja registers under the enabled
-  features (47 filters, 42 tests, and `range`, `dict`, `namespace`; `debug` is removed) was
+  features (47 filters (11 wrapped, `chain` included), 42 tests, and `range`, `dict`, `namespace`; `debug` is removed) was
   inventoried from `defaults.rs`, including multi-line registrations. With the replacements below,
   they keep one invariant: **a missing value is never stored in a container, and never consumed
   inside a builtin unless an explicit escape asked for it.** Builtins that only move, compare, or
@@ -461,6 +491,11 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     whole-loop guard.
   - `dict`, `namespace`, and `**` splats copy a map's pairs. Every map they can receive holds only
     guarded values, except a whole loop object of unknown length, which the guard refuses first.
+  - `chain` of maps returns a merged ordinary map (see Namespace cycles).
+  - `cycle` with no values: the running loop gets a typed error with its line; a receiver with a
+    `cycle` member keeps minijinja's call of it; anything else gets minijinja's own unknown-method
+    error, made without calling the receiver.
+  - Messages name a non-string value by its kind, never by rendering it.
   - A wrapper collects its input once, so a one-shot iterator is never consumed twice.
 
   Correction: the U2 report for `fbd7579` said `selectattr` and `rejectattr` were not registered.
@@ -474,9 +509,10 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     `true is divisibleby(0.5)` and `9223372036854775808.0 is divisibleby(2)` are true, and
     `"x" is divisibleby(0)` is false.
   - The loop object's `cycle()` divides by its argument count. A method call named `cycle` goes
-    through a function that refuses an empty argument list (`cycle()`, `cycle(*[])`) with its line,
-    but only on the loop object, which it recognises by the exact key list it enumerates. Every
-    other receiver's `cycle` is called unchanged.
+    through a function that never calls a receiver's `cycle` method without values: the running
+    loop gets a typed error with its line (`cycle()`, `cycle(*[])`), a `cycle` member is still
+    called, and anything else, an aliased outer loop included, gets minijinja's own unknown-method
+    error. With values, every receiver is called unchanged.
   - Any other panic inside the engine is caught at `render` and becomes
     `Problem::Render("the template engine failed: …")` for the file, with no line, because a panic
     carries none. A panic hook installed once suppresses the report only while the current thread

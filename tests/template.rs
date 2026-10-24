@@ -942,3 +942,361 @@ fn only_the_real_loop_object_counts_as_a_loop() {
         "122",
     )]);
 }
+
+fn cyclic_at(source: &str, line: usize, target: &str, owner: &str) {
+    match render(source, &linux()) {
+        Err(Error {
+            line: Some(found),
+            problem: Problem::Render(message),
+            ..
+        }) => {
+            assert_eq!(found, line, "{source:?}: {message}");
+            assert_eq!(
+                message,
+                format!("assigning to `{target}` would make `{owner}` contain itself"),
+                "{source:?}"
+            );
+        }
+        other => panic!("{source:?} must refuse the cyclic assignment, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_assignment_that_would_make_a_namespace_contain_itself_is_refused_first() {
+    let ns = "{% set ns = namespace(n=1) %}\n";
+    for after in [
+        "{{ ns | length }}",
+        "{{ ns }}",
+        "{{ ns | pprint }}",
+        "{{ ns == ns }}",
+        "{{ ns | items | length }}",
+        "{{ ns | dictsort | length }}",
+        "",
+    ] {
+        cyclic_at(
+            &format!("{ns}{{% set ns.self = ns %}}{after}"),
+            2,
+            "ns.self",
+            "ns",
+        );
+    }
+    for (source, line, target, owner) in [
+        (
+            "{% set a = namespace() %}{% set b = namespace() %}{% set a.b = b %}\n{% set b.a = a %}{{ a }}",
+            2,
+            "b.a",
+            "b",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.items = [{\"x\": [ns]}] %}",
+            2,
+            "ns.items",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.t = (1, (2, ns)) %}",
+            2,
+            "ns.t",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.k = {ns: 1} %}",
+            2,
+            "ns.k",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.z = [ns] | zip([1]) %}",
+            2,
+            "ns.z",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.c = [ns] | chain([1]) %}",
+            2,
+            "ns.c",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.g = [ns] | groupby(\"n\", default=1) %}",
+            2,
+            "ns.g",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}{% set alias = ns %}\n{% set ns.a = alias %}",
+            2,
+            "ns.a",
+            "ns",
+        ),
+        (
+            "{% set outer = namespace() %}{% set inner = namespace(o=outer) %}\n{% set outer.i = inner %}",
+            2,
+            "outer.i",
+            "outer",
+        ),
+        (
+            "{% set outer = namespace() %}{% set inner = namespace() %}{% set outer.i = inner %}\n{% set inner.back = {\"to\": [outer]} %}",
+            2,
+            "inner.back",
+            "inner",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.a = 1 %}\n{% set ns.a = ns %}",
+            2,
+            "ns.a",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.a, ns.b = 1, ns %}",
+            2,
+            "ns.b",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace(inner=namespace()) %}\n{% set ns.inner.up = ns %}",
+            2,
+            "ns.inner.up",
+            "ns.inner",
+        ),
+        (
+            "{% set ns = namespace() %}\n{% set ns.z | zip([ns]) %}ab{% endset %}",
+            2,
+            "ns.z",
+            "ns",
+        ),
+        (
+            "{% set ns = namespace() %}{% set d = dict(n=ns) %}\n{% set ns.copy = namespace(d) %}",
+            2,
+            "ns.copy",
+            "ns",
+        ),
+    ] {
+        cyclic_at(source, line, target, owner);
+    }
+}
+
+#[test]
+fn acyclic_namespaces_aliases_and_shared_values_still_assign() {
+    renders(&[
+        (
+            "{% set inner = namespace(v=1) %}{% set outer = namespace(i=inner) %}{% set outer.list = [inner, {\"k\": inner}] %}{{ outer.i.v }}{{ outer.list | length }}",
+            "12",
+        ),
+        (
+            "{% set leaf = namespace(v=1) %}{% set a = namespace() %}{% set b = namespace() %}{% set a.l = leaf %}{% set b.l = leaf %}{% set a.b = b %}{{ a.b.l.v }}{{ a.l.v }}",
+            "11",
+        ),
+        (
+            "{% set ns = namespace(n=0) %}{% for i in range(4) %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}",
+            "6",
+        ),
+        (
+            "{% set ns = namespace() %}{% for x in [1] %}{% set ns.c = loop.changed(1) %}{{ ns.c }}{{ loop.changed(1) }}{% endfor %}",
+            "TrueFalse",
+        ),
+        (
+            "{% set ns = namespace() %}{% set (ns.a, (x, ns.b)) = (1, (2, 3)) %}{{ ns.a }}{{ x }}{{ ns.b }}",
+            "123",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.s %}text{% endset %}{{ ns.s }}",
+            "text",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.s | upper %}text{% endset %}{{ ns.s }}",
+            "TEXT",
+        ),
+        (
+            "{% set ns = namespace(n=1) %}{% set ns.copy = dict(ns) %}{% set ns.merged = ns | chain({\"m\": 2}) %}{{ ns.copy | length }}{{ ns.merged | length }}{{ ns | length }}",
+            "133",
+        ),
+        (
+            "{% set ns = namespace(n=1) %}{% set view = ns | chain({}) %}{% set ns.n = 2 %}{{ view.n }}{{ ns.n }}",
+            "12",
+        ),
+        (
+            "{% set ns = namespace(inner=namespace()) %}{% set ns.inner.v = 5 %}{{ ns.inner.v }}",
+            "5",
+        ),
+        (
+            "{% set ns = namespace() %}{% set ns.r = range(3) %}{{ ns.r | list | length }}",
+            "3",
+        ),
+        (
+            "{% set m = {\"cycle\": dict} %}{{ m.cycle() | length }}",
+            "0",
+        ),
+        ("{{ namespace(cycle=range).cycle(2) | list | length }}", "2"),
+    ]);
+    match render(
+        "{% set nope = namespace() %}{% set nope.x = typo %}",
+        &linux(),
+    ) {
+        Err(Error {
+            problem: Problem::Missing(variable),
+            ..
+        }) => assert_eq!(
+            variable, "typo",
+            "the value is still evaluated before the receiver"
+        ),
+        other => panic!("a missing value must fail first, got {other:?}"),
+    }
+    assert!(render("{% set x = 1 %}{% set x.y = 2 %}", &linux()).is_err());
+}
+
+#[test]
+fn messages_name_values_without_rendering_them() {
+    let ns = "{% set ns = namespace(n=1) %}";
+    fails_with(&format!("{ns}{{{{ [machine] | map(ns) | join }}}}"), "");
+    for (source, needle) in [
+        (
+            format!("{ns}{{{{ [[]] | map(\"first\") | length }}}}"),
+            "map(\"first\"): an item's result is undefined",
+        ),
+        (
+            format!("{ns}{{{{ [ns] | map(attribute=\"missing\") | length }}}}"),
+            "map(attribute=\"missing\")",
+        ),
+        (
+            format!("{ns}{{{{ ns.cycle() }}}}"),
+            "map has no method named cycle",
+        ),
+    ] {
+        fails_with(&source, needle);
+    }
+}
+
+#[test]
+fn only_the_running_loop_is_checked_and_every_route_to_it_is_covered() {
+    for body in [
+        "{% set outer = loop %}",
+        "{{ dict(loop | default(1)) | length }}",
+        "{{ dict(loop | d(1)) | length }}",
+        "{{ loop | default(0) is mapping }}",
+        "{{ [loop if true else 1] | length }}",
+        "{{ dict((loop, 1)[0]) | length }}",
+        "{% for x in [1] %}{% endfor %}{{ dict(loop) | length }}",
+        "{% with alias = loop %}{% endwith %}",
+    ] {
+        fails_with(&format!("{{% for c in \"ab\" %}}{body}{{% endfor %}}"), "`");
+    }
+    fails_with(
+        "{% for c in \"ab\" recursive %}{{ dict(loop) | length }}{% endfor %}",
+        "in a loop of unknown length",
+    );
+    renders(&[
+        (
+            "{% for c in \"ab\" %}{% for x in [1] %}{{ dict(loop) | length }}{% endfor %}{% endfor %}",
+            "99",
+        ),
+        (
+            "{% for x in [1, 2] %}{% set outer = loop %}{% for c in \"ab\" %}{{ dict(outer) | length }}{{ outer.index }}{% endfor %}{% endfor %}",
+            "91919292",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop is defined }}{% endfor %}",
+            "TrueTrue",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ (loop | default(0)).index }}{{ (loop if true else 0).first }}{% endfor %}",
+            "1True2False",
+        ),
+        (
+            "{% for row in [[[]], []] recursive %}{{ dict(loop) | length }}{{ loop(row) }}{% endfor %}",
+            "999",
+        ),
+    ]);
+    for reserved in [
+        "{% for c in \"ab\" %}{% set loop = 1 %}{% endfor %}",
+        "{% for loop in [1] %}{% endfor %}",
+        "{% with loop = 1 %}{% endwith %}",
+    ] {
+        assert!(
+            matches!(
+                template::check(Path::new(FILE), reserved),
+                Err(Error {
+                    problem: Problem::Syntax(_),
+                    ..
+                })
+            ),
+            "{reserved} must not be able to shadow loop"
+        );
+    }
+}
+
+#[test]
+fn a_set_statement_has_no_target_count_limit() {
+    let targets: Vec<String> = (0..300).map(|index| format!("ns.a{index}")).collect();
+    let source = format!(
+        "{{% set ns = namespace() %}}{{% set {} = range(300) %}}{{{{ ns.a0 }}}}-{{{{ ns.a299 }}}}",
+        targets.join(", ")
+    );
+    assert_eq!(render(&source, &linux()).unwrap(), "0-299");
+    match render(
+        "{% set ns = namespace() %}{% set ns.a, ns.b = [1] %}",
+        &linux(),
+    ) {
+        Err(Error {
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(message, "sequence of wrong length (expected 2, got 1)"),
+        other => panic!("a short sequence keeps minijinja's unpack error, got {other:?}"),
+    }
+}
+
+#[test]
+fn each_target_list_is_unpacked_once_when_reached_as_minijinja_does() {
+    renders(&[
+        (
+            "{% set ns = namespace(a=1, b=2) %}{% set ns.c, ns.d = ns %}{{ ns.c }}{{ ns.d }}{{ ns | length }}",
+            "ab4",
+        ),
+        (
+            "{% set ns = namespace(a=1) %}{% set ns.x, (ns.y, ns.z) = 1, ns %}{{ ns.y }}{{ ns.z }}",
+            "ax",
+        ),
+        (
+            "{% set ns = namespace(a=1, b=2) %}{% set x, ns.c, (y, ns.d) = [1, \"q\", ns] | list | first | string, \"r\", [3, 4] %}{{ x }}{{ ns.c }}{{ y }}{{ ns.d }}",
+            "1r34",
+        ),
+        (
+            "{% set ns = namespace() %}{% set (ns.a, ns.b), ns.c = (1, 2), 3 %}{{ ns.a }}{{ ns.b }}{{ ns.c }}",
+            "123",
+        ),
+    ]);
+    match render(
+        "{% set ns = namespace() %}\n{% set ns.x, (ns.y, ns.z) = 1, ns %}",
+        &linux(),
+    ) {
+        Err(Error {
+            line: Some(2),
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(
+            message, "sequence of wrong length (expected 2, got 1)",
+            "the nested list is unpacked after ns.x is stored, so it sees one key"
+        ),
+        other => panic!("a short nested list must keep minijinja's error, got {other:?}"),
+    }
+    match render(
+        "{% set ns = namespace() %}{% set ns.a, ns.b = [1, 2, 3] %}",
+        &linux(),
+    ) {
+        Err(Error {
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(message, "sequence of wrong length (expected 2, got 3)"),
+        other => panic!("a long list must keep minijinja's error, got {other:?}"),
+    }
+    match render(
+        "{% set ns = namespace() %}{% set ns.a, ns.b = 7 %}",
+        &linux(),
+    ) {
+        Err(Error {
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(message, "value is not iterable"),
+        other => panic!("a scalar must keep minijinja's error, got {other:?}"),
+    }
+}

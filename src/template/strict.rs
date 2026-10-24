@@ -1,6 +1,8 @@
-use minijinja::Value;
+use std::cell::Cell;
+
 use minijinja::machinery::Span;
 use minijinja::machinery::ast::{self, CallArg, Expr, Spanned, Stmt};
+use minijinja::{State, Value};
 
 /// The filter `rewrite` wraps around every value a template computes. It fails on an undefined
 /// value with `Undefined`, so no builtin, container, comparison, or assignment can consume one.
@@ -8,6 +10,23 @@ pub(super) const GUARD: &str = "__loadout_defined";
 
 /// The function a method call named `cycle` is routed through; see `builtins::cycle`.
 pub(super) const CYCLE: &str = "__loadout_cycle";
+
+/// The function every assignment to a namespace attribute passes its value through; see
+/// `builtins::acyclic`.
+pub(super) const ACYCLIC: &str = "__loadout_acyclic";
+
+/// The function a target list is unpacked through; see `builtins::unpack`.
+pub(super) const UNPACK: &str = "__loadout_unpack";
+
+/// The function that records one target list's unpacked items; see `builtins::store`.
+pub(super) const STORE: &str = "__loadout_store";
+
+/// The locals the rewrite binds while it assigns to namespace attributes: the value, the unpacked
+/// items of each target list by list number, and the current receiver. Every such statement runs
+/// to completion before the next, so they are reused. Templates must not use the prefix.
+const VALUE: &str = "__loadout_value";
+const PARTS: &str = "__loadout_parts";
+const RECEIVER: &str = "__loadout_receiver";
 
 const ESCAPE_TESTS: [&str; 2] = ["defined", "undefined"];
 const ESCAPE_FILTERS: [&str; 2] = ["default", "d"];
@@ -20,14 +39,18 @@ pub(super) struct Undefined {
     pub(super) line: Option<usize>,
 }
 
-/// `whole` is false only where the value is a receiver: its attributes, items, or methods are read
+/// Bits of the guard's `flags` argument.
+const LOOKUP: u8 = 1;
+const WHOLE: u8 = 2;
+
+/// `WHOLE` is unset only where the value is a receiver: its attributes, items, or methods are read
 /// next, and each of those reads is guarded on its own.
 pub(super) fn guard(
+    state: &State,
     value: &Value,
     expression: &str,
-    lookup: bool,
+    flags: u8,
     line: usize,
-    whole: bool,
 ) -> Result<Value, minijinja::Error> {
     let failure = |message: String, lookup| {
         let undefined = Undefined {
@@ -38,9 +61,14 @@ pub(super) fn guard(
         minijinja::Error::new(minijinja::ErrorKind::UndefinedError, message).with_source(undefined)
     };
     if value.is_undefined() {
-        return Err(failure(format!("`{expression}` is undefined"), lookup));
+        return Err(failure(
+            format!("`{expression}` is undefined"),
+            flags & LOOKUP != 0,
+        ));
     }
-    if whole && let Some(field) = undefined_loop_field(value) {
+    if flags & WHOLE != 0
+        && let Some(field) = undefined_loop_field(state, value)
+    {
         return Err(failure(
             format!("`{expression}` has no value for `{field}` in a loop of unknown length"),
             false,
@@ -52,9 +80,10 @@ pub(super) fn guard(
 // The loop object is the only map the engine builds that lists keys with no value: `length`,
 // `revindex`, and `revindex0` are undefined when the loop's iterator has no exact length. Used
 // whole (copied by `dict`, `namespace`, or a `**` splat, stored, or passed on), it would carry
-// those undefined values into a container.
-fn undefined_loop_field(value: &Value) -> Option<&'static str> {
-    if !is_loop(value) {
+// those undefined values into a container. Only the current loop can be one: any alias, copy, or
+// container of a loop is made from a whole value, so it was checked while that loop was current.
+fn undefined_loop_field(state: &State, value: &Value) -> Option<&'static str> {
+    if !is_current_loop(state, value) {
         return None;
     }
     LOOP_KEYS
@@ -74,17 +103,13 @@ const LOOP_KEYS: [&str; 9] = [
     "depth0",
 ];
 
-/// Recognises minijinja's loop object: a map-kind object that renders as `<loop …>` and lists
-/// exactly the loop's keys in the loop's order. A map or namespace renders as `{…}` and sorts its
-/// keys, so none matches. Kind is checked first, so an iterator is never iterated here.
-pub(super) fn is_loop(value: &Value) -> bool {
+/// Whether `value` is the loop object of the innermost running loop, by object identity with
+/// what `loop` names there. Nothing is rendered, iterated, or called.
+pub(super) fn is_current_loop(state: &State, value: &Value) -> bool {
     value.as_object().is_some()
-        && minijinja::tests::is_mapping(value)
-        && value.to_string().starts_with("<loop ")
-        && value.try_iter().is_ok_and(|keys| {
-            keys.map(|key| key.as_str().map(str::to_owned))
-                .eq(LOOP_KEYS.map(|key| Some(key.to_owned())))
-        })
+        && state
+            .lookup("loop")
+            .is_some_and(|current| minijinja::tests::is_sameas(value, &current))
 }
 
 /// Rebuilds a parsed template with a guard on every lookup, filter result, and call result that
@@ -176,6 +201,18 @@ impl<'a> Rewriter<'a> {
                 },
                 node.span(),
             )),
+            Stmt::Set(node) if sets_attribute(&node.target) => {
+                let value = self.expr(&node.expr, Value);
+                self.assign_attributes(&node.target, node.span(), |temporary| {
+                    Stmt::Set(Spanned::new(
+                        ast::Set {
+                            target: temporary,
+                            expr: value,
+                        },
+                        node.span(),
+                    ))
+                })
+            }
             Stmt::Set(node) => Stmt::Set(Spanned::new(
                 ast::Set {
                     target: self.expr(&node.target, Target),
@@ -183,6 +220,20 @@ impl<'a> Rewriter<'a> {
                 },
                 node.span(),
             )),
+            Stmt::SetBlock(node) if sets_attribute(&node.target) => {
+                let filter = self.optional(node.filter.as_ref(), FilterBlock);
+                let body = self.stmts(&node.body);
+                self.assign_attributes(&node.target, node.span(), |temporary| {
+                    Stmt::SetBlock(Spanned::new(
+                        ast::SetBlock {
+                            target: temporary,
+                            filter,
+                            body,
+                        },
+                        node.span(),
+                    ))
+                })
+            }
             Stmt::SetBlock(node) => Stmt::SetBlock(Spanned::new(
                 ast::SetBlock {
                     target: self.expr(&node.target, Target),
@@ -413,14 +464,22 @@ impl<'a> Rewriter<'a> {
                 },
                 node.span(),
             )),
-            Expr::IfExpr(node) => Expr::IfExpr(Spanned::new(
-                ast::IfExpr {
-                    test_expr: self.expr(&node.test_expr, inner),
-                    true_expr: self.expr(&node.true_expr, inner),
-                    false_expr: self.optional(node.false_expr.as_ref(), inner),
-                },
-                node.span(),
-            )),
+            Expr::IfExpr(node) => {
+                // A chosen branch is what the receiver position reads through.
+                let branch = if position == Receiver {
+                    Receiver
+                } else {
+                    inner
+                };
+                Expr::IfExpr(Spanned::new(
+                    ast::IfExpr {
+                        test_expr: self.expr(&node.test_expr, inner),
+                        true_expr: self.expr(&node.true_expr, branch),
+                        false_expr: self.optional(node.false_expr.as_ref(), branch),
+                    },
+                    node.span(),
+                ))
+            }
             Expr::List(node) => Expr::List(Spanned::new(
                 ast::List {
                     items: self.exprs(&node.items, inner),
@@ -443,6 +502,101 @@ impl<'a> Rewriter<'a> {
         }
     }
 
+    // `{% set ns.x = v %}` (also unpacked, and as a block) mutates a namespace, the only object a
+    // template can change, so it is the only way a reference cycle could form. Codegen evaluates
+    // the value once; unpacks a target list once, when it is reached (the top list first, a nested
+    // list only after the targets before it are stored); and for each target in order evaluates
+    // its receiver and stores into it. This spells out the same steps. Each list's items are
+    // unpacked once at that point and kept in `PARTS` under the list's number, so a later target
+    // reads that snapshot, never the live value again. `ACYCLIC` checks each part between its
+    // receiver and its store.
+    fn assign_attributes(
+        &self,
+        target: &Expr<'a>,
+        span: Span,
+        bind: impl FnOnce(Expr<'a>) -> Stmt<'a>,
+    ) -> Stmt<'a> {
+        let mut statements = vec![bind(variable(VALUE, span))];
+        let lists = Cell::new(0);
+        self.unpack(target, None, &lists, span, &mut statements);
+        Stmt::Template(Spanned::new(
+            ast::Template {
+                children: statements,
+            },
+            span,
+        ))
+    }
+
+    /// `part` is the list number and index this target's value comes from; `None` for the value.
+    fn unpack(
+        &self,
+        target: &Expr<'a>,
+        part: Option<(usize, usize)>,
+        lists: &Cell<usize>,
+        span: Span,
+        statements: &mut Vec<Stmt<'a>>,
+    ) {
+        let set = |target: Expr<'a>, expr: Expr<'a>| {
+            Stmt::Set(Spanned::new(ast::Set { target, expr }, span))
+        };
+        match target {
+            Expr::GetAttr(attribute) => {
+                statements.push(set(
+                    variable(RECEIVER, span),
+                    self.expr(&attribute.expr, Position::Target),
+                ));
+                let check = call(
+                    ACYCLIC,
+                    vec![
+                        read(part, span),
+                        variable(RECEIVER, span),
+                        constant(Value::from(dotted(target)), span),
+                    ],
+                    span,
+                );
+                statements.push(set(
+                    Expr::GetAttr(Spanned::new(
+                        ast::GetAttr {
+                            expr: variable(RECEIVER, span),
+                            name: attribute.name,
+                        },
+                        span,
+                    )),
+                    check,
+                ));
+            }
+            Expr::List(list) => {
+                let number = lists.get();
+                lists.set(number + 1);
+                let known = if number == 0 {
+                    constant(Value::from(()), span)
+                } else {
+                    variable(PARTS, span)
+                };
+                let items = call(
+                    UNPACK,
+                    vec![
+                        read(part, span),
+                        constant(Value::from(list.items.len()), span),
+                    ],
+                    span,
+                );
+                statements.push(set(
+                    variable(PARTS, span),
+                    call(
+                        STORE,
+                        vec![known, constant(Value::from(number), span), items],
+                        span,
+                    ),
+                ));
+                for (index, item) in list.items.iter().enumerate() {
+                    self.unpack(item, Some((number, index)), lists, span, statements);
+                }
+            }
+            other => statements.push(set(self.expr(other, Position::Target), read(part, span))),
+        }
+    }
+
     fn guarded(&self, expr: Expr<'a>, span: Span, lookup: bool, position: Position) -> Expr<'a> {
         let text = self
             .source
@@ -455,12 +609,66 @@ impl<'a> Rewriter<'a> {
                 expr: Some(expr),
                 args: vec![
                     CallArg::Pos(constant(Value::from(text))),
-                    CallArg::Pos(constant(Value::from(lookup))),
+                    CallArg::Pos(constant(Value::from(
+                        u8::from(lookup) * LOOKUP
+                            + u8::from(position != Position::Receiver) * WHOLE,
+                    ))),
                     CallArg::Pos(constant(Value::from(span.start_line))),
-                    CallArg::Pos(constant(Value::from(position != Position::Receiver))),
                 ],
             },
             span,
         ))
     }
+}
+
+fn variable(id: &str, span: Span) -> Expr<'_> {
+    Expr::Var(Spanned::new(ast::Var { id }, span))
+}
+
+fn sets_attribute(target: &Expr<'_>) -> bool {
+    match target {
+        Expr::GetAttr(_) => true,
+        Expr::List(list) => list.items.iter().any(sets_attribute),
+        _ => false,
+    }
+}
+
+// The dotted name a set target writes, from the parsed names alone: `ns.inner.x`.
+fn dotted(target: &Expr<'_>) -> String {
+    match target {
+        Expr::Var(var) => var.id.to_owned(),
+        Expr::GetAttr(attribute) => format!("{}.{}", dotted(&attribute.expr), attribute.name),
+        _ => "target".to_owned(),
+    }
+}
+
+// What one target receives: the bound value, or item `index` of target list `number`'s snapshot.
+fn read<'a>(part: Option<(usize, usize)>, span: Span) -> Expr<'a> {
+    let Some((number, index)) = part else {
+        return variable(VALUE, span);
+    };
+    let item = |expr, key: usize| {
+        Expr::GetItem(Spanned::new(
+            ast::GetItem {
+                expr,
+                subscript_expr: constant(Value::from(key), span),
+            },
+            span,
+        ))
+    };
+    item(item(variable(PARTS, span), number), index)
+}
+
+fn call<'a>(function: &'a str, args: Vec<Expr<'a>>, span: Span) -> Expr<'a> {
+    Expr::Call(Spanned::new(
+        ast::Call {
+            expr: variable(function, span),
+            args: args.into_iter().map(CallArg::Pos).collect(),
+        },
+        span,
+    ))
+}
+
+fn constant<'a>(value: Value, span: Span) -> Expr<'a> {
+    Expr::Const(Spanned::new(ast::Const { value }, span))
 }
