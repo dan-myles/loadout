@@ -1,0 +1,7 @@
+[update]
+interval_minutes = 120
+
+[programs.firefox]
+replace = true
+cask = "firefox@developer-edition"
+flatpak = "org.mozilla.firefox"

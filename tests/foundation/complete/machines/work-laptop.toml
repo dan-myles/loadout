@@ -1,0 +1,9 @@
+[variables]
+editor_font_size = 15
+
+[agents]
+enabled = { remove = ["muse"] }
+
+[files.vscode-settings]
+source = "files/vscode-settings.json"
+when = { machine = "work-laptop" }

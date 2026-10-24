@@ -1,0 +1,13 @@
+[variables]
+email = "dan@work.example"
+work = true
+
+[mcp.github]
+agents = { add = ["opencode"], remove = ["cursor"] }
+
+[mcp.jira]
+url = "https://mcp.atlassian.com/v1/sse"
+when = { os = ["macos", "linux"], arch = "aarch64" }
+
+[skills.release-notes]
+remove = true

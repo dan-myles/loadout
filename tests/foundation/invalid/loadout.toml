@@ -1,0 +1,48 @@
+[loadout]
+version = 1
+
+[machines.box]
+tags = ["work", "missing-tag", "work"]
+
+[variables]
+machine = "x"
+
+[update]
+interval_minutes = 5
+
+[agents]
+enabled = ["claude", "nobody"]
+
+[agents.custom.claude]
+evidence = ""
+
+[agents.custom.acme]
+evidence = "https://acme.example/docs"
+
+[agents.custom.acme.mcp]
+linux = "/etc/acme.json"
+format = "json"
+map = "mcpServers"
+shape = "codex-toml"
+env_syntax = "codex-env-vars"
+
+[files.escape]
+source = "../outside"
+target = "/etc/passwd"
+
+[files.half]
+target = "~/.half"
+
+[skills.empty]
+source = "skills/empty"
+
+[mcp.both]
+command = "npx"
+url = "https://example.com/mcp"
+
+[mcp.leak]
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer abc123" }
+
+[programs.nothing]
+remove = true

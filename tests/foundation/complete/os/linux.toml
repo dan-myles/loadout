@@ -1,0 +1,8 @@
+[files.ssh-config]
+target = "~/.ssh/config"
+
+[programs.fd]
+apt = "fd-find"
+dnf = "fd-find"
+pacman = "fd"
+when = { distro = ["ubuntu", "debian", "fedora", "arch"] }
