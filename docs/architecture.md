@@ -185,7 +185,7 @@ interval_minutes = 60              # Default 60, minimum 15
 cli = true                         # Default true: also update the loadout CLI
 
 [agents]
-enabled = ["claude", "codex", "devin"]   # list; tags and machines may edit it
+enabled = ["claude", "codex", "devin"]   # list; tags and machines may edit it. Default: none
 
 [agents.custom.devin]              # an agent with no built-in adapter (ACP registry or local)
 evidence = "https://docs.example/devin-config"   # required: where these paths come from
@@ -227,6 +227,12 @@ apt = "ripgrep"
 winget = "BurntSushi.ripgrep.MSVC"
 ```
 
+**Default: no agent is enabled.** If no layer sets `[agents] enabled`, the list is empty, and skills,
+instructions, and MCP items reach no agent. Each agent is opted in explicitly, so Loadout never
+writes into the config of an agent the user didn't name. An item's `agents` list narrows the
+enabled set and never widens it. Naming an agent that isn't enabled on a machine is a resolve warning
+(U1), not a write.
+
 Built-in agents (`manifest::BuiltinAgent`) map one-to-one to T3 Code's named drivers:
 `claude` (`claudeAgent`), `codex`, `cursor`, `grok`, `muse`, `pi`, `opencode`, `antigravity`. T3's
 `acpRegistry` driver is open-ended, so its agents are custom agents whose paths the loadout declares
@@ -254,6 +260,13 @@ machine.
 **Default**: tables assign rather than merge. Every compound value then follows the single rule
 "assignment replaces", and only lists get explicit edits.
 
+**MCP transport.** A resolved server has exactly one valid transport: `command` (stdio, with
+optional `args` and `env`) or `url` (remote, with optional `headers`). A field edit can only add or
+change fields, and the schema has no way to clear one. So if a field edit leaves a server with both
+`command` and `url`, or with stdio fields beside `url` (or `headers` beside `command`), that is a
+resolve error (U1) naming the item and its layers. To switch transports, a narrower layer writes
+`replace = true` with the complete new server.
+
 What validate enforces today, before any machine is known:
 
 - A global-layer item must be complete, and may not use `remove`, `replace`, or list edits.
@@ -273,9 +286,9 @@ What validate enforces today, before any machine is known:
 - Targets are clean `~/` or `{config}/` paths, and two file items in one layer may not share a target.
 - Every agent named anywhere is built in or declared.
 
-U1 adds the checks that need a machine: an added item that turns out incomplete, cross-layer target
-collisions, one instructions item per agent, and `windows_problem` on every target that resolves for
-Windows.
+U1 adds the checks that need a machine: an added item that turns out incomplete, a server left with
+mixed or missing transports, cross-layer target collisions, one instructions item per agent, and
+`windows_problem` on every target that resolves for Windows.
 
 ### Conditions
 
@@ -464,12 +477,15 @@ install time (U8).
 | codex | `~/.agents/skills` | `$CODEX_HOME` or `~/.codex`, then `/AGENTS.md` | `…/config.toml`, `/mcp_servers`, `codex-toml` | `codex-env-vars` |
 | cursor | `~/.cursor/skills` | unsupported (User Rules live in app settings) | `~/.cursor/mcp.json`, `/mcpServers`, `cursor-json` | `${env:VAR}` |
 | grok | `$GROK_HOME` or `~/.grok`, then `/skills` | `…/AGENTS.md` | `…/config.toml`, `/mcp_servers`, `grok-toml`, under Grok's `.config-init.lock` flock | `${VAR}` |
-| opencode | `{config}/opencode/skills` (XDG on every OS) | `…/opencode/AGENTS.md` | `…/opencode/opencode.json` or `.jsonc`, `/mcp`, `opencode-json` | `{env:VAR}` |
+| opencode | `<xdg_config>/opencode/skills` on every OS | `<xdg_config>/opencode/AGENTS.md` | `<xdg_config>/opencode/opencode.json` or `.jsonc`, `/mcp`, `opencode-json` | `{env:VAR}` |
 | pi | `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, then `/skills` | `…/AGENTS.md` | `…/mcp.json`, `/mcpServers`, `pi-json` | `${VAR}` |
-| muse | `~/.config/muse/skills` (macOS, Linux) | unsupported (no documented path) | `~/.config/muse/settings.json`, `/mcp_servers`, `muse-json` | `${VAR}` |
+| muse | `<xdg_config>/muse/skills` (macOS, Linux) | unsupported (no documented path) | `<xdg_config>/muse/settings.json`, `/mcp_servers`, `muse-json` | `${VAR}` |
 | antigravity | `~/.gemini/antigravity-cli/skills` | `~/.gemini/AGENTS.md` | `~/.gemini/config/mcp_config.json`, `/mcpServers`, `antigravity-json` | none (undocumented) |
 
-Muse on Windows is unsupported until its paths are documented. Windows paths for Codex, Cursor, Pi,
+`<xdg_config>` is `Context.xdg_config`: `$XDG_CONFIG_HOME` (outside isolation) or `~/.config` on
+**every** OS. OpenCode and Muse use it even on macOS (not `~/Library/Application Support`) and
+Windows (`%USERPROFILE%\.config`, not `%APPDATA%`), so their rows never use the OS-native
+`{config}`. Muse on Windows is unsupported until its paths are documented. Windows paths for Codex, Cursor, Pi,
 and Antigravity are inferred from home-directory joins in their source; Windows VM evidence confirms
 or corrects them.
 
@@ -491,6 +507,11 @@ or corrects them.
     (`projects`, `tui`) is never touched.
   - An existing server name that loadout doesn't own is `blocked`, not overwritten.
   - Muse needs `"schema_version": 1`. Antigravity takes `serverUrl` and rejects SSE.
+  - Codex's `codex-env-vars` passes a variable through only under its own name (`env_vars`), and
+    takes a bearer token only as `bearer_token_env_var`. So a stdio `env = { K = { env = "OTHER" } }`
+    whose key differs from the variable has no Codex form. The same holds for a header other than
+    `Authorization` with prefix `Bearer `. U6 returns `mcp::Unsupported` for these, and the plan
+    shows an `unsupported` action for Codex; nothing is renamed or resolved.
 - **Custom agents** get exactly the declared paths, their declared `format`, `map`, `shape`, and
   `env_syntax`, and copy-only skills.
 - **Never touched**: OAuth and auth stores (Claude Keychain and `.credentials.json`; Codex
@@ -658,3 +679,18 @@ pub fn install(release: &Release) -> Result<(), release::Error>;
 
 A unit that must change a foundation type or a frozen signature changes it in its own PR, updates
 this section in the same PR, and lists the change under "Decisions made here".
+
+## 12. Recorded follow-ups
+
+Accepted from the foundation review as non-blocking. None of them changes a contract above.
+
+- **Serde diagnostics** (review A, consider 1): the untagged `List`, `OneOrMany`, and `Value` enums
+  report "data did not match any variant", and parsing stops at the first error in each file. A
+  custom `Deserialize` or a pre-pass could name the expected forms. The input is already rejected
+  with exit 3 and a line and column.
+- **Context for validate and doctor JSON** (review A, consider 7): every command builds `Context`
+  first. So a bad `LOADOUT_HOME` makes `validate` exit 1, and makes `doctor --json` print no JSON.
+  Any change must keep the exit-code contract in section 1.
+- **Windows folder redirection** (review A, consider 8): config and state derive from home
+  (`AppData\Roaming`, `AppData\Local`), not from `%APPDATA%` and `%LOCALAPPDATA%`. Platform context
+  work should read the known-folder paths (outside isolation) when Windows VM evidence lands.

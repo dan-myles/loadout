@@ -19,8 +19,6 @@ toml = "1.1"
 [dev-dependencies]
 tempfile = "3"
 
-# Pedantic plus a few restriction lints, adapted from Crabstock. CI runs clippy with
-# -D warnings, so silencing takes #[expect(lint, reason = "...")], never #[allow].
 [lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
