@@ -8,7 +8,7 @@ use super::schema::{
     AgentsPatch, BuiltinAgent, Condition, CustomAgent, EnvSyntax, List, MIN_INTERVAL_MINUTES,
     McpFormat, McpPatch, OneOrMany, PerOs, Value,
 };
-use super::{LayerFile, Loadout, Scope, is_id};
+use super::{Guard, LayerFile, Loadout, Scope, is_id};
 use crate::context::{split_base, windows_problem};
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::platform::Os;
@@ -18,7 +18,7 @@ const TEMPLATE_SUFFIX: &str = ".tmpl";
 const SKILL_FILE: &str = "SKILL.md";
 const GIT_DIR: &str = ".git";
 
-pub(super) fn check(loadout: &Loadout) -> Diagnostics {
+pub(super) fn check(loadout: &Loadout, guard: &Guard<'_>) -> Diagnostics {
     let custom: BTreeSet<String> = loadout
         .layers
         .iter()
@@ -29,7 +29,10 @@ pub(super) fn check(loadout: &Loadout) -> Diagnostics {
         .root
         .canonicalize()
         .unwrap_or_else(|_| loadout.root.clone());
-    let (git, git_problem) = match git_metadata(&root) {
+    let pointer = |reached: &Path, real: &Path| {
+        guard(reached, real).map_err(|message| format!("Git pointer {message}"))
+    };
+    let (git, git_problem) = match git_metadata_guarded(&root, &pointer) {
         Ok(git) => (git, None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
@@ -719,7 +722,20 @@ fn names_git(path: &Path) -> bool {
 const MAX_GIT_POINTER: u64 = 4096;
 
 /// `root` must be canonical. Returns every canonical path that is the loadout's Git metadata.
+/// Unguarded: pointer files are confined to the checkout but not checked against the host's
+/// reserved destinations, so only synthetic and test callers use it.
 pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
+    git_metadata_guarded(root, &|_, _| Ok(()))
+}
+
+/// The same detector, but `guard` sees each pointer file (`.git` as a gitfile, `commondir`), as
+/// reached and as its canonical file, before the file is opened, and its error stops the walk.
+/// A caller that can tell a protected file from a pointer must refuse it before any read; a
+/// parse error after the open would come too late.
+pub fn git_metadata_guarded(
+    root: &Path,
+    guard: &dyn Fn(&Path, &Path) -> Result<(), String>,
+) -> Result<Vec<PathBuf>, String> {
     let dot = root.join(GIT_DIR);
     match fs::symlink_metadata(&dot) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -738,6 +754,7 @@ pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let (gitdir, mut metadata) = if real.is_dir() {
         (real.clone(), vec![real])
     } else {
+        guard(&dot, &real)?;
         let gitdir = git_pointer(root, &real, root, "gitdir: ")?;
         (gitdir.clone(), vec![real, gitdir])
     };
@@ -758,6 +775,7 @@ pub fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
                     "it resolves outside the loadout, which loadout never reads",
                 );
             }
+            guard(&common, &real)?;
             let common_dir = git_pointer(root, &real, &gitdir, "")?;
             metadata.extend([real, common_dir]);
         }
@@ -1015,5 +1033,38 @@ mod tests {
             checker.source("k", bad, Source::File);
         }
         assert_eq!(checker.diagnostics.count(Severity::Error), 5);
+    }
+
+    #[test]
+    fn the_guard_sees_each_pointer_file_before_it_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("meta").join("repo")).unwrap();
+        fs::create_dir_all(root.join("meta").join("common")).unwrap();
+        let gitfile = root.join(GIT_DIR);
+        let commondir = root.join("meta").join("repo").join("commondir");
+        fs::write(&gitfile, "gitdir: meta/repo\n").unwrap();
+        fs::write(&commondir, "../common\n").unwrap();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let guarded = git_metadata_guarded(&root, &|reached, real| {
+            seen.borrow_mut()
+                .push((reached.to_path_buf(), real.to_path_buf()));
+            Ok(())
+        });
+        assert_eq!(guarded, git_metadata(&root));
+        assert_eq!(
+            seen.into_inner(),
+            [
+                (gitfile.clone(), gitfile.clone()),
+                (commondir.clone(), commondir.clone())
+            ]
+        );
+
+        fs::write(&gitfile, "not a pointer\n").unwrap();
+        let refused = git_metadata_guarded(&root, &|reached, _| {
+            Err(format!("refused {}", reached.display()))
+        });
+        assert_eq!(refused, Err(format!("refused {}", gitfile.display())));
     }
 }

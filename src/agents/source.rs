@@ -25,7 +25,11 @@ impl<'a> Sources<'a> {
         let root = loadout.canonicalize().map_err(|error| {
             format!("cannot resolve the loadout {}: {error}", loadout.display())
         })?;
-        let git = manifest::git_metadata(&root)?;
+        let guard = |reached: &Path, real: &Path| match policy(context, &root, reached, real) {
+            Some(message) => Err(format!("Git pointer {message}")),
+            None => Ok(()),
+        };
+        let git = manifest::git_metadata_guarded(&root, &guard)?;
         Ok(Self { context, root, git })
     }
 
@@ -127,11 +131,8 @@ impl<'a> Sources<'a> {
     /// home folder, so both the path as reached and the file it lands on pass the source policy
     /// before anything is opened.
     fn read(&self, shown: &Path, real: &Path) -> Result<FileContent, String> {
-        let conflict = [shown, real]
-            .into_iter()
-            .find_map(|path| reserved::check_source(self.context, &self.root, path));
-        if let Some(conflict) = conflict {
-            return Err(format!("{} {}", self.shown(shown), conflict.message()));
+        if let Some(message) = policy(self.context, &self.root, shown, real) {
+            return Err(message);
         }
         let not_a_file = || format!("{} is not a regular file", self.shown(shown));
         if !fs::metadata(real).is_ok_and(|meta| meta.is_file()) {
@@ -162,6 +163,12 @@ impl<'a> Sources<'a> {
             .display()
             .to_string()
     }
+}
+
+fn policy(context: &Context, root: &Path, reached: &Path, real: &Path) -> Option<String> {
+    let conflict = reserved::check_source_file(context, root, reached, real)?;
+    let shown = reached.strip_prefix(root).unwrap_or(reached);
+    Some(format!("{} {}", shown.display(), conflict.message()))
 }
 
 fn names_git(path: &Path) -> bool {

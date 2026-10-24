@@ -422,6 +422,19 @@ pub fn check_source(context: &Context, loadout: &Path, path: &Path) -> Option<Co
     found
 }
 
+/// `check_source` on one file both as reached and as the canonical file it lands on: the one
+/// check every reader of checkout content runs before an open.
+pub fn check_source_file(
+    context: &Context,
+    loadout: &Path,
+    reached: &Path,
+    real: &Path,
+) -> Option<Conflict> {
+    [reached, real]
+        .into_iter()
+        .find_map(|path| check_source(context, loadout, path))
+}
+
 const MAX_LINKS: usize = 40;
 
 pub fn normalize(path: &Path) -> io::Result<PathBuf> {
