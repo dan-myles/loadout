@@ -231,6 +231,7 @@ dependencies = [
  "clap",
  "gethostname",
  "jsonc-parser",
+ "nix",
  "process-wrap",
  "serde",
  "serde_json",
