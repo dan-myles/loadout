@@ -345,13 +345,14 @@ fn planned_writes(
             Target::Path { path } => (path.clone(), None),
             Target::Entry {
                 file,
+                format,
                 pointer,
                 key,
                 shape,
-                ..
             } => (
                 file.clone(),
                 Some(collide::Entry {
+                    format: *format,
                     pointer: pointer.clone(),
                     key: key.clone(),
                     shape: *shape,

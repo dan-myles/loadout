@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
-use crate::manifest::McpShape;
+use crate::manifest::{McpFormat, McpShape};
 use crate::platform::Os;
 use crate::reserved;
 
@@ -16,6 +16,7 @@ pub(super) struct Write {
 }
 
 pub(super) struct Entry {
+    pub(super) format: McpFormat,
     pub(super) pointer: String,
     pub(super) key: String,
     pub(super) shape: McpShape,
@@ -24,13 +25,15 @@ pub(super) struct Entry {
 struct Forms {
     lexical: Vec<String>,
     real: Option<Vec<String>>,
-    address: Option<Vec<String>>,
+    entry: Option<(McpFormat, Vec<String>)>,
 }
 
 /// Two writes collide when one path is the other or sits inside it, compared both as written
 /// and with links resolved, so an alias of a folder can't hide a second writer. Case folds by
 /// the OS default, as resolve does; U4 probes the real volume. Two MCP entries in one file
-/// collide only when one key's address is the other's or contains it.
+/// collide when they declare different formats for it (JSON and JSONC included: they differ in
+/// what an edit must preserve, so the file's bytes never decide), or when one key's address is
+/// the other's or contains it.
 pub(super) fn check(os: Os, writes: &[Write]) -> Diagnostics {
     let forms: Vec<Forms> = writes
         .iter()
@@ -39,7 +42,10 @@ pub(super) fn check(os: Os, writes: &[Write]) -> Diagnostics {
             real: reserved::normalize(&write.path)
                 .ok()
                 .map(|real| parts(os, &real)),
-            address: write.entry.as_ref().map(address),
+            entry: write
+                .entry
+                .as_ref()
+                .map(|entry| (entry.format, address(entry))),
         })
         .collect();
     let mut diagnostics = Diagnostics::default();
@@ -68,17 +74,26 @@ pub(super) fn check(os: Os, writes: &[Write]) -> Diagnostics {
     diagnostics
 }
 
-fn collision(one: &Forms, other: &Forms) -> Option<&'static str> {
+fn collision(one: &Forms, other: &Forms) -> Option<String> {
     let pairs = [
         Some((&one.lexical, &other.lexical)),
         one.real.as_ref().zip(other.real.as_ref()),
     ];
     let mut found = None;
     for (a, b) in pairs.into_iter().flatten() {
-        let how = match (&one.address, &other.address) {
-            (Some(x), Some(y)) if a == b => nested(x, y).then_some("sets the same MCP key as"),
-            _ if a == b => Some("writes the same path as"),
-            _ if inside(a, b) || inside(b, a) => Some("nests a file and a folder at one path with"),
+        let how = match (&one.entry, &other.entry) {
+            (Some((mine, _)), Some((theirs, _))) if a == b && mine != theirs => Some(format!(
+                "merges into one MCP file as {}, not {} like",
+                mine.id(),
+                theirs.id()
+            )),
+            (Some((_, x)), Some((_, y))) if a == b => {
+                nested(x, y).then(|| "sets the same MCP key as".to_owned())
+            }
+            _ if a == b => Some("writes the same path as".to_owned()),
+            _ if inside(a, b) || inside(b, a) => {
+                Some("nests a file and a folder at one path with".to_owned())
+            }
             _ => None,
         };
         found = found.or(how);

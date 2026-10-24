@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use super::{Agent, Resolved, report};
 use crate::context::{Base, Context, split_base, windows_problem};
 use crate::diagnostic::{Diagnostics, Severity};
+use crate::manifest::McpFormat;
 use crate::platform::Os;
 use crate::reserved::{self, Merge, Use};
 
@@ -13,6 +14,9 @@ pub(super) struct Write {
     pub(super) path: String,
     pub(super) file: Option<PathBuf>,
     pub(super) rank: Option<usize>,
+    /// Set for a key merge of MCP servers into a shared file, with the format it declares.
+    /// Several agents may merge into one file in one format; agents checks their keys.
+    pub(super) merge: Option<McpFormat>,
 }
 
 struct Expanded<'a> {
@@ -70,7 +74,23 @@ pub(super) fn check(os: Os, writes: &[Write], diagnostics: &mut Diagnostics) {
             } else {
                 (other, one)
             };
-            let message = if later.folded == earlier.folded {
+            let message = if later.folded == earlier.folded
+                && let (Some(theirs), Some(ours)) = (later.write.merge, earlier.write.merge)
+            {
+                if theirs == ours {
+                    continue;
+                }
+                format!(
+                    "{} ({}) merges MCP servers into {} as {}, but {} ({}) declares that file as {}; one file has one format",
+                    later.write.owner,
+                    later.write.path,
+                    later.shown,
+                    theirs.id(),
+                    earlier.write.owner,
+                    earlier.write.path,
+                    ours.id()
+                )
+            } else if later.folded == earlier.folded {
                 format!(
                     "{} ({}) and {} ({}) both write {}",
                     later.write.owner,
