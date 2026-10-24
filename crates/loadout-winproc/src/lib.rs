@@ -10,11 +10,11 @@ use std::io;
 use std::process::Child;
 use std::time::Instant;
 
-pub use windows::Win32::System::Threading::CREATE_SUSPENDED;
 use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+pub use windows::Win32::System::Threading::CREATE_SUSPENDED;
 use windows::Win32::System::Threading::{
     GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
     THREAD_SUSPEND_RESUME,
@@ -81,7 +81,9 @@ impl Prepared {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("the deadline passed before thread {thread_id} of process {pid} was resumed, so it was not resumed"),
+                format!(
+                    "the deadline passed before thread {thread_id} of process {pid} was resumed, so it was not resumed"
+                ),
             ));
         }
         // SAFETY: `thread` is a live handle owned by `Owned`, opened with THREAD_SUSPEND_RESUME,

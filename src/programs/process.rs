@@ -854,7 +854,11 @@ fn dispose_never_run(root: &Mutex<Child>, limit: Instant) -> Result<(), String> 
             .map(|status| status.is_some())
             .map_err(|error| format!("cannot reap the query loadout created: {error}"))
     });
-    first(&mut problem, reaped, "the query loadout created has not exited");
+    first(
+        &mut problem,
+        reaped,
+        "the query loadout created has not exited",
+    );
     problem.map_or(Ok(()), |detail| {
         Err(format!(
             "{detail} (within the {} second cleanup limit)",
@@ -992,11 +996,15 @@ mod seam {
         let limit = Instant::now() + Duration::from_secs(20);
         while !ready.exists() {
             if Instant::now() >= limit {
-                return Err(io::Error::other("injected: the descendant never reported ready"));
+                return Err(io::Error::other(
+                    "injected: the descendant never reported ready",
+                ));
             }
             thread::sleep(Duration::from_millis(20));
         }
-        Err(io::Error::other("injected: failure after the query was resumed"))
+        Err(io::Error::other(
+            "injected: failure after the query was resumed",
+        ))
     }
 }
 
@@ -1164,7 +1172,10 @@ fn query_reader<R: Read + Send + 'static>(
 
 /// Starts the reader thread. If it can't start, the stream is marked done and the error is
 /// returned to the caller, which decides what it means.
-fn start_reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> (Shared, io::Result<()>) {
+fn start_reader<R: Read + Send + 'static>(
+    source: Option<R>,
+    keep: Keep,
+) -> (Shared, io::Result<()>) {
     let shared = Shared::default();
     let Some(mut source) = source else {
         lock(&shared).done = true;
@@ -1329,12 +1340,17 @@ mod fixture {
 
         #[cfg(unix)]
         pub(super) fn child(&mut self) -> &mut Child {
-            self.child.as_mut().expect("the fixture child was already reaped")
+            self.child
+                .as_mut()
+                .expect("the fixture child was already reaped")
         }
 
         #[cfg(unix)]
         pub(super) fn id(&self) -> u32 {
-            self.child.as_ref().expect("the fixture child was already reaped").id()
+            self.child
+                .as_ref()
+                .expect("the fixture child was already reaped")
+                .id()
         }
 
         /// Waits for the child within `limit`. `None` if it is still running then; it stays owned,
@@ -1608,7 +1624,9 @@ mod tests {
         let escapee_gone = std::fs::read_to_string(&escapee).map(|pid| {
             let pid = pid.trim().to_owned();
             let _ = kill(Pid::from_raw(pid.parse().unwrap()), Signal::SIGKILL);
-            until(Instant::now() + Duration::from_secs(10), || Ok(!alive(&pid)))
+            until(Instant::now() + Duration::from_secs(10), || {
+                Ok(!alive(&pid))
+            })
         });
         let error = result.unwrap_err();
         assert!(
@@ -1648,7 +1666,10 @@ mod tests {
         );
         let refused = still_present(Probe::Unsignalable, Some(Errno::EPERM));
         assert!(refused.contains("can't signal"), "{refused}");
-        assert!(refused.contains("second kill of the group was refused"), "{refused}");
+        assert!(
+            refused.contains("second kill of the group was refused"),
+            "{refused}"
+        );
         let error = QueryError::Cleanup {
             cause: Some(Box::new(QueryError::TimedOut(QUERY_DEADLINE))),
             detail: "its output is still held open (within the 5 second cleanup limit)".to_owned(),
@@ -1673,12 +1694,17 @@ mod tests {
                 fixture::HELPER,
             )
             .map_err(|error| error.to_string())?;
-            Ok(String::from_utf8_lossy(&stat.stdout).trim_start().starts_with('Z'))
+            Ok(String::from_utf8_lossy(&stat.stdout)
+                .trim_start()
+                .starts_with('Z'))
         });
         let kill = killpg(group, Signal::SIGKILL);
         let signal_zero = killpg(group, None);
         let reaped = anchor.wait_within(Duration::from_secs(10));
-        assert!(reaped.is_some(), "the anchor {pid} was not reaped within 10 seconds");
+        assert!(
+            reaped.is_some(),
+            "the anchor {pid} was not reaped within 10 seconds"
+        );
         assert_eq!(zombie, Ok(true), "the anchor {pid} never became a zombie");
         if cfg!(target_os = "macos") {
             assert_eq!(kill, Err(Errno::EPERM));
@@ -1812,11 +1838,12 @@ mod tests {
                 (second_at, Call::SecondKill, second),
                 probes @ ..,
             ] => {
-                assert_eq!(*first, Ok(()), "the first kill has a live anchor: {events:?}");
-                assert!(
-                    matches!(second, Ok(()) | Err(Errno::EPERM)),
-                    "{events:?}"
+                assert_eq!(
+                    *first,
+                    Ok(()),
+                    "the first kill has a live anchor: {events:?}"
                 );
+                assert!(matches!(second, Ok(()) | Err(Errno::EPERM)), "{events:?}");
                 assert!(*first_at < reaped_query && *second_at < reaped_anchor);
                 assert!(
                     probes
@@ -1937,11 +1964,17 @@ mod tests {
         );
         assert!(trace.setup_limit.is_some());
         assert_eq!(trace.disposal_limit, trace.setup_limit, "no renewed budget");
-        assert!(elapsed < QUERY_CLEANUP_GRACE + Duration::from_secs(2), "{elapsed:?}");
+        assert!(
+            elapsed < QUERY_CLEANUP_GRACE + Duration::from_secs(2),
+            "{elapsed:?}"
+        );
         let query = pid_of(&trace.events, false).unwrap();
         let anchor = pid_of(&trace.events, true).unwrap();
         assert!(!alive(&query.to_string()), "the query {query} must be gone");
-        assert!(!alive(&anchor.to_string()), "the anchor {anchor} must be gone");
+        assert!(
+            !alive(&anchor.to_string()),
+            "the anchor {anchor} must be gone"
+        );
     }
 
     #[test]
@@ -1993,11 +2026,17 @@ mod tests {
         let result = fixture::output(Command::new("sleep").arg("30"), fixture::HELPER);
         fixture::fail_drainer(None);
         let text = result.unwrap_err().to_string();
-        assert!(text.contains("injected: cannot start the stderr drainer"), "{text}");
+        assert!(
+            text.contains("injected: cannot start the stderr drainer"),
+            "{text}"
+        );
         assert!(text.contains("the helper was stopped: Ok(())"), "{text}");
         assert!(text.contains("the stdout drainer is finished"), "{text}");
         let pid = fixture::last_helper().unwrap();
-        assert!(!alive(&pid.to_string()), "the helper {pid} must be gone at return");
+        assert!(
+            !alive(&pid.to_string()),
+            "the helper {pid} must be gone at return"
+        );
     }
 
     #[test]
@@ -2161,10 +2200,16 @@ mod windows_tests {
             "{error}"
         );
         assert_setup_disposal(&trace);
-        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(
+            elapsed >= QUERY_CLEANUP_GRACE,
+            "the seam waits out the deadline: {elapsed:?}"
+        );
         assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
         let root = trace.root.unwrap();
-        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(
+            gone_within(root, Duration::from_secs(10)),
+            "the query {root} must be stopped"
+        );
         assert!(!marker.exists(), "the query must never have run");
     }
 
@@ -2236,12 +2281,21 @@ mod windows_tests {
             matches!(primary(&error), QueryError::Spawn(inner) if inner.kind() == io::ErrorKind::TimedOut),
             "{error}"
         );
-        assert_eq!(trace.job_kills, 1, "the job must be terminated even with no budget left");
+        assert_eq!(
+            trace.job_kills, 1,
+            "the job must be terminated even with no budget left"
+        );
         assert_setup_disposal(&trace);
-        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(
+            elapsed >= QUERY_CLEANUP_GRACE,
+            "the seam waits out the deadline: {elapsed:?}"
+        );
         assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
         let root = trace.root.unwrap();
-        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(
+            gone_within(root, Duration::from_secs(10)),
+            "the query {root} must be stopped"
+        );
         assert!(!marker.exists(), "the query must never have been resumed");
     }
 
@@ -2266,12 +2320,21 @@ mod windows_tests {
                 if inner.kind() == io::ErrorKind::TimedOut && inner.to_string().contains("so it was not resumed")),
             "{error}"
         );
-        assert_eq!(trace.job_kills, 1, "the job must be terminated even with no budget left");
+        assert_eq!(
+            trace.job_kills, 1,
+            "the job must be terminated even with no budget left"
+        );
         assert_setup_disposal(&trace);
-        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(
+            elapsed >= QUERY_CLEANUP_GRACE,
+            "the seam waits out the deadline: {elapsed:?}"
+        );
         assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
         let root = trace.root.unwrap();
-        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(
+            gone_within(root, Duration::from_secs(10)),
+            "the query {root} must be stopped"
+        );
         assert!(!marker.exists(), "the query must never have been resumed");
     }
 
@@ -2315,10 +2378,16 @@ mod windows_tests {
         );
         assert_eq!(trace.job_kills, 1);
         assert_setup_disposal(&trace);
-        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(
+            elapsed >= QUERY_CLEANUP_GRACE,
+            "the seam waits out the deadline: {elapsed:?}"
+        );
         assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
         let root = trace.root.unwrap();
-        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(
+            gone_within(root, Duration::from_secs(10)),
+            "the query {root} must be stopped"
+        );
     }
 
     /// The query really runs and really starts a descendant, which reports itself ready, before
@@ -2354,7 +2423,10 @@ mod windows_tests {
         let root = trace.root.unwrap();
         let descendant = descendant_id(dir);
         assert!(!alive(root), "the query {root} must be gone at return");
-        assert!(!alive(descendant), "its descendant {descendant} must be gone at return");
+        assert!(
+            !alive(descendant),
+            "its descendant {descendant} must be gone at return"
+        );
         assert!(elapsed < READINESS_GRACE, "{elapsed:?}");
     }
 
@@ -2477,7 +2549,13 @@ mod windows_tests {
             None,
         );
         assert!(
-            matches!(result, Err(QueryError::Oversized { stream: "stdout", .. })),
+            matches!(
+                result,
+                Err(QueryError::Oversized {
+                    stream: "stdout",
+                    ..
+                })
+            ),
             "{result:?}"
         );
         assert!(!alive(trace.root.unwrap()));
@@ -2493,7 +2571,10 @@ mod windows_tests {
         );
         fixture::fail_drainer(None);
         let text = result.unwrap_err().to_string();
-        assert!(text.contains("injected: cannot start the stderr drainer"), "{text}");
+        assert!(
+            text.contains("injected: cannot start the stderr drainer"),
+            "{text}"
+        );
         assert!(text.contains("the helper was stopped: Ok(())"), "{text}");
         assert!(text.contains("the stdout drainer is finished"), "{text}");
         let pid = fixture::last_helper().unwrap();
