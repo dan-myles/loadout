@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -370,10 +372,6 @@ pub fn check_path(
 const MAX_LINKS: usize = 40;
 
 pub fn normalize(path: &Path) -> io::Result<PathBuf> {
-    resolve(path, MAX_LINKS)
-}
-
-fn resolve(path: &Path, links: usize) -> io::Result<PathBuf> {
     let clean = path.is_absolute()
         && path
             .components()
@@ -384,52 +382,83 @@ fn resolve(path: &Path, links: usize) -> io::Result<PathBuf> {
             "path is not absolute and clean",
         ));
     }
-    let mut existing = path.to_path_buf();
-    let mut missing = Vec::new();
-    loop {
-        match fs::canonicalize(&existing) {
-            Ok(real) => {
-                return Ok(missing
-                    .iter()
-                    .rev()
-                    .fold(real, |path, part| path.join(part)));
+    resolve(path)
+}
+
+enum Step {
+    Root(PathBuf),
+    Name(OsString),
+    Parent,
+}
+
+fn steps(path: &Path) -> Vec<Step> {
+    let mut root = PathBuf::new();
+    let mut steps = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir => root.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => steps.push(Step::Parent),
+            Component::Normal(name) => steps.push(Step::Name(name.to_owned())),
+        }
+    }
+    if !root.as_os_str().is_empty() {
+        steps.insert(0, Step::Root(root));
+    }
+    steps
+}
+
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    let mut queue: VecDeque<Step> = steps(path).into();
+    let mut out = PathBuf::new();
+    let mut links = MAX_LINKS;
+    while let Some(step) = queue.pop_front() {
+        let name = match step {
+            Step::Root(root) => {
+                out = root;
+                continue;
             }
+            Step::Parent => {
+                out.pop();
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let candidate = out.join(&name);
+        match fs::canonicalize(&candidate) {
+            Ok(real) => out = real,
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             Err(error) => {
-                if fs::symlink_metadata(&existing).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink())
+                {
                     if links == 0 {
                         return Err(io::Error::other("too many levels of symbolic links"));
                     }
-                    let target = fs::read_link(&existing)?;
-                    let parent = existing.parent().unwrap_or(Path::new("/"));
-                    let dangling = missing
-                        .iter()
-                        .rev()
-                        .fold(parent.join(target), |path, part| path.join(part));
-                    return resolve(&lexical(&dangling), links - 1);
+                    links -= 1;
+                    let target = fs::read_link(&candidate)?;
+                    for step in steps(&target).into_iter().rev() {
+                        queue.push_front(step);
+                    }
+                    continue;
                 }
-                let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
-                    return Err(error);
-                };
-                missing.push(name);
-                existing.pop();
+                if queue.iter().any(|step| matches!(step, Step::Parent)) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        "a .. follows a missing component, so the destination is unknowable",
+                    ));
+                }
+                out.push(name);
+                for step in queue.drain(..) {
+                    match step {
+                        Step::Name(name) => out.push(name),
+                        Step::Root(root) => out = root,
+                        Step::Parent => {}
+                    }
+                }
             }
         }
     }
-}
-
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
+    Ok(out)
 }
 
 fn parts(path: &str) -> Vec<String> {
@@ -897,5 +926,69 @@ mod tests {
         };
         assert_eq!(kind(root.join("dotfiles/ssh/id_ed25519")), Some(Kind::Auth));
         assert_eq!(kind(root.join("dotfiles/zshrc")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_links_resolve_symlinks_before_parent_steps() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let at = |relative: &str| root.join(relative);
+        fs::create_dir_all(at("nested/else/deep")).unwrap();
+        fs::create_dir_all(at("nested/else/missing")).unwrap();
+        fs::create_dir_all(at("nested/home/.grok")).unwrap();
+        symlink(at("nested/else/deep"), at("nested/jump")).unwrap();
+        symlink(
+            at("nested/jump/../missing/token"),
+            at("nested/home/.grok/auth.json"),
+        )
+        .unwrap();
+        symlink(
+            at("nested/gone/../x"),
+            at("nested/home/.grok/mcp_credentials.json"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            normalize(&at("nested/home/.grok/auth.json")).unwrap(),
+            at("nested/else/missing/token")
+        );
+        assert!(normalize(&at("nested/home/.grok/mcp_credentials.json")).is_err());
+
+        let context = Context::resolve(Os::Linux, |_| None, Some(at("nested/home"))).unwrap();
+        let conflict = check_path(
+            &context,
+            &no_loadout(),
+            &at("nested/else/missing/token"),
+            Use::Write,
+        );
+        assert!(
+            conflict.is_some(),
+            "the future auth destination must be refused"
+        );
+
+        fs::remove_file(at("nested/home/.grok/mcp_credentials.json")).unwrap();
+        assert_eq!(
+            check_path(
+                &context,
+                &no_loadout(),
+                &at("nested/else/missing/token"),
+                Use::Write
+            )
+            .and_then(|conflict| conflict.kind()),
+            Some(Kind::Auth)
+        );
+        assert_eq!(
+            check_path(
+                &context,
+                &no_loadout(),
+                &at("nested/missing/token"),
+                Use::Write
+            ),
+            None,
+            "the lexically cancelled path is not the protected destination"
+        );
     }
 }

@@ -660,10 +660,15 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     So an alias of a symlinked protected root (`~/alias/codex/auth.json` where
     `CODEX_HOME -> real/codex`) or of a protected file that is itself a link
     (`~/.grok/auth.json -> vault/token`) is caught from either side.
-  - **`reserved::normalize`** canonicalizes the longest existing ancestor and re-appends the missing
-    tail, so future descendants are probed. It follows a dangling link through `read_link`, up to 40
-    links, and rejects non-absolute or `.`/`..` paths. It only stats and reads links; it never opens
-    file contents.
+  - **`reserved::normalize`** resolves the path one component at a time, the way the file system
+    would. Each existing component is canonicalized, which resolves links. A link whose target is
+    missing (a dangling link) is followed through `read_link`, up to 40 links in total, and its
+    target's components replace it. A `..` is applied only after the components before it are
+    resolved, so `jump/../x`, with `jump` a link, means the parent of `jump`'s target, never a text
+    cancellation. A missing tail with no `..` is kept, so future descendants are probed. When a
+    `..` follows a missing component, the destination can't be known, and the result is an error,
+    so `Unverifiable`. Inputs must be absolute without `.` or `..`. It only stats and reads links;
+    it never opens file contents.
   - **Path forms.** Comparison is per component and ASCII case-insensitive. Windows prefixes are
     folded, so `std::fs::canonicalize`'s `\\?\C:` equals `C:`, and `\\?\UNC\srv\share` equals
     `\\srv\share`. A junction or link on Windows therefore resolves to the same entry.
