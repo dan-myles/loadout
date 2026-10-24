@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
@@ -24,15 +25,25 @@ pub(super) fn check(loadout: &Loadout) -> Diagnostics {
         .filter_map(|file| file.layer.agents.as_ref())
         .flat_map(|agents| agents.custom.keys().cloned())
         .collect();
+    let root = loadout
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| loadout.root.clone());
+    let (git, git_problem) = match git_metadata(&root) {
+        Ok(git) => (git, None),
+        Err(problem) => (Vec::new(), Some(problem)),
+    };
     let mut checker = Checker {
-        root: loadout
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| loadout.root.clone()),
+        root,
+        git,
         custom,
         diagnostics: Diagnostics::default(),
         file: None,
     };
+    if let Some(problem) = git_problem {
+        checker.file = Some(PathBuf::from(super::ROOT_FILE));
+        checker.error("", problem);
+    }
     checker.machines(loadout);
     for file in &loadout.layers {
         checker.layer(file);
@@ -42,6 +53,7 @@ pub(super) fn check(loadout: &Loadout) -> Diagnostics {
 
 struct Checker {
     root: PathBuf,
+    git: Vec<PathBuf>,
     custom: BTreeSet<String>,
     diagnostics: Diagnostics,
     file: Option<PathBuf>,
@@ -340,6 +352,13 @@ impl Checker {
             );
             return;
         }
+        if names_git(relative) {
+            self.error(
+                key,
+                format!("{source} is Git metadata (.git), not loadout content"),
+            );
+            return;
+        }
         let path = self.root.join(relative);
         let Ok(real) = path.canonicalize() else {
             self.error(key, format!("{source} does not exist in the loadout"));
@@ -372,11 +391,8 @@ impl Checker {
     }
 
     fn in_git(&self, real: &Path) -> bool {
-        real.strip_prefix(&self.root).is_ok_and(|relative| {
-            relative
-                .components()
-                .any(|part| part.as_os_str().eq_ignore_ascii_case(GIT_DIR))
-        })
+        real.strip_prefix(&self.root).is_ok_and(names_git)
+            || self.git.iter().any(|metadata| real.starts_with(metadata))
     }
 
     fn skill_tree(&mut self, key: &str, dir: &Path) {
@@ -420,6 +436,13 @@ impl Checker {
             if kind.is_dir() {
                 self.skill_tree(key, &path);
             } else if kind.is_symlink() {
+                if fs::read_link(&path).is_ok_and(|literal| names_git(&literal)) {
+                    self.error(
+                        key,
+                        format!("{} links into Git metadata (.git)", shown(&path)),
+                    );
+                    continue;
+                }
                 match path.canonicalize() {
                     Err(_) => self.error(key, format!("{} is a broken link", shown(&path))),
                     Ok(real) if !real.starts_with(&self.root) => self.error(
@@ -678,6 +701,65 @@ impl Checker {
     }
 }
 
+fn names_git(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case(GIT_DIR))
+}
+
+const MAX_GIT_POINTER: u64 = 4096;
+
+fn git_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let dot = root.join(GIT_DIR);
+    match fs::symlink_metadata(&dot) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot inspect .git: {error}")),
+        Ok(_) => {}
+    }
+    let real = dot
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve .git: {error}"))?;
+    if real.is_dir() {
+        return Ok(vec![real]);
+    }
+    let gitdir = git_pointer(&real, "gitdir: ")?;
+    let mut metadata = vec![real, gitdir.clone()];
+    if gitdir.join("commondir").exists() {
+        metadata.push(git_pointer(&gitdir.join("commondir"), "")?);
+    }
+    Ok(metadata)
+}
+
+fn git_pointer(file: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let unsupported = |why: &str| {
+        Err(format!(
+            "unsupported Git metadata layout at {}: {why}; loadout will not certify it",
+            file.display()
+        ))
+    };
+    match fs::metadata(file) {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_GIT_POINTER => {}
+        Ok(_) => return unsupported("not a small regular pointer file"),
+        Err(error) => return unsupported(&error.to_string()),
+    }
+    let Ok(text) = fs::read_to_string(file) else {
+        return unsupported("not readable as text");
+    };
+    let Some(target) = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return unsupported("no pointer line");
+    };
+    let base = file.parent().unwrap_or(Path::new("/"));
+    match base.join(target).canonicalize() {
+        Ok(dir) if dir.is_dir() => Ok(dir),
+        _ => unsupported("its pointer does not name a folder"),
+    }
+}
+
 fn is_variable(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -880,6 +962,7 @@ mod tests {
         fs::write(dir.path().join("a"), "x").unwrap();
         let mut checker = Checker {
             root: dir.path().canonicalize().unwrap(),
+            git: Vec::new(),
             custom: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
             file: None,

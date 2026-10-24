@@ -292,10 +292,21 @@ What validate enforces today, before any machine is known:
   `~1`.
 - Ids are lowercase `[a-z0-9][a-z0-9_-]*`.
 - Sources exist inside the loadout, with symlinks resolved.
-- No source, and no link inside a skill folder, may resolve into `.git` metadata. A skill folder may
-  not contain a `.git` entry at all, whether a folder (a nested repo) or a file (the worktree or
-  submodule pointer form). The comparison is case-insensitive. A clone's `.git` can hold remote URLs
-  with credentials, hooks, and machine-local state, so it is never loadout content.
+- `.git` metadata is never loadout content. A clone's metadata can hold remote URLs with
+  credentials, hooks, and machine-local state. Validate rejects a path if any of these hold:
+  - **Lexical.** A source path, or the literal target of a link inside a skill folder, has a `.git`
+    component (case-insensitive). A skill folder contains any `.git` entry: a nested repo folder, or
+    the worktree or submodule pointer file. `.gitconfig`, `.gitignore`, and other siblings are fine.
+  - **Resolved.** Its canonical path lies under the loadout's actual metadata. That metadata is
+    found from `<root>/.git`: a folder (or a link to one) is the metadata root itself. A gitfile (or
+    a link to one), as made by `--separate-git-dir`, worktrees, and submodules, counts as metadata
+    itself, and so does the folder its `gitdir:` line names. If that folder holds a `commondir`
+    pointer (a worktree), the folder that pointer names counts too.
+  - **Unsupported layout.** Only these one-line pointer files are read, size-capped at 4 KiB; no
+    config contents are read. A pointer that is unreadable, oversized, malformed, or names a
+    missing folder is an error ("unsupported Git metadata layout"). Loadout never certifies metadata
+    it can't identify.
+  - The outside-the-loadout guard still applies first.
 - A skill folder is walked in full. A link inside it may point only to a file inside the loadout.
   A link to a folder, a broken link, a link leaving the loadout, and any special file are errors.
   Folder links are never followed, so a link loop can't make the walk loop. An unreadable entry

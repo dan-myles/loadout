@@ -871,6 +871,135 @@ fn shared_configs_accept_only_their_own_mcp_map_from_custom_agents() {
     }
 }
 
+#[cfg(unix)]
+fn git(scratch: &Path, dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", scratch)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_metadata_is_found_behind_links_gitfiles_and_separate_dirs() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let validate = |root: &Path, manifest: &str| {
+        fs::write(
+            root.join("loadout.toml"),
+            format!("[loadout]\nversion = 1\n{manifest}"),
+        )
+        .unwrap();
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap(), "--json"]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+    let file = |source: &str| format!("[files.a]\nsource = \"{source}\"\ntarget = \"~/.a\"\n");
+    let skill = "[skills.s]\nsource = \"skill\"\n";
+    let make_skill = |root: &Path| {
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+    };
+
+    let linked = scratch.join("linked");
+    fs::create_dir_all(linked.join("meta")).unwrap();
+    fs::write(linked.join("meta/config"), "synthetic").unwrap();
+    symlink(linked.join("meta"), linked.join(".git")).unwrap();
+    for source in [".git/config", "meta/config"] {
+        let (code, text) = validate(&linked, &file(source));
+        assert_eq!(code, 3, "{source}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    let separate = scratch.join("separate");
+    fs::create_dir_all(&separate).unwrap();
+    git(
+        scratch,
+        &separate,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            separate.join("metadata").to_str().unwrap(),
+        ],
+    );
+    symlink(separate.join("metadata/config"), separate.join("alias")).unwrap();
+    make_skill(&separate);
+    symlink(
+        separate.join("metadata/config"),
+        separate.join("skill/config"),
+    )
+    .unwrap();
+    for manifest in [
+        file("metadata/config"),
+        file("alias"),
+        file(".git"),
+        skill.to_owned(),
+    ] {
+        let (code, text) = validate(&separate, &manifest);
+        assert_eq!(code, 3, "{manifest}: {text}");
+        assert!(text.contains("Git metadata"), "{text}");
+    }
+
+    let pointer = scratch.join("pointer");
+    fs::create_dir_all(pointer.join("metadata")).unwrap();
+    fs::write(pointer.join("metadata/config"), "synthetic").unwrap();
+    fs::write(pointer.join("metadata-pointer"), "gitdir: metadata\n").unwrap();
+    symlink(pointer.join("metadata-pointer"), pointer.join(".git")).unwrap();
+    for source in ["metadata-pointer", "metadata/config"] {
+        let (code, text) = validate(&pointer, &file(source));
+        assert_eq!(code, 3, "{source}: {text}");
+    }
+
+    let main = scratch.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(scratch, &main, &["init", "-q"]);
+    git(
+        scratch,
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let worktree = scratch.join("worktree");
+    git(
+        scratch,
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::create_dir_all(worktree.join("files")).unwrap();
+    symlink(main.join(".git/config"), worktree.join("files/common")).unwrap();
+    let (code, text) = validate(&worktree, &file("files/common"));
+    assert_eq!(code, 3, "worktree commondir: {text}");
+
+    let broken = scratch.join("broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join(".git"), "not a pointer\n").unwrap();
+    let (code, text) = validate(&broken, "");
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("unsupported Git metadata layout"), "{text}");
+
+    let clean = scratch.join("clean");
+    fs::create_dir_all(&clean).unwrap();
+    git(scratch, &clean, &["init", "-q"]);
+    fs::write(clean.join(".gitconfig"), "[user]\n").unwrap();
+    make_skill(&clean);
+    let (code, text) = validate(&clean, &format!("{}{skill}", file(".gitconfig")));
+    assert_eq!(
+        code, 0,
+        ".gitconfig and a skill beside a repo stay valid: {text}"
+    );
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
