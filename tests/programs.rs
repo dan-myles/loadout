@@ -817,7 +817,11 @@ esac; exit 64"#,
             .status()
             .unwrap()
             .success();
-        assert!(!alive, "the sleep {} npm left behind must be gone", pid.trim());
+        assert!(
+            !alive,
+            "the sleep {} npm left behind must be gone",
+            pid.trim()
+        );
     }
 
     #[test]

@@ -229,10 +229,7 @@ fn watch(
 }
 
 /// Polls `done` until it holds or `limit` passes; `Ok(false)` means time ran out.
-fn until(
-    limit: Instant,
-    mut done: impl FnMut() -> Result<bool, String>,
-) -> Result<bool, String> {
+fn until(limit: Instant, mut done: impl FnMut() -> Result<bool, String>) -> Result<bool, String> {
     loop {
         if done()? {
             return Ok(true);
@@ -369,7 +366,11 @@ impl Query {
         let group = self.group;
         let empty = until(limit, || group_empty(group));
         note(trace, Event::Probed);
-        first(&mut problem, empty, "processes it started are still running");
+        first(
+            &mut problem,
+            empty,
+            "processes it started are still running",
+        );
         match problem {
             None => Ok(()),
             Some(detail) => Err(format!(
@@ -499,7 +500,11 @@ impl Query {
         _trace: &mut Trace,
     ) -> Result<(), String> {
         let mut problem = None;
-        first(&mut problem, killed(self.child.start_kill()).map(|()| true), "");
+        first(
+            &mut problem,
+            killed(self.child.start_kill()).map(|()| true),
+            "",
+        );
         let reaped = until(limit, || {
             self.child
                 .try_wait()
@@ -711,7 +716,10 @@ mod tests {
         let mut lines = captured.stdout.lines();
         let pid = lines.next().unwrap().to_owned();
         assert_eq!(lines.next(), Some("done"));
-        assert!(!alive(&pid), "the backgrounded sleep {pid} must be gone at return");
+        assert!(
+            !alive(&pid),
+            "the backgrounded sleep {pid} must be gone at return"
+        );
     }
 
     #[test]
@@ -726,14 +734,20 @@ mod tests {
         let mut lines = captured.stdout.lines();
         let pid = lines.next().unwrap().to_owned();
         assert_eq!(lines.next(), Some("done"));
-        assert!(!alive(&pid), "the sleep {pid} that closed its pipes must be gone at return");
+        assert!(
+            !alive(&pid),
+            "the sleep {pid} that closed its pipes must be gone at return"
+        );
     }
 
     #[test]
     fn a_successful_query_has_reaped_its_own_process() {
         let captured = run_query(&sh("echo $$"), Duration::from_secs(20), 1024).unwrap();
         let leader = captured.stdout.trim().to_owned();
-        assert!(!alive(&leader), "the query's process {leader} must be reaped, not a zombie");
+        assert!(
+            !alive(&leader),
+            "the query's process {leader} must be reaped, not a zombie"
+        );
     }
 
     #[test]
@@ -749,7 +763,10 @@ mod tests {
         let pids = std::fs::read_to_string(&pids).unwrap();
         assert_eq!(pids.lines().count(), 2, "{pids}");
         for pid in pids.lines() {
-            assert!(!alive(pid), "{pid} must be gone when the timed-out query returns");
+            assert!(
+                !alive(pid),
+                "{pid} must be gone when the timed-out query returns"
+            );
         }
     }
 
@@ -811,13 +828,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(padded, QueryError::Oversized { stream: "stdout", .. }),
+            matches!(
+                padded,
+                QueryError::Oversized {
+                    stream: "stdout",
+                    ..
+                }
+            ),
             "{padded}"
         );
-        let stderr = run_query(&sh("head -c 65 /dev/zero >&2"), Duration::from_secs(20), 64)
-            .unwrap_err();
+        let stderr =
+            run_query(&sh("head -c 65 /dev/zero >&2"), Duration::from_secs(20), 64).unwrap_err();
         assert!(
-            matches!(stderr, QueryError::Oversized { stream: "stderr", .. }),
+            matches!(
+                stderr,
+                QueryError::Oversized {
+                    stream: "stderr",
+                    ..
+                }
+            ),
             "{stderr}"
         );
     }
@@ -980,8 +1009,10 @@ mod tests {
             events[from..]
                 .iter()
                 .position(|event| *event == wanted)
-                .map(|offset| from + offset)
-                .unwrap_or_else(|| panic!("no {wanted:?} after {from}: {events:?}"))
+                .map_or_else(
+                    || panic!("no {wanted:?} after {from}: {events:?}"),
+                    |offset| from + offset,
+                )
         };
         let first_kill = at(Event::KilledGroup, 0);
         let reaped_query = at(Event::ReapedQuery, first_kill);
@@ -998,7 +1029,10 @@ mod tests {
     fn assert_gone(events: &[Event]) {
         for (role, anchor) in [("anchor", true), ("query", false)] {
             let pid = pid_of(events, anchor).unwrap_or_else(|| panic!("no {role}: {events:?}"));
-            assert!(!alive(&pid.to_string()), "the {role} {pid} must be gone at return");
+            assert!(
+                !alive(&pid.to_string()),
+                "the {role} {pid} must be gone at return"
+            );
         }
     }
 
@@ -1037,7 +1071,10 @@ mod tests {
         assert!(!events.contains(&Event::KilledGroup), "{events:?}");
         assert!(events.contains(&Event::ReapedAnchor), "{events:?}");
         let anchor = pid_of(&events, true).unwrap();
-        assert!(!alive(&anchor.to_string()), "the anchor {anchor} must be gone");
+        assert!(
+            !alive(&anchor.to_string()),
+            "the anchor {anchor} must be gone"
+        );
     }
 
     #[test]

@@ -853,7 +853,11 @@ mod tests {
             .is_err()
         );
         assert!(winget_installer(&out(0, "Found Foo [A.B]\r\n", "")).is_err());
-        for empty in ["  Installer Type:", "  Installer Type:   ", "  Installer Type:\t"] {
+        for empty in [
+            "  Installer Type:",
+            "  Installer Type:   ",
+            "  Installer Type:\t",
+        ] {
             let shown =
                 format!("Found X [A.B]\r\nInstaller:\r\n{empty}\r\n  Installer Url: https://x\r\n");
             assert!(winget_installer(&out(0, &shown, "")).is_err(), "{empty:?}");
@@ -881,7 +885,11 @@ mod tests {
             (none, none, "unsupported: user or machine scope"),
         ];
         for empty in ["  Installer Type:", "  Installer Type:   "] {
-            cases.extend([(empty, exe, "error"), (none, empty, "error"), (exe, empty, "error")]);
+            cases.extend([
+                (empty, exe, "error"),
+                (none, empty, "error"),
+                (exe, empty, "error"),
+            ]);
         }
         // Every script is written before any runs: executing a file another thread's fork may
         // still hold open for writing can fail with ETXTBSY.
