@@ -535,6 +535,36 @@ fn manifests_and_layer_folders_cannot_live_outside_the_loadout() {
 }
 
 #[test]
+fn machine_tags_must_be_ids_that_name_a_loaded_layer() {
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[machines.box]\ntags = [\"../other\", \"Work\", \"../loadout\"]\n",
+        ),
+        ("other.toml", ""),
+        ("tags/work.toml", ""),
+    ]);
+    assert_eq!(code, 3, "{text}");
+    for tag in ["../other", "Work", "../loadout"] {
+        assert!(
+            text.contains(&format!(
+                "machines.box.tags: tag {tag:?} must be lowercase letters"
+            )),
+            "{tag}: {text}"
+        );
+    }
+
+    let (code, text) = validate_tree(&[
+        (
+            "loadout.toml",
+            "[loadout]\nversion = 1\n[machines.box]\ntags = [\"work\"]\n",
+        ),
+        ("tags/work.toml", ""),
+    ]);
+    assert_eq!(code, 0, "{text}");
+}
+
+#[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["doctor", "--json"]);

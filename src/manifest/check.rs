@@ -89,6 +89,20 @@ impl Checker {
 
     fn machines(&mut self, loadout: &Loadout) {
         self.file = Some(PathBuf::from(super::ROOT_FILE));
+        let loaded: BTreeSet<&str> = loadout
+            .layers
+            .iter()
+            .filter_map(|file| match &file.scope {
+                Scope::Tag(tag) => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        let listed: BTreeSet<String> = fs::read_dir(loadout.root.join("tags"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
         let mut used = BTreeSet::new();
         for (name, entry) in &loadout.machines {
             let key = format!("machines.{name}");
@@ -97,16 +111,17 @@ impl Checker {
             }
             let mut seen = BTreeSet::new();
             for tag in &entry.tags {
-                if !seen.insert(tag.as_str()) {
+                if !is_id(tag) {
+                    self.error(
+                        format!("{key}.tags"),
+                        format!("tag {tag:?} must be lowercase letters, digits, - or _"),
+                    );
+                } else if !seen.insert(tag.as_str()) {
                     self.error(
                         format!("{key}.tags"),
                         format!("tag {tag:?} is listed twice"),
                     );
-                } else if !loadout
-                    .root
-                    .join("tags")
-                    .join(format!("{tag}.toml"))
-                    .is_file()
+                } else if !loaded.contains(tag.as_str()) && !listed.contains(&format!("{tag}.toml"))
                 {
                     self.error(
                         format!("{key}.tags"),

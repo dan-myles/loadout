@@ -167,8 +167,10 @@ tags = ["work", "laptop"]
 ```
 
 A machine name the loadout doesn't list gets the global and OS layers only. These are errors: a
-`machines/<name>.toml` with no `[machines.<name>]` entry, a listed tag with no `tags/<tag>.toml`,
-and a tag listed twice. A tag file that no machine lists is a warning.
+`machines/<name>.toml` with no `[machines.<name>]` entry, a listed tag that isn't an id, a tag
+listed twice, and a listed tag with no `tags/<tag>.toml` layer. The match is exact and
+case-sensitive against the loaded tag layers, never a path probe, so `../x` or `Work` can't pass on
+any file system. A tag file that no machine lists is a warning.
 
 ### Layer tables (allowed in every layer file)
 
