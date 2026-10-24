@@ -20,25 +20,71 @@ pub(super) struct Undefined {
     pub(super) line: Option<usize>,
 }
 
+/// `whole` is false only where the value is a receiver: its attributes, items, or methods are read
+/// next, and each of those reads is guarded on its own.
 pub(super) fn guard(
     value: &Value,
     expression: &str,
     lookup: bool,
     line: usize,
+    whole: bool,
 ) -> Result<Value, minijinja::Error> {
-    if value.is_undefined() {
+    let failure = |message: String, lookup| {
         let undefined = Undefined {
             expression: expression.to_owned(),
             lookup,
             line: Some(line),
         };
-        return Err(minijinja::Error::new(
-            minijinja::ErrorKind::UndefinedError,
-            undefined.to_string(),
-        )
-        .with_source(undefined));
+        minijinja::Error::new(minijinja::ErrorKind::UndefinedError, message).with_source(undefined)
+    };
+    if value.is_undefined() {
+        return Err(failure(format!("`{expression}` is undefined"), lookup));
+    }
+    if whole && let Some(field) = undefined_loop_field(value) {
+        return Err(failure(
+            format!("`{expression}` has no value for `{field}` in a loop of unknown length"),
+            false,
+        ));
     }
     Ok(value.clone())
+}
+
+// The loop object is the only map the engine builds that lists keys with no value: `length`,
+// `revindex`, and `revindex0` are undefined when the loop's iterator has no exact length. Used
+// whole (copied by `dict`, `namespace`, or a `**` splat, stored, or passed on), it would carry
+// those undefined values into a container.
+fn undefined_loop_field(value: &Value) -> Option<&'static str> {
+    if !is_loop(value) {
+        return None;
+    }
+    LOOP_KEYS
+        .into_iter()
+        .find(|key| value.get_attr(key).is_ok_and(|field| field.is_undefined()))
+}
+
+const LOOP_KEYS: [&str; 9] = [
+    "index0",
+    "index",
+    "length",
+    "revindex",
+    "revindex0",
+    "first",
+    "last",
+    "depth",
+    "depth0",
+];
+
+/// Recognises minijinja's loop object: a map-kind object that renders as `<loop …>` and lists
+/// exactly the loop's keys in the loop's order. A map or namespace renders as `{…}` and sorts its
+/// keys, so none matches. Kind is checked first, so an iterator is never iterated here.
+pub(super) fn is_loop(value: &Value) -> bool {
+    value.as_object().is_some()
+        && minijinja::tests::is_mapping(value)
+        && value.to_string().starts_with("<loop ")
+        && value.try_iter().is_ok_and(|keys| {
+            keys.map(|key| key.as_str().map(str::to_owned))
+                .eq(LOOP_KEYS.map(|key| Some(key.to_owned())))
+        })
 }
 
 /// Rebuilds a parsed template with a guard on every lookup, filter result, and call result that
@@ -52,6 +98,9 @@ pub(super) fn guard(
 /// The one undefined value a template can still produce is the explicit empty value of an `if`
 /// expression without `else`, which reads no missing variable.
 ///
+/// A guarded value is also checked whole, except as a receiver (of an attribute, an item, or a
+/// method): a loop object whose length is unknown may be read through, never used as a value.
+///
 /// Guards run only when their expression does, so a branch that isn't taken needs nothing. A
 /// method call named `cycle` goes through `CYCLE`, which refuses an empty argument list
 /// instead of letting the loop object divide by zero.
@@ -62,6 +111,7 @@ pub(super) fn rewrite<'a>(source: &'a str, template: &Stmt<'a>) -> Stmt<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Position {
     Value,
+    Receiver,
     Escaped,
     Callee,
     Target,
@@ -187,7 +237,7 @@ impl<'a> Rewriter<'a> {
         if let Expr::GetAttr(method) = &node.expr
             && method.name == "cycle"
         {
-            let mut args = vec![CallArg::Pos(self.expr(&method.expr, Position::Value))];
+            let mut args = vec![CallArg::Pos(self.expr(&method.expr, Position::Receiver))];
             args.extend(self.args(&node.args, Position::Value));
             return Spanned::new(
                 ast::Call {
@@ -207,7 +257,7 @@ impl<'a> Rewriter<'a> {
     }
 
     fn expr(&self, expr: &Expr<'a>, position: Position) -> Expr<'a> {
-        use Position::{Callee, ChainEscaped, Escaped, FilterBlock, Target, Value};
+        use Position::{Callee, ChainEscaped, Escaped, FilterBlock, Receiver, Target, Value};
         // Inside a header chain only a filter continues the chain; anything else in an escaped
         // spot is an ordinary escaped operand.
         let position = match (position, expr) {
@@ -215,14 +265,18 @@ impl<'a> Rewriter<'a> {
             (ChainEscaped, _) => Escaped,
             (position, _) => position,
         };
-        // Targets are names being bound, not values being read; they stay exactly as parsed.
+        // Targets are names being bound, not values being read; they stay exactly as parsed. A
+        // receiver is guarded but not checked whole, because only its parts are read next.
         let inner = if position == Target { Target } else { Value };
+        let receiver = if position == Target { Target } else { Receiver };
         match expr {
             Expr::Var(node) => {
                 let var = Expr::Var(Spanned::new(ast::Var { id: node.id }, node.span()));
                 match position {
                     Escaped | ChainEscaped | Callee | Target => var,
-                    Value | FilterBlock => self.guarded(var, node.span(), true),
+                    Value | Receiver | FilterBlock => {
+                        self.guarded(var, node.span(), true, position)
+                    }
                 }
             }
             Expr::Const(node) => Expr::Const(Spanned::new(
@@ -234,27 +288,31 @@ impl<'a> Rewriter<'a> {
             Expr::GetAttr(node) => {
                 let attr = Expr::GetAttr(Spanned::new(
                     ast::GetAttr {
-                        expr: self.expr(&node.expr, inner),
+                        expr: self.expr(&node.expr, receiver),
                         name: node.name,
                     },
                     node.span(),
                 ));
                 match position {
                     Escaped | ChainEscaped | Callee | Target => attr,
-                    Value | FilterBlock => self.guarded(attr, node.span(), true),
+                    Value | Receiver | FilterBlock => {
+                        self.guarded(attr, node.span(), true, position)
+                    }
                 }
             }
             Expr::GetItem(node) => {
                 let item = Expr::GetItem(Spanned::new(
                     ast::GetItem {
-                        expr: self.expr(&node.expr, inner),
+                        expr: self.expr(&node.expr, receiver),
                         subscript_expr: self.expr(&node.subscript_expr, inner),
                     },
                     node.span(),
                 ));
                 match position {
                     Escaped | ChainEscaped | Target => item,
-                    Value | Callee | FilterBlock => self.guarded(item, node.span(), true),
+                    Value | Receiver | Callee | FilterBlock => {
+                        self.guarded(item, node.span(), true, position)
+                    }
                 }
             }
             Expr::Filter(node) => {
@@ -285,14 +343,18 @@ impl<'a> Rewriter<'a> {
                 };
                 match position {
                     Escaped | ChainEscaped => filter,
-                    Value | Callee | Target | FilterBlock => self.guarded(filter, span, false),
+                    Value | Receiver | Callee | Target | FilterBlock => {
+                        self.guarded(filter, span, false, position)
+                    }
                 }
             }
             Expr::Call(node) => {
                 let call = Expr::Call(self.call(node));
                 match position {
                     Escaped | ChainEscaped => call,
-                    Value | Callee | Target | FilterBlock => self.guarded(call, node.span(), false),
+                    Value | Receiver | Callee | Target | FilterBlock => {
+                        self.guarded(call, node.span(), false, position)
+                    }
                 }
             }
             Expr::Test(node) => {
@@ -381,7 +443,7 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    fn guarded(&self, expr: Expr<'a>, span: Span, lookup: bool) -> Expr<'a> {
+    fn guarded(&self, expr: Expr<'a>, span: Span, lookup: bool, position: Position) -> Expr<'a> {
         let text = self
             .source
             .get(span.start_offset as usize..span.end_offset as usize)
@@ -395,6 +457,7 @@ impl<'a> Rewriter<'a> {
                     CallArg::Pos(constant(Value::from(text))),
                     CallArg::Pos(constant(Value::from(lookup))),
                     CallArg::Pos(constant(Value::from(span.start_line))),
+                    CallArg::Pos(constant(Value::from(position != Position::Receiver))),
                 ],
             },
             span,

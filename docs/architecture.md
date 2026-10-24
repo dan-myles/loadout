@@ -425,6 +425,19 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
   needed, and a Windows-only variable may live in `os/windows.toml`. The one undefined value a
   template can still produce is the explicit empty value of an `if` expression without `else`,
   which reads no missing variable.
+
+  A guard also checks its value **whole**, except where the value is a **receiver** (of an
+  attribute, an item, or a method call, including `cycle`). Only one engine object lists keys it
+  has no value for: minijinja's loop object, whose `length`, `revindex`, and `revindex0` are
+  undefined when its iterator has no exact length, as in `{% for c in "ab" %}`. Used whole, it
+  fails with "`loop` has no value for `length` in a loop of unknown length". That covers a copy
+  (`dict(loop)`, `namespace(loop)`), a `**loop` or `*[loop]` splat into any callable, an
+  assignment, a container item, a filter or test operand, and printing. Read through, it works:
+  `loop.index`, `loop["first"]`, `loop.changed(c)`, `loop.cycle(…)`, `loop.length |
+  default("?")`, and recursive `loop(…)`. A loop of known length is used whole normally. The loop
+  object is recognised as a map-kind object that renders as `<loop …>` and lists exactly its nine
+  keys in order; a map or namespace renders as `{…}` and sorts its keys. Kind is checked before
+  anything is iterated, so an iterator is never consumed.
 - **Builtins** (`src/template/builtins.rs`). Some builtins compute or consume values inside Rust,
   where no guard runs. Every filter, test, and global minijinja registers under the enabled
   features (47 filters, 42 tests, and `range`, `dict`, `namespace`; `debug` is removed) was
@@ -444,8 +457,10 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     every item; `groupby` accepts its `default=`.
   - For an attribute path, every part before the last must exist even under an escape, as for
     `a.b is defined`.
-  - `items` and `dictsort` reject a pair whose value is undefined. The loop object lists `length`
-    and `revindex` even when a loop over a lazy iterator has no known length.
+  - `items` and `dictsort` reject a pair whose value is undefined, as a second line behind the
+    whole-loop guard.
+  - `dict`, `namespace`, and `**` splats copy a map's pairs. Every map they can receive holds only
+    guarded values, except a whole loop object of unknown length, which the guard refuses first.
   - A wrapper collects its input once, so a one-shot iterator is never consumed twice.
 
   Correction: the U2 report for `fbd7579` said `selectattr` and `rejectattr` were not registered.

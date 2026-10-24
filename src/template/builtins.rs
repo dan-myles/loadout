@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use minijinja::value::{Kwargs, Rest, ValueOrKwargs, from_args};
 use minijinja::{Environment, Error, ErrorKind, State, Value, filters, tests};
 
-use super::strict::{CYCLE, Undefined};
+use super::strict::{CYCLE, Undefined, is_loop};
 
 const ESCAPE_TESTS: [&str; 2] = ["defined", "undefined"];
 
@@ -61,8 +61,8 @@ fn divisible_by(value: &Value, divisor: &Value) -> Result<bool, Error> {
 }
 
 // The loop object's `cycle` computes `index % args.len()`, which panics with no arguments. Only
-// that object is intercepted, recognised by the exact key list it enumerates; a map's keys come
-// sorted, so no map matches. Every other receiver's `cycle` method is called unchanged.
+// that object is intercepted (see `strict::is_loop`); every other receiver's `cycle` method is
+// called unchanged.
 fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, Error> {
     if args.is_empty() && is_loop(receiver) {
         return Err(Error::new(
@@ -71,27 +71,6 @@ fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, E
         ));
     }
     receiver.call_method(state, "cycle", args)
-}
-
-const LOOP_KEYS: [&str; 9] = [
-    "index0",
-    "index",
-    "length",
-    "revindex",
-    "revindex0",
-    "first",
-    "last",
-    "depth",
-    "depth0",
-];
-
-fn is_loop(value: &Value) -> bool {
-    value.as_object().is_some()
-        && tests::is_mapping(value)
-        && value.try_iter().is_ok_and(|keys| {
-            keys.map(|key| key.as_str().map(str::to_owned))
-                .eq(LOOP_KEYS.iter().map(|key| Some((*key).to_owned())))
-        })
 }
 
 fn min(state: &State, value: &Value, kwargs: Kwargs) -> Result<Value, Error> {

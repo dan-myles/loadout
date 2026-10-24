@@ -755,7 +755,7 @@ fn a_loop_of_unknown_length_has_no_length_to_read_or_pair() {
     for pairs in ["items | list | length", "dictsort | length"] {
         fails_with(
             &format!("{unknown}{{{{ loop | {pairs} }}}}{{% endfor %}}"),
-            "the value of \"length\" is undefined",
+            "`loop` has no value for `length` in a loop of unknown length",
         );
     }
     renders(&[
@@ -821,5 +821,124 @@ fn loop_cycle_needs_a_value_instead_of_dividing_by_zero() {
     renders(&[(
         "{% for row in [[1, 2]] %}{% for x in row %}{{ loop.cycle(\"o\", \"e\") }}{% endfor %}{% endfor %}",
         "oe",
+    )]);
+}
+
+#[test]
+fn a_whole_loop_of_unknown_length_is_never_copied_stored_or_passed_on() {
+    for body in [
+        "{{ dict(loop) | pprint }}",
+        "{{ dict(**loop) | pprint }}",
+        "{{ namespace(loop) | items | length }}",
+        "{{ namespace(**loop).index }}",
+        "{{ dict(loop) | length }}",
+        "{% set alias = loop %}{{ alias.index }}",
+        "{% with alias = loop %}{{ alias.index }}{% endwith %}",
+        "{{ [loop] | length }}",
+        "{{ {\"l\": loop} | length }}",
+        "{{ loop | pprint }}",
+        "{{ loop | items | length }}",
+        "{{ loop | dictsort | length }}",
+        "{{ loop | list | length }}",
+        "{{ loop is mapping }}",
+        "{{ loop }}",
+        "{{ \"%s\" | format(**loop) }}",
+        "{{ range(1) | map(\"string\", **loop) | join }}",
+        "{{ dict(*[loop]) | length }}",
+        "{{ loop.cycle(loop) }}",
+        "{{ loop.changed(loop) }}",
+    ] {
+        fails_with(
+            &format!("{{% for c in \"ab\" %}}{body}{{% endfor %}}"),
+            "`loop` has no value for `length` in a loop of unknown length",
+        );
+    }
+    renders(&[
+        (
+            "{% for c in \"ab\" %}{{ loop.index }}{{ loop.first }}{{ loop.changed(c) }}{{ loop.cycle(\"x\", \"y\") }}{% endfor %}",
+            "1TrueTruex2FalseTruey",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop.length | default(\"?\") }}{% endfor %}",
+            "??",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop.length is defined }}{% endfor %}",
+            "FalseFalse",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop[\"index\"] }}{{ loop.depth }}{% endfor %}",
+            "1121",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ dict(i=loop.index).i }}{% endfor %}",
+            "12",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop is defined }}{{ (loop | default(1)).index }}{% endfor %}",
+            "True1True2",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ dict(loop) | length }}{% endfor %}",
+            "99",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ dict(**loop).index }}{% endfor %}",
+            "12",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ namespace(loop).revindex }}{% endfor %}",
+            "21",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ namespace(**loop).length }}{% endfor %}",
+            "22",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ loop | items | length }}{% endfor %}",
+            "99",
+        ),
+        (
+            "{% for x in [1, 2] %}{% set alias = loop %}{{ alias.revindex0 }}{% endfor %}",
+            "10",
+        ),
+        (
+            "{% for row in [[1], [2]] recursive %}{{ loop.depth }}{% if row is sequence %}{{ loop([]) }}{% endif %}{% endfor %}",
+            "11",
+        ),
+        ("{{ {\"k\": (\"a\" if false)} | length }}", "1"),
+    ]);
+}
+
+#[test]
+fn only_the_real_loop_object_counts_as_a_loop() {
+    let lookalike = "dict(index0=0, index=1, length=none, revindex=3, revindex0=4, first=5, last=6, depth=7, depth0=8)";
+    renders(&[
+        (&format!("{{{{ {lookalike} | length }}}}"), "9"),
+        (&format!("{{{{ {lookalike} | items | length }}}}"), "9"),
+        (
+            &format!("{{% set ns = namespace({lookalike}) %}}{{{{ ns.depth0 }}}}"),
+            "8",
+        ),
+        (
+            "{{ ({\"index0\": 0} | chain({\"index\": 1}, {\"length\": 2}, {\"revindex\": 3}, {\"revindex0\": 4}, {\"first\": 5}, {\"last\": 6}, {\"depth\": 7}, {\"depth0\": 8})) | length }}",
+            "9",
+        ),
+    ]);
+    for receiver in [
+        lookalike.to_owned(),
+        "({\"index0\": 0} | chain({\"index\": 1}, {\"length\": 2}, {\"revindex\": 3}, {\"revindex0\": 4}, {\"first\": 5}, {\"last\": 6}, {\"depth\": 7}, {\"depth0\": 8}))".to_owned(),
+    ] {
+        match render(&format!("{{{{ {receiver}.cycle() }}}}"), &linux()) {
+            Err(Error {
+                problem: Problem::Render(message),
+                ..
+            }) => assert!(!message.contains("loop.cycle()"), "{receiver}: {message}"),
+            other => panic!("a map has no cycle method, got {other:?}"),
+        }
+    }
+    renders(&[(
+        "{{ [1, 2] | zip([3, 4]) | map(\"first\") | join }}{{ range(2) | list | length }}",
+        "122",
     )]);
 }
