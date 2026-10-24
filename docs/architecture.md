@@ -30,7 +30,8 @@ async would buy v1 nothing.
 | `nix` (`signal`; Unix only) | programs: signals the query's process group and confirms it is empty (U7) |
 
 `loadout-winproc` (`crates/loadout-winproc`, a workspace member) is the workspace's only `unsafe`
-code: one safe function, `resume_suspended`, over `windows` 0.62 (already in the lock through
+code: one safe operation in two steps, `prepare` (find, open and check the child's one thread)
+and `Prepared::resume_before(deadline)`, over `windows` 0.62 (already in the lock through
 `process-wrap`). It denies `unsafe_op_in_unsafe_fn`, gives every `unsafe` block one call and a
 `SAFETY` comment, and owns every handle it opens. The `loadout` crate keeps
 `unsafe_code = "forbid"`. Nothing else goes in that crate: it is not a general Windows wrapper.
@@ -1000,12 +1001,19 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   4. If the setup deadline has already passed, the query is **not resumed**. Loadout still
      terminates the job at once (checked) and confirms what it can within the spent limit. The
      result is the setup error, or `Cleanup` with it as the cause; never success.
-  5. Otherwise `loadout_winproc::resume_suspended` resumes the query. It finds the child's
-     threads in one snapshot, requires exactly one, opens it, checks it still belongs to the
-     child, and only then resumes it. A previous suspend count other than 1 is an error.
-  6. **Any** resume error is treated as "the query may have run": there is no `watch`, and the
-     whole job is stopped within the **same** setup deadline, with the resume error as the
-     cause. Only a successful resume ends setup and clears the deadline. From then on, the
+  5. Otherwise `loadout_winproc::prepare` finds the child's threads in one snapshot, requires
+     exactly one, opens it, and checks it still belongs to the child. Then
+     `Prepared::resume_before` reads the clock once more, after all that preparation, as the
+     last step before `ResumeThread`: if the setup deadline has passed, `ResumeThread` is not
+     called, and the result is a setup timeout. A previous suspend count other than 1 is an
+     error. Reading the clock and resuming aren't one atomic step, and no real-time guarantee
+     is made: the thread can be preempted between them. So after the resume returns, loadout
+     checks the deadline again, and setup succeeds only if it still hasn't passed. Otherwise it
+     is a setup timeout, handled as in step 6.
+  6. **Any** resume error, or a resume that returned after the deadline, is treated as "the
+     query may have run": there is no `watch`, and the whole job is stopped within the **same**
+     setup deadline, with that error as the cause. Only a successful resume that returned in
+     time ends setup and clears the deadline. From then on, the
      innermost wrapper's blocking `wait` refuses rather than block without a bound; loadout
      itself only ever polls.
 

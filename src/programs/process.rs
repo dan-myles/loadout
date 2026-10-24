@@ -632,26 +632,34 @@ impl Query {
         }
     }
 
-    /// Resumes the suspended query, unless the setup deadline has passed: a query is never newly
-    /// resumed after it. Loadout owns the job by now, so any error, even one after the thread
-    /// started, leaves the whole job to `settle`, within the same setup deadline, with this error
-    /// as the cause. Only a successful resume ends setup.
+    /// Resumes the suspended query within the setup deadline `limit`. Loadout owns the job by
+    /// now, so any error, even one after the thread started, leaves the whole job to `settle`,
+    /// within the same deadline, with this error as the cause.
+    ///
+    /// The deadline is checked on entry, then again by the helper after all its preparation
+    /// (finding, opening and checking the thread), as the last step before `ResumeThread`: a
+    /// query is never knowingly resumed late. The clock check and the resume aren't one atomic
+    /// step, so a resume can still land just after the deadline. That is why setup succeeds
+    /// only if the deadline still hasn't passed once the resume returns; otherwise it is a
+    /// setup timeout, and the query, which may now be running, is stopped with its whole job.
     fn start(&self, limit: Instant) -> Result<(), QueryError> {
         #[cfg(test)]
         seam::before_resume(limit);
         if Instant::now() >= limit {
-            return Err(QueryError::Spawn(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "its setup did not finish within the {} second setup limit, so loadout did not resume it",
-                    QUERY_CLEANUP_GRACE.as_secs()
-                ),
-            )));
+            return Err(setup_timeout("so loadout did not resume it"));
         }
-        let resumed = loadout_winproc::resume_suspended(&guard(&self.root));
+        let prepared = loadout_winproc::prepare(&guard(&self.root)).map_err(QueryError::Spawn)?;
         #[cfg(test)]
-        let resumed = resumed.and_then(|()| seam::after_resume());
+        seam::after_prepare(limit);
+        let resumed = prepared.resume_before(limit);
+        #[cfg(test)]
+        let resumed = resumed.and_then(|()| seam::after_resume(limit));
         resumed.map_err(QueryError::Spawn)?;
+        if Instant::now() >= limit {
+            return Err(setup_timeout(
+                "and it was resumed only as that limit passed, so loadout stopped it",
+            ));
+        }
         *guard(&self.setup) = None;
         Ok(())
     }
@@ -704,6 +712,17 @@ impl Query {
             )),
         }
     }
+}
+
+#[cfg(windows)]
+fn setup_timeout(outcome: &str) -> QueryError {
+    QueryError::Spawn(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "its setup did not finish within the {} second setup limit, {outcome}",
+            QUERY_CLEANUP_GRACE.as_secs()
+        ),
+    ))
 }
 
 /// The innermost child `process-wrap` wraps: loadout's own process, shared with `Query::root`
@@ -849,7 +868,7 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Test-only fault injection for query setup. Each seam reaches exactly one branch. The two
+/// Test-only fault injection for query setup. Each seam reaches exactly one branch. The
 /// deadline seams wait for the real setup deadline to pass, so the branch after them runs with
 /// an exhausted budget; they move no clock.
 #[cfg(test)]
@@ -879,6 +898,17 @@ mod seam {
         /// Holds `start` until the setup deadline has passed, so it must refuse to resume.
         #[cfg(windows)]
         ExhaustBeforeResume,
+        /// Holds `start` after the thread was found, opened and checked, until the setup deadline
+        /// has passed, so the helper's final check must refuse to call `ResumeThread`.
+        #[cfg(windows)]
+        ExpireAfterPrepare,
+        /// Holds `start` for this long after preparation, with time still left: a positive.
+        #[cfg(windows)]
+        PauseAfterPrepare(Duration),
+        /// After a real, successful resume, holds `start` until the setup deadline has passed, so
+        /// the recheck must turn the late resume into a setup timeout.
+        #[cfg(windows)]
+        ExpireAfterResume,
         /// After a real resume, waits until the test's descendant writes this file, then fails.
         #[cfg(windows)]
         FailAfterResume(PathBuf),
@@ -930,10 +960,28 @@ mod seam {
         }
     }
 
-    /// The readiness wait is the test's own bound. It is longer than the production setup
-    /// deadline, so a test using this seam supplies a longer setup deadline of its own.
     #[cfg(windows)]
-    pub(super) fn after_resume() -> io::Result<()> {
+    pub(super) fn after_prepare(limit: Instant) {
+        let pause = SEAM.with(|cell| match cell.borrow().as_ref() {
+            Some(Seam::PauseAfterPrepare(pause)) => Some(*pause),
+            _ => None,
+        });
+        if let Some(pause) = pause {
+            thread::sleep(pause);
+        } else if is(&Seam::ExpireAfterPrepare) {
+            wait_out(limit);
+        }
+    }
+
+    /// `FailAfterResume`'s readiness wait is the test's own bound. It is longer than the
+    /// production setup deadline, so a test using that seam supplies a longer setup deadline of
+    /// its own.
+    #[cfg(windows)]
+    pub(super) fn after_resume(limit: Instant) -> io::Result<()> {
+        if is(&Seam::ExpireAfterResume) {
+            wait_out(limit);
+            return Ok(());
+        }
         let ready = SEAM.with(|cell| match cell.borrow().as_ref() {
             Some(Seam::FailAfterResume(ready)) => Some(ready.clone()),
             _ => None,
@@ -1158,6 +1206,7 @@ fn start_reader<R: Read + Send + 'static>(source: Option<R>, keep: Keep) -> (Sha
 /// is killed and reaped, and the test fails.
 #[cfg(test)]
 mod fixture {
+    use std::cell::Cell;
     use std::io::{self, Read};
     use std::process::{Child, Command, ExitStatus, Output, Stdio};
     use std::sync::mpsc;
@@ -1167,18 +1216,57 @@ mod fixture {
     /// A generous bound for a short helper command.
     pub(super) const HELPER: Duration = Duration::from_secs(20);
 
-    /// Runs a helper command to completion within `limit`, reading its output on bounded threads.
-    /// Only failing to start it is an error; not finishing in time fails the test.
+    thread_local! {
+        /// Test-only: the stream whose drainer `drain` refuses to start, as if no thread could
+        /// be created.
+        static FAIL_DRAINER: Cell<Option<&'static str>> = const { Cell::new(None) };
+        /// The id of the last helper `output` started, so a test can check it is gone.
+        static LAST_HELPER: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn fail_drainer(stream: Option<&'static str>) {
+        FAIL_DRAINER.with(|cell| cell.set(stream));
+    }
+
+    pub(super) fn last_helper() -> Option<u32> {
+        LAST_HELPER.with(Cell::get)
+    }
+
+    /// Runs a helper command to completion within `limit`, reading its output on two drainer
+    /// threads. The child is owned from the moment it exists, before either drainer starts, so
+    /// every later failure, a panic included, kills and reaps it within a bound.
+    ///
+    /// An error is either the spawn itself (`NotFound` if there is no such program) or a
+    /// drainer that couldn't start, after the child was stopped. Not finishing in time fails the
+    /// test. Waiting for the output is bounded only for this caller: a drainer still blocked on
+    /// a pipe some other process holds open keeps running, and nothing cancels it. Helper output
+    /// is short, read whole, and read errors are not reported.
     pub(super) fn output(command: &mut Command, limit: Duration) -> io::Result<Output> {
         let started = Instant::now();
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
-        let mut owned = Owned::new(child);
+        let mut owned = Owned::new(
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+        let child = owned.child.as_mut().expect("just spawned");
+        LAST_HELPER.with(|cell| cell.set(Some(child.id())));
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let stdout = drain(stdout, "stdout")?;
+        let stderr = match drain(stderr, "stderr") {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                let stopped = owned.stop(Duration::from_secs(10));
+                let first = match stdout.recv_timeout(Duration::from_secs(5)) {
+                    Ok(_) => "finished",
+                    Err(_) => "still running (nothing cancels it)",
+                };
+                return Err(io::Error::other(format!(
+                    "{error}; the helper was stopped: {stopped:?}; the stdout drainer is {first}"
+                )));
+            }
+        };
         let status = owned
             .wait_within(limit.saturating_sub(started.elapsed()))
             .unwrap_or_else(|| panic!("the test helper {command:?} did not exit within {limit:?}"));
@@ -1190,18 +1278,35 @@ mod fixture {
         })
     }
 
-    fn drain(source: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    /// Starts a drainer with `thread::Builder`, so a thread that can't be created is an error,
+    /// not a panic.
+    fn drain(
+        source: Option<impl Read + Send + 'static>,
+        stream: &'static str,
+    ) -> io::Result<mpsc::Receiver<Vec<u8>>> {
         let (sender, receiver) = mpsc::channel();
-        if let Some(mut source) = source {
-            thread::spawn(move || {
+        if FAIL_DRAINER.with(Cell::get) == Some(stream) {
+            return Err(io::Error::other(format!(
+                "injected: cannot start the {stream} drainer"
+            )));
+        }
+        let Some(mut source) = source else {
+            let _ = sender.send(Vec::new());
+            return Ok(receiver);
+        };
+        thread::Builder::new()
+            .spawn(move || {
                 let mut bytes = Vec::new();
                 let _ = source.read_to_end(&mut bytes);
                 let _ = sender.send(bytes);
-            });
-        } else {
-            let _ = sender.send(Vec::new());
-        }
-        receiver
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot start the {stream} drainer: {error}"),
+                )
+            })?;
+        Ok(receiver)
     }
 
     fn collect(receiver: &mpsc::Receiver<Vec<u8>>, limit: Duration, command: &Command) -> Vec<u8> {
@@ -1479,8 +1584,9 @@ mod tests {
 
     #[test]
     fn output_held_by_a_process_that_left_the_group_is_a_bounded_cleanup_error() {
-        if fixture::output(Command::new("python3").arg("--version"), fixture::HELPER).is_err() {
-            return;
+        match fixture::output(Command::new("python3").arg("--version"), fixture::HELPER) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            result => assert!(result.unwrap().status.success()),
         }
         let dir = tempfile::tempdir().unwrap();
         let escapee = dir.path().join("escapee");
@@ -1877,6 +1983,34 @@ mod tests {
         assert!(elapsed > QUERY_CLEANUP_GRACE, "{elapsed:?}");
         assert!(trace.disposal_limit.unwrap() > trace.setup_limit.unwrap());
     }
+
+    /// C4: the helper fixture owns its child before either drainer starts. If the second can't
+    /// start, the child is killed and reaped (so it is gone at return), and what became of the
+    /// first drainer is reported.
+    #[test]
+    fn a_helper_whose_second_drainer_cannot_start_is_stopped() {
+        fixture::fail_drainer(Some("stderr"));
+        let result = fixture::output(Command::new("sleep").arg("30"), fixture::HELPER);
+        fixture::fail_drainer(None);
+        let text = result.unwrap_err().to_string();
+        assert!(text.contains("injected: cannot start the stderr drainer"), "{text}");
+        assert!(text.contains("the helper was stopped: Ok(())"), "{text}");
+        assert!(text.contains("the stdout drainer is finished"), "{text}");
+        let pid = fixture::last_helper().unwrap();
+        assert!(!alive(&pid.to_string()), "the helper {pid} must be gone at return");
+    }
+
+    #[test]
+    fn a_helper_with_both_drainers_returns_its_output() {
+        let output = fixture::output(
+            Command::new("/bin/sh").args(["-c", "echo out; echo err >&2"]),
+            fixture::HELPER,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1936,7 +2070,8 @@ mod windows_tests {
     }
 
     /// For the exhausted-budget controls: the job was terminated, but its exit may not have been
-    /// observed before the spent limit. The test waits for it within its own bound.
+    /// observed before the spent limit. The test waits for it within its own bound. This shows
+    /// it eventually disappeared, not that it was already gone when the query returned.
     fn gone_within(pid: u32, limit: Duration) -> bool {
         until(Instant::now() + limit, || Ok(!alive(pid))) == Ok(true)
     }
@@ -2110,6 +2245,82 @@ mod windows_tests {
         assert!(!marker.exists(), "the query must never have been resumed");
     }
 
+    /// The deadline passes after the helper found, opened and checked the thread, before its
+    /// final check: `ResumeThread` must not be called. The query never runs (no marker), and its
+    /// job is stopped with the original deadline. Its disappearance is then observed within the
+    /// test's own 10 second poll, which is not proof that it was gone when `run` returned.
+    #[test]
+    fn a_query_whose_deadline_passes_after_preparation_is_not_resumed() {
+        let scratch = tempdir().unwrap();
+        let (invocation, marker) = marking(scratch.path());
+        let (result, trace, elapsed) = run(
+            &invocation,
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::ExpireAfterPrepare),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(primary(&error), QueryError::Spawn(inner)
+                if inner.kind() == io::ErrorKind::TimedOut && inner.to_string().contains("so it was not resumed")),
+            "{error}"
+        );
+        assert_eq!(trace.job_kills, 1, "the job must be terminated even with no budget left");
+        assert_setup_disposal(&trace);
+        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
+        let root = trace.root.unwrap();
+        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+        assert!(!marker.exists(), "the query must never have been resumed");
+    }
+
+    /// The positive for the same boundary: a pause after preparation that leaves time on the
+    /// setup deadline still resumes, and the query answers.
+    #[test]
+    fn a_query_paused_after_preparation_with_time_left_is_resumed() {
+        let scratch = tempdir().unwrap();
+        let (result, trace, _) = run(
+            &script(scratch.path(), "echo hello"),
+            Duration::from_secs(20),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::PauseAfterPrepare(Duration::from_secs(1))),
+        );
+        let captured = result.unwrap();
+        assert_eq!(captured.code, Some(0));
+        assert_eq!(captured.stdout.trim(), "hello");
+        assert!(trace.disposal_limit.unwrap() > trace.setup_limit.unwrap());
+        assert!(!alive(trace.root.unwrap()));
+    }
+
+    /// A real resume that returns only once the deadline has passed: setup must not succeed.
+    /// The query may be running, so its whole job is stopped with the original deadline.
+    /// Disappearance is observed within the test's own poll, not claimed at return.
+    #[test]
+    fn a_resume_that_returns_after_the_deadline_is_a_setup_timeout() {
+        let scratch = tempdir().unwrap();
+        let (result, trace, elapsed) = run(
+            &script(scratch.path(), "ping -n 60 127.0.0.1 >nul"),
+            Duration::from_secs(60),
+            1024,
+            QUERY_CLEANUP_GRACE,
+            Some(seam::Seam::ExpireAfterResume),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(primary(&error), QueryError::Spawn(inner)
+                if inner.kind() == io::ErrorKind::TimedOut && inner.to_string().contains("resumed only as that limit passed")),
+            "{error}"
+        );
+        assert_eq!(trace.job_kills, 1);
+        assert_setup_disposal(&trace);
+        assert!(elapsed >= QUERY_CLEANUP_GRACE, "the seam waits out the deadline: {elapsed:?}");
+        assert!(elapsed < SETUP_BOUND, "no renewed budget: {elapsed:?}");
+        let root = trace.root.unwrap();
+        assert!(gone_within(root, Duration::from_secs(10)), "the query {root} must be stopped");
+    }
+
     /// The query really runs and really starts a descendant, which reports itself ready, before
     /// the injected error. The whole job must then be stopped: the query and the descendant are
     /// each checked to be gone.
@@ -2270,5 +2481,22 @@ mod windows_tests {
             "{result:?}"
         );
         assert!(!alive(trace.root.unwrap()));
+    }
+
+    /// C4, on Windows: as the Unix control, with `ping.exe` started directly.
+    #[test]
+    fn a_helper_whose_second_drainer_cannot_start_is_stopped() {
+        fixture::fail_drainer(Some("stderr"));
+        let result = fixture::output(
+            Command::new("ping.exe").args(["-n", "30", "127.0.0.1"]),
+            fixture::HELPER,
+        );
+        fixture::fail_drainer(None);
+        let text = result.unwrap_err().to_string();
+        assert!(text.contains("injected: cannot start the stderr drainer"), "{text}");
+        assert!(text.contains("the helper was stopped: Ok(())"), "{text}");
+        assert!(text.contains("the stdout drainer is finished"), "{text}");
+        let pid = fixture::last_helper().unwrap();
+        assert!(!alive(pid), "the helper {pid} must be gone at return");
     }
 }
