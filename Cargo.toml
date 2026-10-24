@@ -14,6 +14,7 @@ gethostname = "1"
 jsonc-parser = { version = "0.34", features = ["cst"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
 thiserror = "2"
 toml = "1.1"
 toml_edit = "0.25"
