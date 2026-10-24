@@ -80,11 +80,11 @@ src/
     doctor.rs             loadout doctor                                    [foundation, contended]
     validate.rs           loadout validate                                  [foundation; U1/U2 extend]
     plan.rs, apply.rs                                                       [U4]
-    status.rs, rollback.rs                                                  [U3]
+    status.rs, rollback.rs                                                  [built, U3]
     update.rs, service.rs                                                   [U8]
     init.rs                                                                 [U9]
   template/                                                                 [U2]
-  state/                                                                    [U3]
+  state/                  hash, disk, journal, run, rollback                [built, U3]
   apply/                                                                    [U4]
   agents/                 adapter table, skills + instructions targets      [U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [U6]
@@ -409,7 +409,7 @@ the output.
   agent config would put the secret on disk.
 - OAuth tokens and agent auth stores are never read, copied, or written (section 6).
 
-## 4. Local state (frozen, U3)
+## 4. Local state (built, U3)
 
 State lives in one directory per machine, never in the loadout.
 
@@ -460,7 +460,30 @@ exits 4, and never blocks. When the file is absent, the machine name
 defaults to the hostname, cut at the first `.`, lowercased, with other characters mapped to `-`.
 Once the file is written, renaming the computer doesn't change the name.
 
-## 5. Apply lifecycle (frozen, U3 + U4)
+**State files (built, U3, `src/state/`).** Loadout creates the state dir and `runs/` as `0700` on
+Unix, and writes `state.json` and every journal as `0600`, through a temp file, `fsync`, and rename.
+It reads `state.json` and journals only after checking that they canonicalize to a regular file
+inside the canonical state dir, the same rule as `machine.toml`. A link planted there is an error and
+is never opened. A corrupt or unknown-version `state.json` is an error (exit 1), never an empty
+machine.
+
+- `state.json`: `{ "version": 1, "records": [Record] }`. A `Record` is `{ target, item, sha256, run }`:
+  the `Target` and `ItemRef` (serialized exactly as in `plan --json`), the hash of what loadout last
+  wrote, and the id of the run that wrote it. There is one record per target, and an MCP entry is
+  its own target, so ownership is per key.
+- `runs/<run-id>/journal.json`: `{ version, run, started, loadout, status, entries }`. `loadout` is
+  the active checkout the run used, and `status` is `running`, `finished`, or `rolled-back`. Each
+  entry holds `item`, `target`, `change`, `prior`, `record` (the record before this run), `backup`
+  (`{ path, kind, modes, dirs }`), `step` (`pending`, `started`, `done`, `released`, `failed`),
+  `after` (the hash the action leaves), and `created` (the folders it made). No file content is in
+  a journal.
+- `runs/<run-id>/backups/<n>`: the prior file, or a copy of the prior folder, of entry `n`. Its
+  Unix modes are in the journal, not on the copy, which is `0600` (folders `0700`).
+- A run id is the UTC start time with nanoseconds, `YYYYMMDDTHHMMSS.nnnnnnnnnZ`, so byte order is
+  time order and the newest run is the greatest id. Rollback accepts only a name that matches a run
+  folder exactly, so a run argument can't name a path.
+
+## 5. Apply lifecycle (state built by U3; plan and apply frozen, U4)
 
 Settles the [Apply lifecycle](./wayfinder/loadout-v1/tickets/04-apply-lifecycle.md) ticket as
 delegated defaults.
@@ -500,7 +523,9 @@ delegated defaults.
   and overwrites it. The background service never forces.
 - **Removal.** An owned target that hasn't changed since loadout wrote it is backed up, then removed.
   A drifted one is released from ownership and left in place, with a warning. Programs are never
-  uninstalled in v1.
+  uninstalled in v1. `Run::remove` makes that call itself, from the journaled record: the plan
+  marks every undeclared owned target `remove`, and the result is `Removal::Removed` or
+  `Removal::Released`. A target that is already gone is released.
 - **Hashing** (`state::observe`, U3) is defined once. It is domain-separated by kind, so a file can
   never hash equal to a tree or an MCP entry. `Observed::Present.sha256` is the lowercase hex of:
   - a file: `SHA-256("loadout:file:v1\n" ‖ X ‖ 0x00 ‖ u64 big-endian length ‖ bytes)`. `X` is
@@ -517,7 +542,11 @@ delegated defaults.
     serde_json's `preserve_order`, under which `Map` keeps insertion order. A value read from TOML
     is first converted to `serde_json::Value`, so both formats hash the same way.
 
-  Plan, journal, and records all use this definition.
+  Plan, journal, and records all use this definition: `state::digest(&Content)` for desired
+  content, and `state::observe` for the disk. Observing a folder hashes its regular files and walks
+  its subfolders without following links. A link, FIFO, socket, or device inside an owned folder,
+  or as the target itself, is `state::Error::Special`, and nothing is opened. "Executable" on disk
+  means any `x` bit is set.
 - **Safe write.** Before the first write, the run's `journal.json` lists every action with its
   `prior` and backup path. For each write, `Run::write(action, content)`:
   1. Re-observes the target and compares the result to `action.prior`. If they differ, it aborts
@@ -537,11 +566,60 @@ delegated defaults.
      and execute bits entirely. Content hashes include the bit, so a mode-only change is an
      `update`.
   5. Marks the action done in the journal.
+
+  As built (U3): the target goes through `reserved::check_path(context, loadout, path, Use::Write)`
+  before it is read, backed up, or written, and a conflict is `state::Error::Reserved`. The
+  re-observation and the backup come from one read, so the backup is exactly the observed `prior`.
+  The backup is taken, and the journal marks the action `started` with its `after` hash and the
+  folders it will create, before the target changes. The target is observed once more just before
+  the rename, and any difference aborts with `Changed`. A file over a file is one rename. When a
+  folder is involved, the old target is renamed aside to `.<name>.loadout-<run>-<n>.old`, the new
+  one is renamed in, and the old one is deleted. If the second rename fails, the old one is moved
+  back. Through a symlink, the link's real target is written (a dangling link is created at its
+  destination). Unix modes for a tree come from the existing file at the same relative path.
+  Setuid, setgid, and sticky bits are dropped. An action whose target already equals its content
+  (`adopt`) is recorded without a write or a backup. A write that fails is marked `failed`, and
+  the empty folders it made are removed. `Run::finish` records ownership for every action that
+  reached the disk and must run even when some actions failed. A `Run` dropped without `finish`
+  leaves an interrupted run.
 - **Rollback.** `loadout rollback [RUN]` restores a run's backups and deletes the files that run
   created; the default is the latest run. `status` reports an interrupted run, and the same command
   rolls it back.
+  - Every `started` or `done` target must hold either the run's `after` (it is restored) or its
+    `prior` (nothing to do). Anything else, such as a later run's write or a user edit, blocks the
+    whole rollback with exit 4, and nothing is restored. A reserved target blocks the same way.
+  - A backup is restored only if it still hashes to `prior`, with its exact recorded modes.
+    Otherwise it is an error, and nothing is overwritten.
+  - Each target is re-observed just before it is restored.
+  - Folders the run created are removed when they are empty again.
+  - The records of every touched or released target go back to the journaled pre-run record.
+  - Rolling back a run that is already rolled back is an error (exit 1). A rollback that stops
+    halfway can be run again, and the targets it already restored are skipped.
+  - The reserved check uses the journal's recorded checkout.
 - **Concurrency.** `<state>/lock` (`std::fs::File::try_lock`) keeps a background update and a manual
-  apply from overlapping. The second one exits 1 with a clear message.
+  apply from overlapping. The second one exits 1 with a clear message. `state::lock` returns the
+  `Lock`, and `Run::begin` takes it by value, so a run can't start without holding it. `rollback`
+  takes it too. `status` only probes it (`state::busy`) and never creates anything.
+- **`loadout status [--json]`** (built) lists each record with its health (`ok`, `drifted`,
+  `missing`, or `unchecked` with a reason) and each run (`finished`, `rolled-back`, `interrupted`,
+  `in-progress` when another process holds the lock, or unreadable with its error). It exits 4 when
+  a record isn't `ok`, or when a run is interrupted or unreadable. The audit uses the default
+  checkout `<state>/loadout` as the reserved active checkout.
+- **MCP entries: interim guard (U3), entry transaction follow-up required.** U3 ships the
+  `mcp-entry` hash and per-key `Target::Entry` records. Until the follow-up lands, `observe`,
+  `Run::write`, and `Run::remove` refuse a `Target::Entry` with `state::Error::EntryNeedsMcp` and
+  write nothing, and `status` shows such a record as `unchecked`. This is not the v1 entry feature.
+  The follow-up, after U3 and U6, adds `shape: McpShape` to `Target::Entry`. It then consumes U6's
+  byte API, with state owning the transaction:
+  1. `reserved::check_path` with `KeyMerge`.
+  2. `mcp::lock(context, loadout, file)`: Grok's `.config-init.lock`, held to the rename.
+  3. One read, then `mcp::parse` and a check of that key's `prior`.
+  4. A backup of that key's value only. The whole shared file is never backed up, since
+     `.claude.json` holds `oauthAccount`.
+  5. `mcp::edit(bytes, format, pointer, shape, set, remove)`.
+  6. A re-read just before the rename, and abort if the bytes moved.
+  7. The atomic write, keeping the mode and links.
+  8. Rollback restores or removes that one key the same way.
 
 ## 6. Agents (frozen, U5 adapters, U6 MCP)
 
@@ -773,8 +851,8 @@ Automatic updates are required, so they are on by default.
 | `loadout validate [DIR] [--json]`: strict schema and static checks; exit 3 when invalid | foundation | U1 adds resolution across every machine on all three OSes, U2 adds template syntax |
 | `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
-| `loadout status [--json]` | frozen | U3 |
-| `loadout rollback [RUN]` | frozen | U3 |
+| `loadout status [--json]`: ownership records with drift, runs with interrupted ones; exit 4 when not healthy; never writes | built | U3 |
+| `loadout rollback [RUN]`: undo the newest or the named run; exit 4 when later changes block it | built | U3 |
 | `loadout update [--background]` | frozen | U8 (+U9 self-update) |
 | `loadout service install\|uninstall\|status` | frozen | U8 |
 | `loadout init <URL> [--name NAME] [--no-service]` | frozen | U9 |
@@ -857,13 +935,28 @@ pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts, context: &Cont
 pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;
 pub fn checks(context: &Context) -> Vec<Check>;
 
-// state (U3)
-impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; }
-pub fn lock(context: &Context) -> Result<Lock, state::Error>;
-pub fn observe(target: &Target) -> Result<Observed, state::Error>;   // the one hash definition (section 5)
-impl Run { pub fn begin(context: &Context, plan: &Plan) -> Result<Run, state::Error>; pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), state::Error>; pub fn finish(self, state: &mut State) -> Result<(), state::Error>; }
-// Run::write re-observes and returns Error::Changed { target } when the result != action.prior
-pub fn rollback(context: &Context, run: Option<&str>) -> Result<Vec<Target>, state::Error>;
+// state (built, U3)
+impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; pub fn records(&self) -> impl Iterator<Item = &Record>; }
+pub struct Record { pub target: Target, pub item: ItemRef, pub sha256: String, pub run: String }
+pub fn lock(context: &Context) -> Result<Lock, state::Error>;          // Error::Locked when another run holds it
+pub fn busy(context: &Context) -> Result<bool, state::Error>;           // probe only; never creates
+pub fn digest(content: &Content) -> Result<Observed, state::Error>;     // desired side of the one hash definition
+pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, state::Error>; // reserved check first; disk side
+impl Run {
+    pub fn begin(context: &Context, loadout: &Path, lock: Lock, state: &State, plan: &Plan) -> Result<Run, state::Error>;
+    pub fn id(&self) -> &str;
+    pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), state::Error>;   // create/update/adopt/replace/drifted
+    pub fn remove(&mut self, action: &Action) -> Result<Removal, state::Error>;              // Removed | Released
+    pub fn finish(self, state: &mut State) -> Result<(), state::Error>;
+}
+// Run::write and Run::remove re-observe and return Error::Changed { target } when the result != prior
+pub fn rollback(context: &Context, run: Option<&str>) -> Result<RolledBack, state::Error>; // RolledBack { run, restored: Vec<Target> }
+pub fn audit<'a>(context: &Context, loadout: &Path, state: &'a State) -> Vec<(&'a Record, Health)>;
+pub fn runs(context: &Context) -> Result<Vec<RunSummary>, state::Error>;
+// U3 changes to the frozen signatures (Decisions made here): observe and Run::begin take the
+// active checkout so the reserved check happens inside state before any read, backup, or write;
+// Run::begin takes the Lock by value and the pre-run State for the journaled records; Run::remove
+// is new; rollback returns the run id with the targets. plan types gained Deserialize.
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
