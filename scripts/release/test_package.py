@@ -74,6 +74,41 @@ class SmokeTest(unittest.TestCase):
         package.smoke_test(Path("loadout"), "riscv64gc-unknown-none-elf", "0.1.0")
 
 
+class MembersTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.binary = self.root / "loadout"
+        self.binary.write_bytes(b"bin")
+
+    def symlink(self, link, target):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("creating symlinks is not permitted here")
+
+    def test_ships_regular_root_files_and_skips_missing_ones(self):
+        (self.root / "README.md").write_text("readme")
+        (self.root / "LICENSE-MIT").write_text("mit")
+        _, entries = package.members(self.root, self.binary, "t")
+        self.assertEqual(
+            [name for name, _, _ in entries],
+            ["loadout-t/LICENSE-MIT", "loadout-t/README.md", "loadout-t/loadout"],
+        )
+
+    def test_symlink_to_file_outside_checkout_is_rejected(self):
+        outside = Path(tempfile.mkdtemp()) / "private.txt"
+        outside.write_text("local secret")
+        self.symlink(self.root / "README.md", outside)
+        with self.assertRaisesRegex(package.ReleaseError, "README.md is a symlink"):
+            package.members(self.root, self.binary, "t")
+
+    def test_symlink_inside_checkout_is_also_rejected(self):
+        (self.root / "docs.md").write_text("docs")
+        self.symlink(self.root / "LICENSE", self.root / "docs.md")
+        with self.assertRaisesRegex(package.ReleaseError, "LICENSE is a symlink"):
+            package.members(self.root, self.binary, "t")
+
+
 @unittest.skipIf(os.name == "nt", "fake binary is a POSIX shell script")
 class SmokeVersionTest(unittest.TestCase):
     def smoke(self, printed, expected):

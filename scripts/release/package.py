@@ -111,6 +111,8 @@ def members(root, binary, target):
     entries = [(f"{prefix}/{binary.name}", binary.read_bytes(), 0o755)]
     for name in EXTRA_FILES:
         path = root / name
+        if path.is_symlink():
+            raise ReleaseError(f"{name} is a symlink; release archives only ship regular files")
         if path.is_file():
             entries.append((f"{prefix}/{name}", path.read_bytes(), 0o644))
     return prefix, sorted(entries)
