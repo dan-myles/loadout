@@ -297,7 +297,9 @@ What validate enforces today, before any machine is known:
   - **Lexical.** A source path, or the literal target of a link inside a skill folder, has a `.git`
     component (case-insensitive). A skill folder contains any `.git` entry: a nested repo folder, or
     the worktree or submodule pointer file. `.gitconfig`, `.gitignore`, and other siblings are fine.
-  - **Resolved.** Its canonical path lies under the loadout's actual metadata. That metadata is
+  - **Resolved.** Its canonical path lies under the loadout's actual metadata. For a skill folder
+    this is checked for **every** entry the walk visits, before descending into it, not only for
+    the source root and links. A separate Git dir placed inside a skill is therefore caught. That metadata is
     found from `<root>/.git`: a folder (or a link to one) is the metadata root itself. A gitfile (or
     a link to one), as made by `--separate-git-dir`, worktrees, and submodules, counts as metadata
     itself, and so does the folder its `gitdir:` line names. If that folder holds a `commondir`

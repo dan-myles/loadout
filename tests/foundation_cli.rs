@@ -1022,6 +1022,75 @@ fn well_known_credential_files_are_reserved_targets() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_skill_folder_holding_the_real_git_metadata_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    let manifest = "[loadout]\nversion = 1\n[skills.x]\nsource = \"skill\"\n";
+    let setup = |name: &str| {
+        let root = scratch.join(name);
+        fs::create_dir_all(root.join("skill")).unwrap();
+        fs::write(root.join("skill/SKILL.md"), "x").unwrap();
+        fs::write(root.join("loadout.toml"), manifest).unwrap();
+        root
+    };
+    let run = |root: &Path, json: bool| {
+        let mut args = vec!["validate", root.to_str().unwrap()];
+        if json {
+            args.push("--json");
+        }
+        let output = Sandbox::new().run(&args);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let gitfile = setup("gitfile");
+    let metadata = gitfile.join("skill/metadata");
+    git(
+        scratch,
+        &gitfile,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let linked = setup("linked");
+    git(
+        scratch,
+        &linked,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            linked.join("skill/metadata").to_str().unwrap(),
+        ],
+    );
+    fs::remove_file(linked.join(".git")).unwrap();
+    symlink(linked.join("skill/metadata"), linked.join(".git")).unwrap();
+    for root in [&gitfile, &linked] {
+        for json in [false, true] {
+            let (code, text) = run(root, json);
+            assert_eq!(code, 3, "{root:?} json={json}: {text}");
+            assert!(text.contains("the loadout's Git metadata"), "{text}");
+        }
+    }
+
+    let clean = setup("clean");
+    git(scratch, &clean, &["init", "-q"]);
+    fs::write(clean.join("skill/.gitconfig"), "[user]\n").unwrap();
+    for json in [false, true] {
+        assert_eq!(
+            run(&clean, json).0,
+            0,
+            "clean skill with .gitconfig stays valid"
+        );
+    }
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();

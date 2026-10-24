@@ -419,6 +419,16 @@ impl Checker {
                 }
             };
             let path = entry.path();
+            if self.git.iter().any(|metadata| path.starts_with(metadata)) {
+                self.error(
+                    key,
+                    format!(
+                        "{} is the loadout's Git metadata, not skill content",
+                        shown(&path)
+                    ),
+                );
+                continue;
+            }
             if entry.file_name().eq_ignore_ascii_case(GIT_DIR) {
                 self.error(
                     key,
