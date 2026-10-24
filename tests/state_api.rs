@@ -1695,7 +1695,12 @@ fn observe_write_and_remove_refuse_a_none_target_without_file_system_access() {
     let machine = Machine::new();
     let error = state::observe(&machine.context, &machine.loadout, &Target::None).unwrap_err();
     assert!(
-        matches!(error, Error::NoTarget { operation: "observe" }),
+        matches!(
+            error,
+            Error::NoTarget {
+                operation: "observe"
+            }
+        ),
         "{error}"
     );
     assert_eq!(state::label(&Target::None), "no target");
@@ -1712,7 +1717,12 @@ fn observe_write_and_remove_refuse_a_none_target_without_file_system_access() {
         );
         let error = run.remove(&none).unwrap_err();
         assert!(
-            matches!(error, Error::NoTarget { operation: "remove" }),
+            matches!(
+                error,
+                Error::NoTarget {
+                    operation: "remove"
+                }
+            ),
             "{error}"
         );
     }
