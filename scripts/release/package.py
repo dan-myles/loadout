@@ -92,8 +92,10 @@ def host_can_run(target):
     return target.startswith(arch + "-") and system is not None and system in target
 
 
-def smoke_test(binary, target, version):
+def smoke_test(binary, target, version, required=False):
     if not host_can_run(target):
+        if required:
+            raise ReleaseError(f"--require-smoke: this host cannot execute {target}")
         print(f"smoke test skipped: this host cannot execute {target}", file=sys.stderr)
         return
     output = run([str(binary), "--version"])
@@ -164,6 +166,11 @@ def main(argv=None):
     parser.add_argument(
         "--expect-version", help="fail unless Cargo.toml's version equals this (tag without v)"
     )
+    parser.add_argument(
+        "--require-smoke",
+        action="store_true",
+        help="fail instead of skipping the --version smoke test when the host can't run the target",
+    )
     args = parser.parse_args(argv)
 
     root = Path(run(["git", "rev-parse", "--show-toplevel"]).strip())
@@ -182,7 +189,7 @@ def main(argv=None):
     )
     exe = PACKAGE + (".exe" if is_windows(args.target) else "")
     binary = target_dir / args.target / "release" / exe
-    smoke_test(binary, args.target, version)
+    smoke_test(binary, args.target, version, args.require_smoke)
 
     prefix, entries = members(root, binary, args.target)
     out_dir = (args.out_dir or target_dir / "dist").resolve()

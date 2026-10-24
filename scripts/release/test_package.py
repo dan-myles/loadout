@@ -63,5 +63,14 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(checksum.read_bytes(), f"{digest}  loadout-t.tar.gz\n".encode())
 
 
+class SmokeTest(unittest.TestCase):
+    def test_required_smoke_fails_when_host_cannot_run_target(self):
+        with self.assertRaisesRegex(package.ReleaseError, "cannot execute"):
+            package.smoke_test(Path("loadout"), "riscv64gc-unknown-none-elf", "0.1.0", required=True)
+
+    def test_optional_smoke_skips_when_host_cannot_run_target(self):
+        package.smoke_test(Path("loadout"), "riscv64gc-unknown-none-elf", "0.1.0")
+
+
 if __name__ == "__main__":
     unittest.main()

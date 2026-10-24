@@ -31,20 +31,18 @@ jobs:
       matrix:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
-          - { target: x86_64-apple-darwin, os: macos-15 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
-          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
-    env:
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -52,7 +50,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
       - name: Build and package
         run: |
-          args=(--target "${{ matrix.target }}" --out-dir dist)
+          args=(--target "${{ matrix.target }}" --out-dir dist --require-smoke)
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             args+=(--expect-version "${GITHUB_REF_NAME#v}")
           fi

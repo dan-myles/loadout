@@ -10,8 +10,8 @@ Runs on pushes to `main`, every pull request, and manual dispatch.
 | Job | Runner | Command |
 |-----|--------|---------|
 | rustfmt | ubuntu-24.04 | `cargo fmt --all --check` |
-| clippy and test | ubuntu-24.04, macos-15 (arm64), windows-2025 | `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked` |
-| release packaging tests | ubuntu-24.04 | `python3 -m unittest discover -s scripts/release -v` |
+| clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked` |
+| release packaging tests | ubuntu-24.04, Python 3.8 and 3.12 | `python -m unittest discover -s scripts/release -v` |
 
 Every job installs the latest stable Rust through rustup. If the repo adds `rust-toolchain.toml`,
 rustup uses that toolchain instead, with no change to the workflow. `--locked` means a stale
@@ -20,19 +20,26 @@ downloads and `target/`. Release builds start clean so a poisoned cache can't re
 
 ## Release artifacts (`.github/workflows/release.yml`)
 
-| Target | Runner | Built how | Executed in CI |
-|--------|--------|-----------|----------------|
-| `x86_64-unknown-linux-musl` | ubuntu-24.04 | native, static | yes, `--version` smoke |
-| `aarch64-unknown-linux-musl` | ubuntu-24.04 | cross, linked by the toolchain's `rust-lld` | no |
-| `x86_64-apple-darwin` | macos-15 (arm64) | cross with the Xcode SDK | no |
-| `aarch64-apple-darwin` | macos-15 | native | yes |
-| `x86_64-pc-windows-msvc` | windows-2025 | native, static CRT | yes |
-| `aarch64-pc-windows-msvc` | windows-2025 | cross with MSVC ARM64 tools, static CRT | no |
+| Target | Runner |
+|--------|--------|
+| `x86_64-unknown-linux-musl` | ubuntu-24.04 |
+| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm |
+| `x86_64-apple-darwin` | macos-15-intel |
+| `aarch64-apple-darwin` | macos-15 |
+| `x86_64-pc-windows-msvc` | windows-2025 |
+| `aarch64-pc-windows-msvc` | windows-11-arm |
+
+Every target builds natively on the matching architecture, using only
+[standard GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+which are free for public repositories. No larger runners are used. Every build runs
+`package.py --require-smoke`, so the packaged binary's `--version` must succeed on its own platform,
+or the job fails. If GitHub retires its Intel macOS images (`macos-15-intel`, `macos-26-intel`),
+cross-build `x86_64-apple-darwin` on an arm64 `macos-*` runner and drop `--require-smoke` for that
+target.
 
 The Linux binaries are statically linked against musl, so they run on any distribution and need
 no glibc. The Windows binaries link the C runtime statically, so they don't need the VC++
-redistributable. The repo is private, so GitHub's free ARM runners aren't available. That's why
-three targets are cross-built and never executed in CI.
+redistributable.
 
 Each target produces two assets:
 
@@ -44,7 +51,7 @@ The `checksums` job checks all six, then combines them into `SHA256SUMS`. Asset 
 version, so bootstrap and self-update can resolve
 `https://github.com/dan-myles/loadout/releases/download/<tag>/loadout-<target>.tar.gz` (or
 `releases/latest/download/...`) directly from the target triple.
-While the repo is private, those URLs need a GitHub token to download.
+The repository is public, so these downloads need no GitHub token.
 
 Triggers:
 
@@ -77,11 +84,13 @@ python3 scripts/release/package.py --target x86_64-unknown-linux-musl
 
 The script runs `cargo build --release --locked --target <target> --bin loadout`, runs
 `loadout --version` when the host can execute the target, and writes the archive and checksum.
-Pass `--out-dir DIR` to write somewhere else, and `--expect-version X.Y.Z` to repeat the tag check.
+Pass `--out-dir DIR` to write somewhere else, `--expect-version X.Y.Z` to repeat the tag check, and
+`--require-smoke` to fail instead of skipping the smoke test.
 
 Prerequisites per host:
 
-- All: rustup, git, Python 3.8+ (`python` on Windows runners comes from `actions/setup-python`).
+- All: rustup, git, Python 3.8+. Release jobs install Python 3.13 with `actions/setup-python`, the
+  oldest line it ships as binaries for every runner above, Windows ARM64 included.
 - Linux cross to aarch64: `export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`. No apt
   packages needed while the crate has no C dependencies. If one is added, install `musl-tools` and
   `gcc-aarch64-linux-gnu` and point the linker at the latter.
