@@ -399,7 +399,13 @@ delegated defaults.
 - **Ownership.** `state.json` records every target the CLI wrote, with the SHA-256 of what it wrote.
   An entry inside a shared file, such as an MCP server in `~/.claude.json`, gets a record per key.
 - **Plan as data.** `plan::build` compares desired content, the disk, and the records, and returns
-  `Action`s with one of these `Change`s:
+  `Action`s. Each action carries:
+  - `prior: Observed`: what the plan saw at the target, from `state::observe`. It is `Absent`,
+    `Present { sha256 }`, or `Installed` (for programs). This precondition travels with the action
+    into the journal and into the safe write.
+  - `content: Option<Content>`: `File(FileContent { bytes, executable })`, `Tree` (relative path to
+    `FileContent`), or `Entry` (one JSON value). Content is never serialized.
+  - one of these `Change`s:
 
   | Change | Meaning |
   | --- | --- |
@@ -420,13 +426,24 @@ delegated defaults.
 - **Removal.** An owned target that hasn't changed since loadout wrote it is backed up, then removed.
   A drifted one is released from ownership and left in place, with a warning. Programs are never
   uninstalled in v1.
-- **Safe write.** Before the first write, the run's `journal.json` lists every action with the
-  target's prior hash and backup path. For each write:
-  1. Re-hash the target and abort that action if it changed since the plan.
-  2. Resolve a symlinked target and write the real file, so the user's links survive.
-  3. Write a temp file in the same directory, `fsync` it, and rename it over the target.
-  4. Keep the file's mode, and never widen it (for example, keep `0600`).
-  5. Mark the action done in the journal.
+- **Hashing** (`state::observe`, U3) is defined once:
+  - a file: SHA-256 of its bytes
+  - a tree: SHA-256 over its sorted relative paths, each with its executable bit and bytes
+  - an entry: SHA-256 of the canonical JSON of that one key
+
+  Plan, journal, and records all use this definition.
+- **Safe write.** Before the first write, the run's `journal.json` lists every action with its
+  `prior` and backup path. For each write, `Run::write(action, content)`:
+  1. Re-observes the target and compares the result to `action.prior`. If they differ, it aborts
+     that action with `state::Error::Changed` and writes nothing, so a target that changed after the
+     plan (even an unowned file planned for `replace`) is never overwritten.
+  2. Resolves a symlinked target and writes the real file, so the user's links survive.
+  3. Writes a temp file in the same directory, `fsync`s it, and renames it over the target.
+  4. Sets modes. An existing file keeps its permission bits and is never widened (for example, it
+     keeps `0600`); only its execute bits follow `FileContent.executable`. A new file gets the
+     default mode, plus execute bits when `executable` is set. Execute bits mean nothing on Windows
+     and are ignored there.
+  5. Marks the action done in the journal.
 - **Rollback.** `loadout rollback [RUN]` restores a run's backups and deletes the files that run
   created; the default is the latest run. `status` reports an interrupted run, and the same command
   rolls it back.
@@ -619,10 +636,12 @@ pub fn checks(context: &Context) -> Vec<Check>;
 // state (U3)
 impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; }
 pub fn lock(context: &Context) -> Result<Lock, state::Error>;
-impl Run { pub fn begin(context: &Context, plan: &Plan) -> Result<Run, state::Error>; pub fn write(&mut self, action: &Action, bytes: &[u8]) -> Result<(), state::Error>; pub fn finish(self, state: &mut State) -> Result<(), state::Error>; }
+pub fn observe(target: &Target) -> Result<Observed, state::Error>;   // the one hash definition (section 5)
+impl Run { pub fn begin(context: &Context, plan: &Plan) -> Result<Run, state::Error>; pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), state::Error>; pub fn finish(self, state: &mut State) -> Result<(), state::Error>; }
+// Run::write re-observes and returns Error::Changed { target } when the result != action.prior
 pub fn rollback(context: &Context, run: Option<&str>) -> Result<Vec<Target>, state::Error>;
 
-// plan (U4; Desired/Content/Target/Action/Plan types foundation)
+// plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
 pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, state: &State) -> Result<Plan, Diagnostics>;
 // apply (U4)
 pub fn run(plan: &Plan, context: &Context, options: Options) -> Result<Report, apply::Error>;
