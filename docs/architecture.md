@@ -140,8 +140,18 @@ machines/<name>.toml      one layer per machine name
 files/ skills/ ...        sources in any layout, referenced by relative path
 ```
 
-Only `loadout.toml` is required. `os/`, `tags/`, and `machines/` may hold only `<name>.toml` files.
-Other directories are sources, and validate ignores them. An unknown key anywhere is an error.
+Only `loadout.toml` is required. `os/`, `tags/`, and `machines/` may hold only `<name>.toml` files,
+plus the folder metadata `.DS_Store` and `.gitkeep`, which are ignored. Other directories are
+sources, and validate ignores them. An unknown key anywhere is an error.
+
+`Loadout::load` reads only from inside the canonical loadout root:
+
+- `loadout.toml` and every layer file and layer folder are canonicalized, and anything that resolves
+  outside the root is an error. A link inside the loadout is fine.
+- A missing `os/`, `tags/`, or `machines/` folder means "no layers of that kind". Every other
+  discovery failure is an error with its path, so a layer is never silently dropped: a permission
+  error, a file where the folder should be, or an unreadable entry.
+- `Loadout.root` holds the canonical root.
 [`tests/foundation/complete/`](../tests/foundation/complete) is a full example that passes
 validation, and [`tests/foundation/invalid/`](../tests/foundation/invalid) collects the mistakes
 validate catches.

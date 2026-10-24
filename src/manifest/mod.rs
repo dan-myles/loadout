@@ -3,6 +3,7 @@ mod schema;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -109,16 +110,18 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
         key: None,
         message,
     };
-    if !root.is_dir() {
-        diagnostics.push(error(
-            None,
-            format!("{} is not a directory", root.display()),
-        ));
-        return None;
-    }
-
+    let real_root = match root.canonicalize() {
+        Ok(real) if real.is_dir() => real,
+        _ => {
+            diagnostics.push(error(
+                None,
+                format!("{} is not a directory", root.display()),
+            ));
+            return None;
+        }
+    };
     let root_file = PathBuf::from(ROOT_FILE);
-    let parsed: RootFile = parse(root, &root_file, diagnostics)?;
+    let parsed: RootFile = parse(&real_root, &root_file, diagnostics)?;
     match &parsed.loadout {
         None => diagnostics.push(error(
             Some(root_file.clone()),
@@ -151,7 +154,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
         },
     }];
 
-    for (name, file) in layer_files(root, OS_DIR, diagnostics) {
+    for (name, file) in layer_files(&real_root, OS_DIR, diagnostics) {
         let Some(os) = Os::ALL.into_iter().find(|os| os.name() == name) else {
             diagnostics.push(error(
                 Some(file),
@@ -159,7 +162,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
             ));
             continue;
         };
-        if let Some(layer) = parse(root, &file, diagnostics) {
+        if let Some(layer) = parse(&real_root, &file, diagnostics) {
             layers.push(LayerFile {
                 scope: Scope::Os(os),
                 file,
@@ -171,7 +174,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
         (TAGS_DIR, Scope::Tag as fn(String) -> Scope),
         (MACHINES_DIR, Scope::Machine),
     ] {
-        for (name, file) in layer_files(root, dir, diagnostics) {
+        for (name, file) in layer_files(&real_root, dir, diagnostics) {
             if !is_id(&name) {
                 diagnostics.push(error(
                     Some(file),
@@ -179,7 +182,7 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
                 ));
                 continue;
             }
-            if let Some(layer) = parse(root, &file, diagnostics) {
+            if let Some(layer) = parse(&real_root, &file, diagnostics) {
                 layers.push(LayerFile {
                     scope: scope(name),
                     file,
@@ -190,29 +193,81 @@ fn read(root: &Path, diagnostics: &mut Diagnostics) -> Option<Loadout> {
     }
 
     Some(Loadout {
-        root: root.to_path_buf(),
+        root: real_root,
         machines: parsed.machines,
         layers,
     })
 }
 
+const IGNORED: [&str; 2] = [".DS_Store", ".gitkeep"];
+
 fn layer_files(root: &Path, dir: &str, diagnostics: &mut Diagnostics) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = fs::read_dir(root.join(dir)) else {
-        return Vec::new();
+    let mut problem = |file: PathBuf, message: String| {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            file: Some(file),
+            key: None,
+            message,
+        });
     };
+    let path = root.join(dir);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            problem(PathBuf::from(dir), format!("cannot read: {error}"));
+            return Vec::new();
+        }
+        Ok(_) => {}
+    }
+    match path.canonicalize() {
+        Ok(real) if !real.starts_with(root) => {
+            problem(
+                PathBuf::from(dir),
+                "resolves outside the loadout".to_owned(),
+            );
+            return Vec::new();
+        }
+        Ok(real) if !real.is_dir() => {
+            problem(
+                PathBuf::from(dir),
+                "must be a folder of <name>.toml layer files".to_owned(),
+            );
+            return Vec::new();
+        }
+        Ok(_) => {}
+        Err(error) => {
+            problem(PathBuf::from(dir), format!("cannot read: {error}"));
+            return Vec::new();
+        }
+    }
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            problem(PathBuf::from(dir), format!("cannot read: {error}"));
+            return Vec::new();
+        }
+    };
+
     let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let relative = Path::new(dir).join(entry.file_name());
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                problem(PathBuf::from(dir), format!("cannot read an entry: {error}"));
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
-        let stem = name.strip_suffix(".toml");
-        match stem {
+        if IGNORED.contains(&name.as_str()) {
+            continue;
+        }
+        let relative = Path::new(dir).join(&name);
+        match name.strip_suffix(".toml") {
             Some(stem) if entry.path().is_file() => files.push((stem.to_owned(), relative)),
-            _ => diagnostics.push(Diagnostic {
-                severity: Severity::Error,
-                file: Some(relative),
-                key: None,
-                message: format!("{dir}/ holds only <name>.toml layer files"),
-            }),
+            _ => problem(
+                relative,
+                format!("{dir}/ holds only <name>.toml layer files"),
+            ),
         }
     }
     files.sort();
@@ -224,27 +279,36 @@ fn parse<T: for<'de> Deserialize<'de>>(
     file: &Path,
     diagnostics: &mut Diagnostics,
 ) -> Option<T> {
-    let text = match fs::read_to_string(root.join(file)) {
+    let mut problem = |message: String| {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            file: Some(file.to_path_buf()),
+            key: None,
+            message,
+        });
+    };
+    let real = match root.join(file).canonicalize() {
+        Ok(real) if real.starts_with(root) => real,
+        Ok(_) => {
+            problem("resolves outside the loadout".to_owned());
+            return None;
+        }
+        Err(error) => {
+            problem(format!("cannot read: {error}"));
+            return None;
+        }
+    };
+    let text = match fs::read_to_string(real) {
         Ok(text) => text,
         Err(error) => {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Error,
-                file: Some(file.to_path_buf()),
-                key: None,
-                message: format!("cannot read: {error}"),
-            });
+            problem(format!("cannot read: {error}"));
             return None;
         }
     };
     match toml::from_str(&text) {
         Ok(value) => Some(value),
         Err(error) => {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Error,
-                file: Some(file.to_path_buf()),
-                key: None,
-                message: error.to_string().trim_end().to_owned(),
-            });
+            problem(error.to_string().trim_end().to_owned());
             None
         }
     }

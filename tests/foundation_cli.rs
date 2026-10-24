@@ -421,6 +421,119 @@ fn skill_contents_cannot_escape_through_links() {
     assert_eq!(code, 0, "in-loadout file link stays valid: {text}");
 }
 
+const MINIMAL: &str = "[loadout]\nversion = 1\n";
+const BAD_LAYER: &str = "[nonsense]\nx = 1\n";
+
+#[test]
+fn a_layer_path_that_is_not_a_folder_is_an_error() {
+    for dir in ["os", "tags", "machines"] {
+        let (code, text) = validate_tree(&[("loadout.toml", MINIMAL), (dir, "not a folder")]);
+        assert_eq!(code, 3, "{dir}: {text}");
+        assert!(
+            text.contains(&format!(
+                "{dir}: error: must be a folder of <name>.toml layer files"
+            )),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn only_known_folder_metadata_is_ignored() {
+    let (code, text) = validate_tree(&[
+        ("loadout.toml", MINIMAL),
+        ("os/.DS_Store", "finder"),
+        ("tags/.gitkeep", ""),
+        ("machines/.gitkeep", ""),
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let (code, text) = validate_tree(&[("loadout.toml", MINIMAL), ("os/.hidden.toml", "")]);
+    assert_eq!(code, 3, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_layer_folder_is_an_error_not_an_absent_layer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loadout.toml"), MINIMAL).unwrap();
+    fs::create_dir(dir.path().join("os")).unwrap();
+    fs::write(dir.path().join("os/linux.toml"), BAD_LAYER).unwrap();
+    fs::set_permissions(dir.path().join("os"), fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(dir.path().join("os")).is_ok();
+    let output = Sandbox::new().run(&["validate", dir.path().to_str().unwrap(), "--json"]);
+    fs::set_permissions(dir.path().join("os"), fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        eprintln!("running with permission to read a 000 folder (root?); skipped");
+        return;
+    }
+    assert_eq!(output.status.code(), Some(3), "{}", stdout(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["valid"], false);
+    assert!(stdout(&output).contains("cannot read"));
+}
+
+#[cfg(unix)]
+#[test]
+fn manifests_and_layer_folders_cannot_live_outside_the_loadout() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = scratch.path().join("outside");
+    fs::create_dir_all(outside.join("os")).unwrap();
+    fs::write(outside.join("linux.toml"), "").unwrap();
+    fs::write(outside.join("loadout.toml"), MINIMAL).unwrap();
+
+    let case = |name: &str, build: &dyn Fn(&Path)| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        build(&root);
+        let output = Sandbox::new().run(&["validate", root.to_str().unwrap()]);
+        (output.status.code().unwrap(), stdout(&output))
+    };
+
+    let (code, text) = case("layer-file", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        fs::create_dir(root.join("os")).unwrap();
+        symlink(outside.join("linux.toml"), root.join("os/linux.toml")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("os/linux.toml: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("layer-dir", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        symlink(outside.join("os"), root.join("os")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("os: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("root-file", &|root| {
+        symlink(outside.join("loadout.toml"), root.join("loadout.toml")).unwrap();
+    });
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("loadout.toml: error: resolves outside the loadout"),
+        "{text}"
+    );
+
+    let (code, text) = case("inside-link", &|root| {
+        fs::write(root.join("loadout.toml"), MINIMAL).unwrap();
+        fs::create_dir_all(root.join("shared")).unwrap();
+        fs::write(root.join("shared/linux.toml"), "").unwrap();
+        fs::create_dir(root.join("os")).unwrap();
+        symlink(root.join("shared/linux.toml"), root.join("os/linux.toml")).unwrap();
+    });
+    assert_eq!(code, 0, "a link inside the loadout stays valid: {text}");
+}
+
 #[test]
 fn doctor_passes_in_an_isolated_home() {
     let sandbox = Sandbox::new();
