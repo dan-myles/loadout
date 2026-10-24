@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use minijinja::value::ValueKind;
-use minijinja::value::{DynObject, Kwargs, Rest, ValueOrKwargs, from_args};
+use minijinja::value::{DynObject, Enumerator, Kwargs, ObjectRepr, Rest, ValueOrKwargs, from_args};
 use minijinja::{Environment, Error, ErrorKind, State, Value, filters, functions, tests};
 
-use super::strict::{ACYCLIC, CYCLE, STORE, UNPACK, Undefined, is_current_loop};
+use super::strict::{
+    ACYCLIC, CHANGED, CYCLE, LOOP, LOOP_KEYS, STORE, UNPACK, Undefined, is_current_loop,
+};
 
 const ESCAPE_TESTS: [&str; 2] = ["defined", "undefined"];
 
@@ -28,6 +30,8 @@ pub(super) fn install(environment: &mut Environment<'_>) {
     environment.add_filter("dictsort", dictsort);
     environment.add_filter("chain", chain);
     environment.add_function(CYCLE, cycle);
+    environment.add_function(CHANGED, changed);
+    environment.add_function(LOOP, register_loop);
     environment.add_function("namespace", namespace);
     environment.add_function(ACYCLIC, acyclic);
     environment.add_function(UNPACK, unpack);
@@ -71,16 +75,22 @@ fn divisible_by(value: &Value, divisor: &Value) -> Result<bool, Error> {
 // no arguments, only the running loop gets that error; a receiver with a `cycle` member keeps
 // minijinja's call of that member; anything else gets minijinja's own unknown-method error, built
 // here without calling into the receiver, because an aliased outer loop would still divide by
-// zero. With arguments, every receiver is called unchanged.
-fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, Error> {
+// zero. With arguments, every receiver is called unchanged, keyword arguments included.
+fn cycle(
+    state: &mut State,
+    receiver: ValueOrKwargs,
+    args: Rest<ValueOrKwargs>,
+) -> Result<Value, Error> {
+    let receiver = receiver.into_value();
+    let args = native_args(args);
     if !args.is_empty()
         || receiver
             .as_object()
             .is_some_and(|object| object.get_value(&Value::from("cycle")).is_some())
     {
-        return receiver.call_method(state, "cycle", args);
+        return receiver.call_method(state, "cycle", &args);
     }
-    if is_current_loop(state, receiver) {
+    if is_current_loop(state, &receiver) {
         return Err(Error::new(
             ErrorKind::MissingArgument,
             "loop.cycle() needs at least one value to cycle through",
@@ -90,6 +100,75 @@ fn cycle(state: &mut State, receiver: &Value, args: &[Value]) -> Result<Value, E
         ErrorKind::UnknownMethod,
         format!("{} has no method named cycle", receiver.kind()),
     ))
+}
+
+// A method's arguments as the VM hands them to `call_method`: keyword arguments stay one trailing
+// keyword-arguments value.
+fn native_args(args: Rest<ValueOrKwargs>) -> Vec<Value> {
+    args.0.into_iter().map(ValueOrKwargs::into_value).collect()
+}
+
+// Every loop object of this render, each with what its `changed()` last saw. minijinja keeps that
+// memory inside the loop object, where it holds template values the loop does not expose, so a
+// namespace stored in the loop's memory and the loop stored in the namespace would form a cycle
+// no check can see. Kept here instead, the memory lives in the render's `State`, which no template
+// value can reach, and goes away with the render. The loop objects then hold only their fields.
+struct Loops(Vec<(Value, Option<Vec<Value>>)>);
+
+// Called first in every loop body with that body's loop: minijinja reserves the name `loop`, so
+// no local can hide it.
+fn register_loop(state: &mut State, current: &Value) -> Value {
+    let loops = state.get_or_insert_extension(Loops(Vec::new()));
+    if !loops
+        .0
+        .iter()
+        .rev()
+        .any(|(known, _)| tests::is_sameas(known, current))
+    {
+        loops.0.push((current.clone(), None));
+    }
+    Value::from(())
+}
+
+// Only a loop object enumerates exactly the loop's keys in this order; a map or a namespace lists
+// its keys sorted. Nothing is rendered, iterated, or called.
+fn is_loop(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.repr() == ObjectRepr::Map
+            && matches!(object.enumerate(), Enumerator::Str(keys) if keys == LOOP_KEYS)
+    })
+}
+
+// minijinja's `loop.changed(*args)`: true, and remembered, when the arguments differ from the
+// last call's (`last != Some(&args)`). A loop's memory is the render's, never the loop object's:
+// its body registered it, and a loop not yet registered starts with no memory, as minijinja's
+// does. Any other receiver is called exactly as minijinja would.
+fn changed(
+    state: &mut State,
+    receiver: ValueOrKwargs,
+    args: Rest<ValueOrKwargs>,
+) -> Result<Value, Error> {
+    let receiver = receiver.into_value();
+    let args = native_args(args);
+    if !is_loop(&receiver) {
+        return receiver.call_method(state, "changed", &args);
+    }
+    let loops = &mut state.get_or_insert_extension(Loops(Vec::new())).0;
+    let known = loops
+        .iter()
+        .rposition(|(known, _)| tests::is_sameas(known, &receiver));
+    let index = if let Some(index) = known {
+        index
+    } else {
+        loops.push((receiver, None));
+        loops.len() - 1
+    };
+    let memory = &mut loops[index].1;
+    let changed = memory.as_ref() != Some(&args);
+    if changed {
+        *memory = Some(args);
+    }
+    Ok(Value::from(changed))
 }
 
 // The namespaces created in this render. minijinja's `Namespace` type is private and its global
@@ -123,12 +202,18 @@ fn is_namespace(state: &State, value: &Value) -> bool {
 //   rendering, comparing, or sorting it recurses without end;
 // - a value holding a lazy sequence anywhere, because a lazy sequence keeps references it does not
 //   yield yet (a `zip` cut short, an empty slice) that could reach the receiver once it is stored.
-fn acyclic(state: &State, value: &Value, receiver: &Value, target: &str) -> Result<Value, Error> {
-    if !is_namespace(state, receiver) {
-        return Ok(value.clone());
+fn acyclic(
+    state: &State,
+    value: ValueOrKwargs,
+    receiver: ValueOrKwargs,
+    target: &str,
+) -> Result<Value, Error> {
+    let receiver = receiver.into_value();
+    if !is_namespace(state, &receiver) {
+        return Ok(value.into_value());
     }
-    match stored(value, receiver) {
-        Stored::Plain => Ok(value.clone()),
+    match stored(&value, &receiver) {
+        Stored::Plain => Ok(value.into_value()),
         Stored::Cycle => {
             let owner = target.rsplit_once('.').map_or(target, |(owner, _)| owner);
             Err(Error::new(
@@ -195,8 +280,8 @@ fn stored(start: &Value, receiver: &Value) -> Stored {
 // minijinja's unpacking of a target list (`vm::unpack_list`): the object-level items (so a scalar
 // and a non-enumerable object such as a function both fail as `value is not iterable`), each
 // checked, exactly `count` of them, with minijinja's own error kinds and messages.
-fn unpack(value: &Value, count: usize) -> Result<Value, Error> {
-    let Some(items) = value.as_object().and_then(DynObject::try_iter) else {
+fn unpack(value: ValueOrKwargs, count: usize) -> Result<Value, Error> {
+    let Some(items) = value.into_value().as_object().and_then(DynObject::try_iter) else {
         return Err(Error::new(ErrorKind::CannotUnpack, "value is not iterable"));
     };
     let items = Value::from(items.collect::<Vec<Value>>())

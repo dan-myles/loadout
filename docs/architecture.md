@@ -477,8 +477,26 @@ The syntax is minijinja's Jinja subset: `{{ email }}`, `{% if work %}…{% elif 
     view. **Transparent:** maps (literals, `dict`, namespaces, keyword arguments, the loop object),
     lists, tuples (a tuple slice or repeat is a new tuple), a `chain` of only sequences, groupby's
     group tuple (whose `list` is itself lazy), and `* 0` or repeating an empty sequence (an
-    empty list). The loop object's remembered `changed()` arguments are never exposed as a value,
-    so they cannot form a reachable cycle. No enabled builtin makes a one-shot iterator.
+    empty list). The loop object is transparent only because its `changed()` memory is kept out of
+    it (below) and the `adjacent_loop_items` feature is off; with either one changed, it would
+    hold template values it does not expose. No enabled builtin makes a one-shot iterator.
+  - **Loop memory** (correction). An earlier version of this section said the loop's
+    remembered `changed()` arguments could not form a reachable cycle. That was wrong:
+    minijinja's `loop.changed(…)` keeps its arguments inside the loop object
+    (`Loop.last_changed_value`), which the loop never lists. So `{% do loop.changed(ns) %}{% set
+    ns.saved = loop %}`, or the same two steps in the other order, made a reference cycle that
+    no check could see, and that is never freed. Now every for-loop body first passes its
+    `loop` to `__loadout_loop`, which records the loop object in the render's `State` (the raw
+    name, which minijinja reserves, so an unknown-length loop is not refused there), and every
+    `X.changed(…)` call goes through `__loadout_changed`. For a loop object, recognized by its
+    exact unsorted key list (a map or namespace lists its keys sorted), it answers exactly as
+    minijinja does (true, and remembered, when the arguments differ from the last call's,
+    keyword arguments included), with the memory held beside the record in the render's
+    `State`: no template value can reach it, and it is dropped with the render. Any other
+    receiver gets minijinja's own call, member fallback, or error. The loop object's own memory
+    is never written. `cycle` routing passes keyword arguments through in the same way, and the
+    keyword-arguments value it can return passes the guards, namespace checks, and unpacking as
+    it passes minijinja. No new restriction comes with this.
   - Opaque container: minijinja's `chain` of maps is a live view that hides which maps it reads.
     `chain` is wrapped to merge maps into an ordinary map with the same precedence (the last map
     with a key wins), so nothing can hide a namespace. This is a second deliberate contract

@@ -1447,3 +1447,81 @@ fn unpacking_a_function_keeps_minijinjas_not_iterable_error() {
         }
     }
 }
+
+#[test]
+fn loop_changed_keeps_minijinjas_answers_with_its_memory_outside_the_loop() {
+    renders(&[
+        (
+            "{% for x in [1, 1, 2] %}{{ loop.changed(x) }}{% endfor %}",
+            "TrueFalseTrue",
+        ),
+        (
+            "{% for x in [1, 2] %}{{ loop.changed() }}{% endfor %}",
+            "TrueFalse",
+        ),
+        (
+            "{% for x in [1, 1, 2] %}{{ loop.changed(x, 7) }}{% endfor %}",
+            "TrueFalseTrue",
+        ),
+        (
+            "{% for x in [1, 1] %}{{ loop.changed(x, k=1) }}{% endfor %}",
+            "TrueFalse",
+        ),
+        (
+            "{% for x in [1, 2] %}{% set o = loop %}{% for y in [1] %}{{ o.changed(y) }}{% endfor %}{% endfor %}",
+            "TrueFalse",
+        ),
+        (
+            "{% for x in [1] %}{{ loop.changed(1) }}{% for y in [1] %}{{ loop.changed(1) }}{% endfor %}{{ loop.changed(1) }}{% endfor %}",
+            "TrueTrueFalse",
+        ),
+        (
+            "{% for row in [[1], [1]] recursive %}{{ loop.changed(row | length) }}{% endfor %}",
+            "TrueFalse",
+        ),
+        (
+            "{% for x in [1, 2, 2, 3] if x > 1 %}{{ loop.changed(x) }}{% endfor %}",
+            "TrueFalseTrue",
+        ),
+        (
+            "{% for c in \"ab\" %}{{ loop.changed(c) }}{{ loop.index }}{% endfor %}",
+            "True1True2",
+        ),
+        // Both orders store the loop; minijinja steps the index once more as the loop ends.
+        (
+            "{% set ns = namespace() %}{% for x in [1] %}{% do loop.changed(ns) %}{% set ns.saved = loop %}{% endfor %}{{ ns.saved.index }}",
+            "2",
+        ),
+        (
+            "{% set ns = namespace() %}{% for x in [1] %}{% set ns.saved = loop %}{% do loop.changed(ns) %}{% endfor %}{{ ns.saved.index }}",
+            "2",
+        ),
+        (
+            "{% set ns = namespace() %}{% for x in [1, 1] %}{{ loop.changed([ns], {\"k\": ns}) }}{% endfor %}",
+            "TrueFalse",
+        ),
+        ("{{ {\"changed\": dict}.changed() | length }}", "0"),
+        ("{% for x in [] %}{% else %}empty{% endfor %}", "empty"),
+        // `cycle` passes keyword arguments on, and the value it returns for them is a value.
+        (
+            "{% for x in [1, 2] %}{{ loop.cycle(\"a\", k=1) }}{% endfor %}",
+            "a{'k': 1}",
+        ),
+        (
+            "{% set ns = namespace() %}{% for x in [1] %}{% set ns.k = loop.cycle(k=2) %}{% endfor %}{{ ns.k.k }}",
+            "2",
+        ),
+        (
+            "{% set ns = namespace() %}{% for x in [1] %}{% set ns.a, ns.b = loop.cycle(j=1, k=2) %}{% endfor %}{{ ns.a }}{{ ns.b }}",
+            "jk",
+        ),
+    ]);
+    match render("{% set ns = namespace() %}\n{{ ns.changed(1) }}", &linux()) {
+        Err(Error {
+            line: Some(2),
+            problem: Problem::Render(message),
+            ..
+        }) => assert_eq!(message, "map has no method named changed"),
+        other => panic!("a namespace has no changed method, got {other:?}"),
+    }
+}

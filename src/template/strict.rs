@@ -2,6 +2,7 @@ use std::cell::Cell;
 
 use minijinja::machinery::Span;
 use minijinja::machinery::ast::{self, CallArg, Expr, Spanned, Stmt};
+use minijinja::value::ValueOrKwargs;
 use minijinja::{State, Value};
 
 /// The filter `rewrite` wraps around every value a template computes. It fails on an undefined
@@ -10,6 +11,12 @@ pub(super) const GUARD: &str = "__loadout_defined";
 
 /// The function a method call named `cycle` is routed through; see `builtins::cycle`.
 pub(super) const CYCLE: &str = "__loadout_cycle";
+
+/// The function a method call named `changed` is routed through; see `builtins::changed`.
+pub(super) const CHANGED: &str = "__loadout_changed";
+
+/// The function every for-loop body calls first with its `loop`; see `builtins::register_loop`.
+pub(super) const LOOP: &str = "__loadout_loop";
 
 /// The function every assignment to a namespace attribute passes its value through; see
 /// `builtins::acyclic`.
@@ -44,10 +51,13 @@ const LOOKUP: u8 = 1;
 const WHOLE: u8 = 2;
 
 /// `WHOLE` is unset only where the value is a receiver: its attributes, items, or methods are read
-/// next, and each of those reads is guarded on its own.
+/// next, and each of those reads is guarded on its own. The value is taken as `ValueOrKwargs`
+/// because a plain `Value` argument refuses a keyword-arguments value, which a template can still
+/// hold (`loop.cycle(k=1)` returns one) and minijinja passes on like any other; so does every
+/// function the rewrite puts where minijinja calls none.
 pub(super) fn guard(
     state: &State,
-    value: &Value,
+    value: ValueOrKwargs,
     expression: &str,
     flags: u8,
     line: usize,
@@ -67,14 +77,14 @@ pub(super) fn guard(
         ));
     }
     if flags & WHOLE != 0
-        && let Some(field) = undefined_loop_field(state, value)
+        && let Some(field) = undefined_loop_field(state, &value)
     {
         return Err(failure(
             format!("`{expression}` has no value for `{field}` in a loop of unknown length"),
             false,
         ));
     }
-    Ok(value.clone())
+    Ok(value.into_value())
 }
 
 // The loop object is the only map the engine builds that lists keys with no value: `length`,
@@ -91,7 +101,7 @@ fn undefined_loop_field(state: &State, value: &Value) -> Option<&'static str> {
         .find(|key| value.get_attr(key).is_ok_and(|field| field.is_undefined()))
 }
 
-const LOOP_KEYS: [&str; 9] = [
+pub(super) const LOOP_KEYS: [&str; 9] = [
     "index0",
     "index",
     "length",
@@ -128,7 +138,9 @@ pub(super) fn is_current_loop(state: &State, value: &Value) -> bool {
 ///
 /// Guards run only when their expression does, so a branch that isn't taken needs nothing. A
 /// method call named `cycle` goes through `CYCLE`, which refuses an empty argument list
-/// instead of letting the loop object divide by zero.
+/// instead of letting the loop object divide by zero, and one named `changed` goes through
+/// `CHANGED`, which keeps a loop's memory in the render's `State`. Every for-loop body starts by
+/// passing its `loop` to `LOOP`.
 pub(super) fn rewrite<'a>(source: &'a str, template: &Stmt<'a>) -> Stmt<'a> {
     Rewriter { source }.stmt(template)
 }
@@ -171,17 +183,36 @@ impl<'a> Rewriter<'a> {
             Stmt::EmitRaw(node) => {
                 Stmt::EmitRaw(Spanned::new(ast::EmitRaw { raw: node.raw }, node.span()))
             }
-            Stmt::ForLoop(node) => Stmt::ForLoop(Spanned::new(
-                ast::ForLoop {
-                    target: self.expr(&node.target, Target),
-                    iter: self.expr(&node.iter, Value),
-                    filter_expr: self.optional(node.filter_expr.as_ref(), Value),
-                    recursive: node.recursive,
-                    body: self.stmts(&node.body),
-                    else_body: self.stmts(&node.else_body),
-                },
-                node.span(),
-            )),
+            Stmt::ForLoop(node) => {
+                // Each iteration first records its `loop` (the raw name, not a guarded value, so
+                // an unknown-length loop is never refused here), so that every loop object a
+                // template can hold, an alias of an outer or earlier loop included, is known.
+                let span = node.span();
+                let mut body = vec![Stmt::Do(Spanned::new(
+                    ast::Do {
+                        call: Spanned::new(
+                            ast::Call {
+                                expr: variable(LOOP, span),
+                                args: vec![CallArg::Pos(variable("loop", span))],
+                            },
+                            span,
+                        ),
+                    },
+                    span,
+                ))];
+                body.extend(self.stmts(&node.body));
+                Stmt::ForLoop(Spanned::new(
+                    ast::ForLoop {
+                        target: self.expr(&node.target, Target),
+                        iter: self.expr(&node.iter, Value),
+                        filter_expr: self.optional(node.filter_expr.as_ref(), Value),
+                        recursive: node.recursive,
+                        body,
+                        else_body: self.stmts(&node.else_body),
+                    },
+                    span,
+                ))
+            }
             Stmt::IfCond(node) => Stmt::IfCond(Spanned::new(
                 ast::IfCond {
                     expr: self.expr(&node.expr, Value),
@@ -285,14 +316,21 @@ impl<'a> Rewriter<'a> {
     }
 
     fn call(&self, node: &Spanned<ast::Call<'a>>) -> Spanned<ast::Call<'a>> {
+        // The loop object's two methods are routed through functions: `cycle`, so that a call
+        // with no values cannot divide by zero, and `changed`, so that its memory is kept out of
+        // the loop object. The receiver is still evaluated first, then the arguments in order.
         if let Expr::GetAttr(method) = &node.expr
-            && method.name == "cycle"
+            && let Some(function) = match method.name {
+                "cycle" => Some(CYCLE),
+                "changed" => Some(CHANGED),
+                _ => None,
+            }
         {
             let mut args = vec![CallArg::Pos(self.expr(&method.expr, Position::Receiver))];
             args.extend(self.args(&node.args, Position::Value));
             return Spanned::new(
                 ast::Call {
-                    expr: Expr::Var(Spanned::new(ast::Var { id: CYCLE }, method.span())),
+                    expr: Expr::Var(Spanned::new(ast::Var { id: function }, method.span())),
                     args,
                 },
                 node.span(),
