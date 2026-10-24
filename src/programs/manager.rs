@@ -164,6 +164,7 @@ pub(super) fn install(manager: Manager, program: &Path, package: &str, scope: Sc
             "--accept-package-agreements",
             "--accept-source-agreements",
             "--disable-interactivity",
+            "--no-upgrade",
             "--scope",
             match scope {
                 Scope::User => "user",
@@ -312,7 +313,7 @@ mod tests {
         let program = Path::new("winget");
         let user = install(Manager::Winget, program, "A.B", Scope::User).display();
         let machine = install(Manager::Winget, program, "A.B", Scope::System).display();
-        assert!(user.ends_with("--scope user"), "{user}");
+        assert!(user.ends_with("--no-upgrade --scope user"), "{user}");
         assert!(machine.ends_with("--scope machine"), "{machine}");
         assert!(install_succeeded(Manager::Choco, 3010));
         assert!(!install_succeeded(Manager::Apt, 3010));

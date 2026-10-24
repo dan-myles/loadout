@@ -731,53 +731,118 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
 
 A manager is available when every tool it needs is on PATH (`context::which`); `install` runs the
 executable found there. Every subprocess gets its argv as an array (no shell), a null stdin, and
-`LC_ALL=C`, so nothing waits on a prompt and the not-found messages below are stable.
+`LC_ALL=C`, so the not-found messages below are stable. A null stdin doesn't rule out every prompt:
+with `--elevated`, `sudo` may ask for a password on the terminal, and a Windows installer may raise
+UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' display language.
 
 | Manager | Needs | Installed-query (one per program) | Not installed when | Install |
 | --- | --- | --- | --- | --- |
-| `brew` | brew | `brew info --json=v2 --formula P` | `formulae[0].installed` is `[]` | `brew install --formula P` |
-| `cask` | brew | `brew info --json=v2 --cask P` | `casks[0].installed` is `null` | `brew install --cask P` |
+| `brew` | brew | `brew info --json=v2 --formula P` | the one entry named `P` (name, full name, alias, or old name) has `installed: []` | `brew install --formula P`, `HOMEBREW_NO_INSTALL_UPGRADE=1` |
+| `cask` | brew | `brew info --json=v2 --cask P` | the one entry for `P` (token, full token, or old token) has `installed: null` | `brew install --cask P`, `HOMEBREW_NO_INSTALL_UPGRADE=1` |
 | `apt` | apt-get, dpkg-query | `dpkg-query -W -f '${db:Status-Status} ' P` | exit 1, or no status is `installed` | `apt-get install -y --no-upgrade P`, `DEBIAN_FRONTEND=noninteractive` |
 | `dnf` | dnf, rpm | `rpm -q P` | exit 1 with "is not installed" | `dnf install -y P` |
 | `pacman` | pacman | `pacman -Q P` | exit 1 with "was not found" | `pacman -S --needed --noconfirm P` |
 | `zypper` | zypper | `zypper --non-interactive --no-refresh search --installed-only --match-exact --type package P` | exit 104 | `zypper --non-interactive install P` |
 | `flatpak` | flatpak | `flatpak info P` (any installation) | exit 1 with "not installed" | `flatpak install --user --noninteractive P` |
 | `snap` | snap | `snap list P` | exit 1 with "no matching snaps installed" | `snap install P` |
-| `winget` | winget | `winget list --id P --exact --source winget` | `0x8A150014` | `winget install --id P --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --scope user\|machine` |
+| `winget` | winget | `winget list --id P --exact --source winget` | `0x8A150014` | `winget install --id P --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade --scope user\|machine` |
 | `scoop` | scoop | `scoop prefix APP` (`APP` is `P` after any `bucket/`) | exit 1 with "Could not find app path" | `scoop install P` |
 | `choco` | choco (2.x) | `choco list --exact P --limit-output` | no `P\|version` line, or exit 2 | `choco install P -y --no-progress`; 1641 and 3010 are success |
-| `npm`, `pnpm` | npm / pnpm | `ls --global --depth=0 --json P` | no `dependencies.P` (exit 0 or 1) | `npm install --global P` / `pnpm add --global P` |
+| `npm` | npm | `npm ls --global --depth=0 --json P` | the root `{"name": …}` has no `dependencies.P`, or it is `missing: true` (exit 0 or 1) | `npm install --global P` |
+| `pnpm` | pnpm | `pnpm ls --global --depth=0 --json P` | no project in the list `[{"path": …, "dependencies": {…}}]` has `P` (exit 0) | `pnpm add --global P` |
 | `bun` | bun | `bun pm ls --global` | no `── P@…` line | `bun add --global P` |
 | `cargo` | cargo | `cargo install --list` | no `P v…:` line | `cargo install P` |
 | `uv` | uv | `uv tool list` | no `P v…` line (PEP 503 names) | `uv tool install P` |
-| `pipx` | pipx | `pipx list --json` | no `venvs` entry (PEP 503 names) | `pipx install P` |
+| `pipx` | pipx | `pipx list --json` | no venv's `metadata.main_package.package` is `P` (PEP 503 names) | `pipx install P` |
 | `go` | go | `go env GOBIN GOPATH`, then `go version -m BIN` | `BIN` (from `GOBIN` or `GOPATH/bin`) is absent | `go install P@latest` |
 
 - **Installed needs positive evidence.** Every row's other outcomes (an unexpected exit code,
   unreadable JSON, a missing tool) are `programs::Error::Detect`, so a broken or locked manager is
   never read as "installed", and `steps` fails before any write. A Go binary at `BIN` built from a
   different package is an error, never overwritten.
+- **JSON answers must match the manager's real schema before either verdict.** npm's root is an
+  object with a string `name`; pnpm's is a non-empty list of objects with a string `path`; a
+  `dependencies` table is an object whose entry for `P` is an object with a string `version` (or
+  `missing: true`); every pipx venv names its main package; a brew entry must answer for `P`, and
+  its `installed` is a list of `{ "version": … }` records (formula) or a version string or `null`
+  (cask). npm listing `P` while exiting 1 means npm found problems in the tree, and is an error.
+  Anything else, such as `null`, a non-object entry, or an empty pnpm list, is `Error::Detect`, so a
+  malformed answer never authorizes an install. The npm and pnpm empty shapes and the npm installed
+  shape were sampled from real managers. The pnpm installed entry, the pipx entry, and brew's
+  records follow the managers' documented output and still need a real sample.
 - **Package ids are passed as one exact argument.** `steps` refuses, before any subprocess, an id
   that is empty, starts with `-`, has a character outside letters, digits, and `@ / . _ + : ~ -`,
   or pins a version (`name@1.2` for npm, pnpm, bun; any `@` for cargo, uv, pipx, go). Go is the
   one manager given `@latest`, because `go install` requires a version.
-- **Scope.** `apt`, `dnf`, `pacman`, `zypper`, `snap`, and `choco` are system scope. A missing
-  winget package is user scope when `winget show --id P --exact --source winget --scope user` lists an
-  installer under its `Installer:` heading, and machine scope when it prints "No applicable
-  installer found" there (winget 1.6 still exits 0) or returns `0x8A150010`. The `winget` field
-  names an id in the `winget` community source; every winget call passes `--source winget`,
-  so a broken `msstore` source (as in the Windows test guest) can't stop an install. Everything else is
-  user scope. `install(step, false)` refuses a system-scope step with `Error::NeedsElevation`
-  before any subprocess. With `elevated`, Unix runs `sudo -- [env K=V] TOOL …` (or the tool
-  directly as root), and an absent `sudo` is `Error::NoSudo`. Windows runs the tool directly.
-  User-scope managers are never elevated.
+- **Scope.** `apt`, `dnf`, `pacman`, `zypper`, `snap`, and `choco` are system scope; the other
+  non-winget managers are user scope. Winget's scope is per package, read from
+  `winget show --id P --exact --source winget --scope user|machine`, whose answer is the line under
+  its `Installer:` heading (winget 1.6 exits 0 even when it prints "No applicable installer
+  found"; `0x8A150010` means the same):
+  - The user scope applies only when its installer is `portable` or `portable (zip)`, a portable
+    package bare or nested in a zip, which installs into the user's WinGet Packages folder (seen
+    natively with `BurntSushi.ripgrep.MSVC`). Other types, other installers nested in a zip, MSIX,
+    and APPX may install machine-wide or raise UAC whatever scope is asked for, so they don't
+    count as per user until native evidence shows otherwise.
+  - Otherwise the machine scope is asked separately. Only an installer winget shows as applicable
+    there makes the package system scope, which needs `--elevated`.
+  - With neither, the step is `Unsupported` with the reason. Any other text is `Error::Detect`,
+    never a guessed scope.
+
+  The `winget` field names an id in the `winget` community source. Every winget call passes
+  `--source winget`, so a broken `msstore` source (as in the Windows test guest) can't stop an
+  install.
+- **Elevation.** `install(step, false)` refuses a system-scope step with `Error::NeedsElevation`.
+  With `elevated`, Unix runs `sudo -- [env K=V] TOOL …` (or the tool directly as root), and an
+  absent `sudo` is `Error::NoSudo`. Windows runs the tool directly. User-scope managers are never
+  elevated.
+- **Checked again at install.** `install` re-checks the step against the machine as it is then:
+  - The package id rule.
+  - The manager's static scope.
+  - The executable PATH resolves the manager to (a different path, or none, is `Error::Changed`).
+  - The manager's own answer, the same installed-query and scope as `steps`.
+
+  A package installed by then is `Installed::Already`, and nothing runs, so a stale step, a second
+  program naming the same package, or an earlier install's dependency never reinstalls or upgrades
+  it. A changed scope or a Go collision is an error before any installer runs, and this re-check
+  comes before the elevation check. Two limits remain:
+  - Another process can install the package between that last look and the installer starting.
+    winget (`--no-upgrade`), Homebrew, apt (`--no-upgrade`), flatpak, Scoop, Chocolatey, uv, pipx,
+    and snap then skip it themselves; npm, pnpm, bun, go, cargo, dnf, pacman, and zypper may
+    upgrade it.
+  - An equal PATH answer means the same path, not the same file, so a manager binary replaced in
+    place isn't detected.
+
+  If a winget too old for `--no-upgrade` rejects it, the install fails with winget's message.
+  Loadout never retries without it.
+- **Producer-only steps.** `Package` and `Missing` have private fields, and only `steps` creates
+  them, so a caller (U4 included) can read a step but never fabricate a trusted one.
 - **Verified.** After the manager exits with success, `install` runs the installed-query again; a
   success that left the program missing is `Error::NotInstalled`.
-- **Doctor** (`programs::checks`) adds `programs` (this OS's managers grouped as per user, with
-  `--elevated`, per package, and not on PATH; a warning when none is available), `elevation` on
-  macOS and Linux when a system-scope manager is present (sudo found, root, or a warning), and
-  `flatpak` (its per-user remotes; a warning when there is none). Under isolation it only looks on
-  PATH and runs no manager.
+- **Bounded queries.** Every installed-query, scope query, and doctor query runs in its own process
+  group (Unix) or job object (Windows), through `process-wrap`. `QUERY_DEADLINE` (10 minutes)
+  covers the query and any process it starts that keeps its output open. At the deadline the whole
+  tree is killed and the result is `Error::Detect`. A query's stdout and stderr are read in full up
+  to `QUERY_OUTPUT_CAP` (8 MiB each); a larger answer is an error, never parsed truncated. Once the
+  query itself exits, anything it left in its group is killed, so leftovers can't hold the pipes.
+- **Installs have no deadline.** They run in loadout's own process group, so `sudo` can prompt and
+  Ctrl-C reaches them. Errors keep the last 64 KiB of each output stream. After the installer
+  exits, its output is read for at most 30 more seconds, in case a process it started still holds
+  it.
+  - A hung install or UAC prompt is not bounded by U7.
+  - **U8 must bound every background run and cancel its descendants on all three OSes** before
+    automatic updates can be claimed safe: the service unit's own time limit (systemd
+    `RuntimeMaxSec`, Task Scheduler `ExecutionTimeLimit`), and a watchdog in `update --background`
+    where the OS has none (launchd).
+- **Doctor** (`programs::checks`) adds three checks:
+  - `programs`: this OS's managers, grouped as per user, with `--elevated`, per package, and not on
+    PATH; a warning when none is available.
+  - `elevation`, on macOS and Linux when a system-scope manager is present: sudo found, root, or a
+    warning.
+  - `flatpak`: its per-user remotes, or a warning when there is none or its query fails or times
+    out.
+
+  Under isolation it only looks on PATH and runs no manager.
 
 ## 8. Updates (frozen, U8 + U9)
 
@@ -906,15 +971,19 @@ pub fn checks(context: &Context) -> Vec<Check>;
 
 // programs (U7, built)
 pub struct Step { pub program: String, pub state: State }       // Step::needs_elevation(): Missing with Scope::System
-pub enum State { Installed(Package), Missing { package: Package, scope: Scope }, Unsupported(String), Blocked(String) }
-pub struct Package { pub manager: Manager, pub id: String, pub executable: PathBuf }   // the selected manager and its exact id
+pub enum State { Installed(Package), Missing(Missing), Unsupported(String), Blocked(String) }
+pub struct Package { .. }   // private; manager() -> Manager, id() -> &str, executable() -> &Path; only steps() makes one
+pub struct Missing { .. }   // private; package() -> &Package, scope() -> Scope
 pub enum Scope { User, System }
+pub enum Installed { Now, Already }                             // Already: found installed on the re-check; nothing ran
 pub const ISOLATED: &str;                                       // the Blocked reason under LOADOUT_HOME
 pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts, context: &Context) -> Result<Vec<Step>, programs::Error>; // every step blocked when context.isolated
-pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;   // Missing steps only; re-queries after
+pub fn install(step: &Step, elevated: bool) -> Result<Installed, programs::Error>;   // Missing steps only; re-checks before, re-queries after
 pub fn checks(context: &Context) -> Vec<Check>;
 // plan::build: Installed -> unchanged (prior Installed); Missing -> install (prior Absent), or blocked when it
 // needs elevation the run lacks; Unsupported and Blocked carry their reason. Order follows `programs` (by id).
+// apply: Installed::Already -> report unchanged; Error::Changed -> the action failed and nothing ran (plan again).
+// U4 gets steps only from steps() and never fabricates Package or Missing.
 
 // state (U3)
 impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; }

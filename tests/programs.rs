@@ -6,7 +6,7 @@ use loadout::context::Context;
 use loadout::machine::Facts;
 use loadout::manifest::ProgramPatch;
 use loadout::platform::{Arch, Os};
-use loadout::programs::{self, State, Step};
+use loadout::programs::{self, Installed, State, Step};
 use loadout::resolve::Program;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +22,10 @@ struct Request {
     install: bool,
     #[serde(default)]
     elevated: bool,
+    /// A command to run after `steps` and before any install, standing in for another process
+    /// that changes the machine in between.
+    #[serde(default)]
+    interpose: Vec<String>,
     programs: BTreeMap<String, ProgramPatch>,
 }
 
@@ -56,21 +60,31 @@ fn probe() {
         .collect();
     let result = match programs::steps(&programs, &facts, &context) {
         Err(error) => json!({ "error": error.to_string() }),
-        Ok(steps) => Value::Array(
-            steps
-                .iter()
-                .map(|step| {
-                    let mut out = describe(step);
-                    if request.install && matches!(step.state, State::Missing { .. }) {
-                        out["install"] = match programs::install(step, request.elevated) {
-                            Ok(()) => json!("ok"),
-                            Err(error) => json!(error.to_string()),
-                        };
-                    }
-                    out
-                })
-                .collect(),
-        ),
+        Ok(steps) => {
+            if let Some((program, args)) = request.interpose.split_first() {
+                let status = std::process::Command::new(program)
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "interpose {:?} failed", request.interpose);
+            }
+            Value::Array(
+                steps
+                    .iter()
+                    .map(|step| {
+                        let mut out = describe(step);
+                        if request.install && matches!(step.state, State::Missing(_)) {
+                            out["install"] = match programs::install(step, request.elevated) {
+                                Ok(Installed::Now) => json!("ok"),
+                                Ok(Installed::Already) => json!("already"),
+                                Err(error) => json!(error.to_string()),
+                            };
+                        }
+                        out
+                    })
+                    .collect(),
+            )
+        }
     };
     println!("{RESULT}{result}");
 }
@@ -80,14 +94,14 @@ fn describe(step: &Step) -> Value {
     match &step.state {
         State::Installed(package) => json!({
             "program": program, "state": "installed",
-            "manager": package.manager.id(), "package": package.id,
-            "executable": package.executable,
+            "manager": package.manager().id(), "package": package.id(),
+            "executable": package.executable(),
         }),
-        State::Missing { package, scope } => json!({
+        State::Missing(missing) => json!({
             "program": program, "state": "missing",
-            "manager": package.manager.id(), "package": package.id,
-            "executable": package.executable,
-            "scope": format!("{scope:?}").to_lowercase(),
+            "manager": missing.package().manager().id(), "package": missing.package().id(),
+            "executable": missing.package().executable(),
+            "scope": format!("{:?}", missing.scope()).to_lowercase(),
             "needs_elevation": step.needs_elevation(),
         }),
         State::Unsupported(reason) => {
@@ -110,6 +124,7 @@ mod recorded {
     const HEADER: &str = r#"#!/bin/sh
 { printf '%s' 'NAME'; for a in "$@"; do printf ' %s' "$a"; done; printf ' | LC_ALL=%s\n' "$LC_ALL"; } >> "$FAKE_LOG"
 if [ "$FAKE_FAIL" = 'NAME' ]; then echo 'NAME: database is locked' >&2; exit 3; fi
+if [ "$FAKE_REPLY_TOOL" = 'NAME' ]; then printf '%s\n' "$FAKE_REPLY"; exit "$FAKE_REPLY_CODE"; fi
 S="$FAKE_STATE"
 mark() { [ -n "$FAKE_LIE" ] || : > "$S/$1"; }
 "#;
@@ -199,7 +214,7 @@ esac; exit 64"#,
         (
             "pnpm",
             r#"case "$1" in add) mark pnpm; exit 0;;
-ls) if [ -e "$S/pnpm" ]; then printf '[{"path":"/g","dependencies":{"%s":{"version":"1.0.0"}}}]\n' "$5"; else printf '[]\n'; fi; exit 0;;
+ls) if [ -e "$S/pnpm" ]; then printf '[{"path":"/g","dependencies":{"%s":{"version":"1.0.0"}}}]\n' "$5"; else printf '[{"path":"/g","dependencies":{}}]\n'; fi; exit 0;;
 esac; exit 64"#,
         ),
         (
@@ -224,7 +239,7 @@ esac; exit 64"#,
         (
             "pipx",
             r#"case "$1" in install) mark pipx; exit 0;;
-list) if [ -e "$S/pipx" ]; then printf '{"pipx_spec_version":"0.1","venvs":{"pkg-pipx":{}}}\n'
+list) if [ -e "$S/pipx" ]; then printf '{"pipx_spec_version":"0.1","venvs":{"pkg-pipx":{"metadata":{"main_package":{"package":"pkg-pipx"}}}}}\n'
   else printf '{"pipx_spec_version":"0.1","venvs":{}}\n'; fi; exit 0;;
 esac; exit 64"#,
         ),
@@ -232,7 +247,8 @@ esac; exit 64"#,
             "go",
             r#"case "$1" in env) printf '%s\n\n' "$S/gobin"; exit 0;;
 install) [ -n "$FAKE_LIE" ] || : > "$S/gobin/hello"; exit 0;;
-version) printf '%s: go1.22\n\tpath\texample.com/tools/hello\n' "$3"; exit 0;;
+version) if [ -e "$S/other" ]; then p=example.com/other/hello; else p=example.com/tools/hello; fi
+  printf '%s: go1.22\n\tpath\t%s\n' "$3" "$p"; exit 0;;
 esac; exit 64"#,
         ),
         ("sudo", r#"[ "$1" = -- ] && shift; exec "$@""#),
@@ -590,6 +606,184 @@ esac; exit 64"#,
         }
     }
 
+    /// Inserts a command for the probe to run between `steps` and `install`.
+    fn interposed(request: &str, command: &[&str]) -> String {
+        let tables = request.find("\n[").map_or(request.len(), |at| at + 1);
+        format!(
+            "{}interpose = {}\n{}",
+            &request[..tables],
+            serde_json::to_string(command).unwrap(),
+            &request[tables..]
+        )
+    }
+
+    fn installed_marker(case: &Case) -> &'static str {
+        if case.manager == "go" {
+            "gobin/hello"
+        } else {
+            case.manager
+        }
+    }
+
+    #[test]
+    fn a_package_installed_after_the_plan_is_left_alone() {
+        for case in CASES {
+            let bench = Bench::new(&fake_tools());
+            let marker = bench.dir.path().join("state").join(installed_marker(case));
+            let script = format!(": > '{}'", marker.display());
+            let run = bench.probe(&interposed(&single(case), &["/bin/sh", "-c", &script]), &[]);
+            let step = run.step("tool");
+            let label = format!("{} {}: {}", case.os, case.manager, run.result);
+            assert_eq!(step["state"], "missing", "{label}");
+            assert_eq!(step["install"], "already", "{label}");
+            let commands = run.commands(&bench.bin());
+            assert!(
+                !commands
+                    .iter()
+                    .any(|command| command.contains(case.install)),
+                "no install runs for a package that appeared after the plan: {label}\n{commands:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_programs_naming_one_package_install_it_once() {
+        let bench = Bench::new(&fake_tools());
+        let run = bench.probe(
+            &request(
+                "linux",
+                true,
+                false,
+                &[
+                    ("cowsay", "npm", "cowsay"),
+                    ("cowsay-again", "npm", "cowsay"),
+                ],
+            ),
+            &[],
+        );
+        assert_eq!(run.step("cowsay")["install"], "ok", "{}", run.result);
+        assert_eq!(
+            run.step("cowsay-again")["install"],
+            "already",
+            "{}",
+            run.result
+        );
+        let installs = run
+            .commands(&bench.bin())
+            .into_iter()
+            .filter(|command| command == "npm install --global cowsay")
+            .count();
+        assert_eq!(installs, 1);
+    }
+
+    #[test]
+    fn a_go_binary_from_another_package_that_appears_after_the_plan_is_never_overwritten() {
+        let bench = Bench::new(&fake_tools());
+        let state = bench.dir.path().join("state");
+        let script = format!(
+            ": > '{}'; : > '{}'",
+            state.join("gobin/hello").display(),
+            state.join("other").display()
+        );
+        let run = bench.probe(
+            &interposed(
+                &request(
+                    "linux",
+                    true,
+                    false,
+                    &[("hello", "go", "example.com/tools/hello")],
+                ),
+                &["/bin/sh", "-c", &script],
+            ),
+            &[],
+        );
+        let error = run.step("hello")["install"].as_str().unwrap().to_owned();
+        assert!(
+            error.contains("was built from example.com/other/hello, not example.com/tools/hello"),
+            "{error}"
+        );
+        assert!(
+            !run.commands(&bench.bin())
+                .iter()
+                .any(|command| command.starts_with("go install")),
+            "{:#?}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn a_manager_gone_from_path_after_the_plan_installs_nothing() {
+        let bench = Bench::new(&fake_tools());
+        let npm = bench.bin().join("npm");
+        let script = format!("/bin/rm '{}'", npm.display());
+        let run = bench.probe(
+            &interposed(
+                &request("linux", true, false, &[("cowsay", "npm", "cowsay")]),
+                &["/bin/sh", "-c", &script],
+            ),
+            &[],
+        );
+        assert_eq!(
+            run.step("cowsay")["install"],
+            "programs.cowsay: the machine changed after the plan (npm is no longer on PATH (npm)), so loadout installed nothing; plan again"
+        );
+        assert_eq!(
+            run.commands(&bench.bin()),
+            ["npm ls --global --depth=0 --json cowsay"]
+        );
+    }
+
+    #[test]
+    fn a_malformed_answer_is_an_error_and_never_authorizes_an_install() {
+        for (tool, manager, package, reply, code) in [
+            (
+                "npm",
+                "npm",
+                "cowsay",
+                r#"{"name":"lib","dependencies":{"cowsay":null}}"#,
+                "0",
+            ),
+            ("npm", "npm", "cowsay", "null", "1"),
+            ("npm", "npm", "cowsay", r#"{"dependencies":[]}"#, "0"),
+            ("pnpm", "pnpm", "figlet", r#"[{"unexpected":true}]"#, "0"),
+            ("pnpm", "pnpm", "figlet", "[]", "0"),
+            (
+                "pipx",
+                "pipx",
+                "pycowsay",
+                r#"{"venvs":{"pycowsay":null}}"#,
+                "0",
+            ),
+            (
+                "brew",
+                "brew",
+                "ripgrep",
+                r#"{"formulae":[{"name":"ripgrep","installed":"14.1.0"}],"casks":[]}"#,
+                "0",
+            ),
+        ] {
+            let bench = Bench::new(&fake_tools());
+            let run = bench.probe(
+                &request("linux", true, false, &[("tool", manager, package)]),
+                &[
+                    ("FAKE_REPLY_TOOL", tool),
+                    ("FAKE_REPLY", reply),
+                    ("FAKE_REPLY_CODE", code),
+                ],
+            );
+            let error = run.result["error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{manager} {reply} must be an error: {}", run.result));
+            assert!(error.contains("cannot tell whether"), "{error}");
+            assert_eq!(
+                run.commands(&bench.bin()).len(),
+                1,
+                "only the query ran: {:#?}",
+                run.log
+            );
+        }
+    }
+
     #[test]
     fn managers_get_their_noninteractive_environment() {
         let bench = Bench::new(&fake_tools());
@@ -735,9 +929,10 @@ esac; exit 64"#,
             let commands = run.commands(&bench.bin());
             assert_eq!(
                 commands.len(),
-                1,
-                "only the installed-query ran: {commands:#?}"
+                2,
+                "only the installed-query ran, once in steps and once again in install: {commands:#?}"
             );
+            assert_eq!(commands[0], commands[1]);
         }
     }
 

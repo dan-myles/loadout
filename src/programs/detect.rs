@@ -1,86 +1,15 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::context;
 use crate::manifest::Manager;
 
 use super::Scope;
 use super::manager::{self, Invocation};
-
-pub(super) struct Captured {
-    pub(super) code: Option<i32>,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
-}
-
-impl Captured {
-    fn success(&self) -> bool {
-        self.code == Some(0)
-    }
-
-    fn hresult(&self) -> Option<u32> {
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "winget reports HRESULTs as negative i32 codes"
-        )]
-        self.code.map(|code| code as u32)
-    }
-
-    pub(super) fn status(&self) -> String {
-        match self.code {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "show HRESULTs the way winget documents them"
-            )]
-            Some(code) if code < 0 => format!("exit code {:#010X}", code as u32),
-            Some(code) => format!("exit code {code}"),
-            None => "killed by a signal".to_owned(),
-        }
-    }
-
-    /// The tail of what the manager printed, as a terminal would show it: a progress bar that
-    /// redraws with `\r` keeps only its last state.
-    pub(super) fn tail(&self) -> String {
-        let text = format!("{}\n{}", self.stdout.trim(), self.stderr.trim());
-        let lines: Vec<&str> = text
-            .lines()
-            .filter_map(|line| line.trim_end_matches('\r').rsplit('\r').next())
-            .map(str::trim_end)
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
-        if tail.is_empty() {
-            String::new()
-        } else {
-            format!(":\n{tail}")
-        }
-    }
-
-    fn unexpected(&self) -> String {
-        format!("unexpected {}{}", self.status(), self.tail())
-    }
-}
-
-/// Runs a manager with no stdin and messages in the C locale, so the not-installed messages
-/// below match and no prompt can wait on input.
-pub(super) fn capture(invocation: &Invocation) -> io::Result<Captured> {
-    let mut command = Command::new(&invocation.program);
-    command
-        .args(&invocation.args)
-        .envs(invocation.env.iter().copied())
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null());
-    let output = command.output()?;
-    Ok(Captured {
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
+use super::process::{self, Captured};
 
 fn query<I, S>(program: &Path, args: I) -> Result<Captured, String>
 where
@@ -91,7 +20,7 @@ where
         program,
         args.into_iter().map(|arg| arg.as_ref().to_os_string()),
     );
-    capture(&invocation).map_err(|error| format!("cannot run {}: {error}", invocation.display()))
+    process::query(&invocation).map_err(|error| format!("{}: {error}", invocation.display()))
 }
 
 fn helper(tool: &str) -> Result<PathBuf, String> {
@@ -105,10 +34,12 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
     match manager {
         Manager::Brew => brew(
             &query(program, ["info", "--json=v2", "--formula", package])?,
+            package,
             false,
         ),
         Manager::Cask => brew(
             &query(program, ["info", "--json=v2", "--cask", package])?,
+            package,
             true,
         ),
         Manager::Apt => dpkg(&query(
@@ -150,7 +81,11 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
             &query(program, ["list", "--exact", package, "--limit-output"])?,
             package,
         ),
-        Manager::Npm | Manager::Pnpm => node(
+        Manager::Npm => npm(
+            &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
+            package,
+        ),
+        Manager::Pnpm => pnpm(
             &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
             package,
         ),
@@ -165,49 +100,91 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
 const WINGET_NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
 const WINGET_NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
 
-/// Winget's scope is per package: the user scope when the package has a user installer,
-/// otherwise the machine scope, which needs `--elevated`.
-pub(super) fn scope(manager: Manager, program: &Path, package: &str) -> Result<Scope, String> {
-    if let Some(scope) = manager::scope(manager) {
-        return Ok(scope);
-    }
-    let shown = query(
-        program,
-        [
-            "show",
-            "--id",
-            package,
-            "--exact",
-            "--source",
-            "winget",
-            "--scope",
-            "user",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ],
-    )?;
-    winget_show(&shown)
+/// Whether and how a missing package can be installed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Eligibility {
+    Scope(Scope),
+    Unsupported(String),
 }
 
-/// `winget show` exits 0 even when no installer fits the requested scope (seen on winget 1.6),
-/// so the answer is the line under its `Installer:` heading.
-fn winget_show(shown: &Captured) -> Result<Scope, String> {
+/// Winget's scope is per package. A user-scope install needs an applicable user-scope installer
+/// whose per-user behaviour is known (portable); otherwise a machine-scope installer must be
+/// shown to apply before the package counts as installable with `--elevated`. Winget's own
+/// applicability answers both questions; loadout never assumes a machine installer exists.
+pub(super) fn eligibility(
+    manager: Manager,
+    program: &Path,
+    package: &str,
+) -> Result<Eligibility, String> {
+    if let Some(scope) = manager::scope(manager) {
+        return Ok(Eligibility::Scope(scope));
+    }
+    let show = |scope: &str| {
+        query(
+            program,
+            [
+                "show",
+                "--id",
+                package,
+                "--exact",
+                "--source",
+                "winget",
+                "--scope",
+                scope,
+                "--accept-source-agreements",
+                "--disable-interactivity",
+            ],
+        )
+        .and_then(|shown| winget_installer(&shown))
+    };
+    let user = show("user")?;
+    if user.as_deref().is_some_and(per_user_installer) {
+        return Ok(Eligibility::Scope(Scope::User));
+    }
+    Ok(match (show("machine")?, user) {
+        (Some(_), _) => Eligibility::Scope(Scope::System),
+        (None, Some(kind)) => Eligibility::Unsupported(format!(
+            "winget's user-scope installer is {kind:?}, whose per-user behaviour loadout can't \
+             confirm (only portable installers qualify), and no machine-scope installer applies"
+        )),
+        (None, None) => Eligibility::Unsupported(
+            "winget has no installer that applies to this machine in user or machine scope"
+                .to_owned(),
+        ),
+    })
+}
+
+/// Portable packages, bare or nested in a zip (shown as "portable (zip)"), install into the
+/// user's WinGet Packages folder; seen natively with `BurntSushi.ripgrep.MSVC`. Other types,
+/// including other installers nested in a zip, may install machine-wide or raise UAC whatever
+/// scope was asked for.
+fn per_user_installer(kind: &str) -> bool {
+    matches!(kind, "portable" | "portable (zip)")
+}
+
+const WINGET_NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
+const WINGET_NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
+
+/// The installer type winget would use for the requested scope, or `None` when it says none
+/// applies. `winget show` exits 0 even then (seen on winget 1.6), so the answer is the line under
+/// its `Installer:` heading; any other text is an error, never a guess.
+fn winget_installer(shown: &Captured) -> Result<Option<String>, String> {
     match shown.hresult() {
         Some(0) => {}
-        Some(WINGET_NO_APPLICABLE_INSTALLER) => return Ok(Scope::System),
+        Some(WINGET_NO_APPLICABLE_INSTALLER) => return Ok(None),
         _ => return Err(shown.unexpected()),
     }
-    let installer = shown
+    let line = shown
         .stdout
         .lines()
         .map(str::trim)
         .skip_while(|line| *line != "Installer:")
         .nth(1)
         .unwrap_or_default();
-    if installer.starts_with("Installer Type:") {
-        Ok(Scope::User)
-    } else if installer.starts_with("No applicable installer found") {
-        Ok(Scope::System)
+    if let Some(kind) = line.strip_prefix("Installer Type:") {
+        Ok(Some(kind.trim().to_owned()))
+    } else if line.starts_with("No applicable installer found") {
+        Ok(None)
     } else {
         Err(format!(
             "winget show printed no installer section{}",
@@ -220,21 +197,58 @@ fn json(text: &str) -> Result<Value, String> {
     serde_json::from_str(text.trim()).map_err(|error| format!("unreadable JSON: {error}"))
 }
 
-fn brew(output: &Captured, cask: bool) -> Result<bool, String> {
+/// One `brew info --json=v2` entry for the requested name (its name, tap-qualified name, alias,
+/// or old name). A formula's `installed` is a list of `{ "version": … }` records; a cask's is a
+/// version string, or `null` when it isn't installed.
+fn brew(output: &Captured, package: &str, cask: bool) -> Result<bool, String> {
     if !output.success() {
         return Err(output.unexpected());
     }
     let info = json(&output.stdout)?;
     let list = if cask { "casks" } else { "formulae" };
-    match info.get(list).and_then(Value::as_array).map(Vec::as_slice) {
-        Some([entry]) => match entry.get("installed") {
-            Some(Value::Array(versions)) => Ok(!versions.is_empty()),
-            Some(Value::String(version)) => Ok(!version.is_empty()),
-            Some(Value::Null) => Ok(false),
-            _ => Err(format!("brew info has no {list}[0].installed")),
-        },
-        _ => Err(format!(
+    let Some([entry]) = info.get(list).and_then(Value::as_array).map(Vec::as_slice) else {
+        return Err(format!(
             "brew info did not return exactly one entry in {list}"
+        ));
+    };
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| format!("brew info's {list} entry is not an object"))?;
+    let (names, aliases) = if cask {
+        (&["token", "full_token"][..], &["old_tokens"][..])
+    } else {
+        (&["name", "full_name"][..], &["aliases", "oldnames"][..])
+    };
+    let named = names
+        .iter()
+        .any(|field| entry.get(*field).and_then(Value::as_str) == Some(package))
+        || aliases.iter().any(|field| {
+            entry
+                .get(*field)
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(package)))
+        });
+    if !named {
+        return Err(format!(
+            "brew info answered for a different {}",
+            if cask { "cask" } else { "formula" }
+        ));
+    }
+    match (cask, entry.get("installed")) {
+        (false, Some(Value::Array(kegs))) => {
+            if kegs
+                .iter()
+                .all(|keg| keg.get("version").is_some_and(Value::is_string))
+            {
+                Ok(!kegs.is_empty())
+            } else {
+                Err("brew info lists an installed keg without a version".to_owned())
+            }
+        }
+        (true, Some(Value::String(version))) if !version.is_empty() => Ok(true),
+        (true, Some(Value::Null)) => Ok(false),
+        _ => Err(format!(
+            "brew info's {list} entry has no recognizable installed field"
         )),
     }
 }
@@ -326,25 +340,86 @@ fn choco(output: &Captured, package: &str) -> Result<bool, String> {
     }
 }
 
-/// npm prints `{"dependencies": {...}}` and pnpm a list of those, exiting 1 when the filter
-/// matches nothing.
-fn node(output: &Captured, package: &str) -> Result<bool, String> {
-    if !matches!(output.code, Some(0 | 1)) {
+/// What a `dependencies` table in npm's or pnpm's `ls --json` says about one package: absent,
+/// installed (an object with a `version`), or explicitly `missing`. Any other shape is an error.
+fn dependency(root: &Map<String, Value>, package: &str) -> Result<Option<bool>, String> {
+    let Some(dependencies) = root.get("dependencies") else {
+        return Ok(None);
+    };
+    let dependencies = dependencies
+        .as_object()
+        .ok_or("its dependencies field is not an object")?;
+    let Some(entry) = dependencies.get(package) else {
+        return Ok(None);
+    };
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| format!("its entry for {package} is not an object"))?;
+    if entry.get("missing") == Some(&Value::Bool(true)) {
+        Ok(Some(false))
+    } else if entry.get("version").is_some_and(Value::is_string) {
+        Ok(Some(true))
+    } else {
+        Err(format!(
+            "its entry for {package} has neither a version nor missing: true"
+        ))
+    }
+}
+
+/// `npm ls --global --json P` prints the global root, `{"name": …, "dependencies": {…}}`, and
+/// exits 1 when the filter matches nothing; it prints `{"name":"lib"}` then (sampled on npm 9 and
+/// 11). An installed package at exit 1 means npm found problems in the tree, which is an error.
+fn npm(output: &Captured, package: &str) -> Result<bool, String> {
+    let exited_one = match output.code {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(output.unexpected()),
+    };
+    let tree = json(&output.stdout).map_err(|error| format!("{error}{}", output.tail()))?;
+    let root = tree
+        .as_object()
+        .ok_or("npm ls printed JSON that is not an object")?;
+    if let Some(error) = root.get("error") {
+        return Err(format!("npm reported an error: {error}"));
+    }
+    if !root.get("name").is_some_and(Value::is_string) {
+        return Err("npm ls printed an object without the global root's name".to_owned());
+    }
+    match dependency(root, package).map_err(|error| format!("npm ls: {error}"))? {
+        Some(true) if exited_one => Err(format!(
+            "npm ls lists {package} but exited 1, so npm found problems in the global tree{}",
+            output.tail()
+        )),
+        Some(installed) => Ok(installed),
+        None => Ok(false),
+    }
+}
+
+/// `pnpm ls --global --json P` prints a list of global projects, each `{"path": …,
+/// "dependencies": {…}}`, and exits 0 either way (sampled on pnpm 12: `[{"path":
+/// ".../global/v11", "private": true, "dependencies": {}}]` before any install).
+fn pnpm(output: &Captured, package: &str) -> Result<bool, String> {
+    if !output.success() {
         return Err(output.unexpected());
     }
     let tree = json(&output.stdout).map_err(|error| format!("{error}{}", output.tail()))?;
-    let roots = match &tree {
-        Value::Array(roots) => roots.as_slice(),
-        root => std::slice::from_ref(root),
-    };
-    if let Some(error) = roots.iter().find_map(|root| root.get("error")) {
-        return Err(format!("the manager reported an error: {error}"));
+    let roots = tree
+        .as_array()
+        .filter(|roots| !roots.is_empty())
+        .ok_or("pnpm ls printed JSON that is not a list of global projects")?;
+    let mut installed = false;
+    for root in roots {
+        let root = root
+            .as_object()
+            .filter(|root| root.get("path").is_some_and(Value::is_string))
+            .ok_or("pnpm ls printed a project without a path")?;
+        if let Some(error) = root.get("error") {
+            return Err(format!("pnpm reported an error: {error}"));
+        }
+        installed |=
+            dependency(root, package).map_err(|error| format!("pnpm ls: {error}"))? == Some(true);
     }
-    Ok(roots.iter().any(|root| {
-        root.get("dependencies")
-            .and_then(|dependencies| dependencies.get(package))
-            .is_some_and(|dependency| dependency.get("missing") != Some(&Value::Bool(true)))
-    }))
+    Ok(installed)
 }
 
 fn bun(output: &Captured, package: &str) -> Result<bool, String> {
@@ -402,6 +477,9 @@ fn uv(output: &Captured, package: &str) -> Result<bool, String> {
         .any(|name| python_name(name) == wanted))
 }
 
+/// `pipx list --json` prints `{"venvs": {NAME: {"metadata": {"main_package": {"package": …}}}}}`.
+/// Every venv must carry its main package's name; the requested package is installed when one
+/// venv's main package is it.
 fn pipx(output: &Captured, package: &str) -> Result<bool, String> {
     if !output.success() {
         return Err(output.unexpected());
@@ -412,13 +490,15 @@ fn pipx(output: &Captured, package: &str) -> Result<bool, String> {
         .and_then(Value::as_object)
         .ok_or("pipx list --json has no venvs table")?;
     let wanted = python_name(package);
-    Ok(venvs.iter().any(|(name, venv)| {
-        python_name(name) == wanted
-            || venv
-                .pointer("/metadata/main_package/package")
-                .and_then(Value::as_str)
-                .is_some_and(|main| python_name(main) == wanted)
-    }))
+    let mut installed = false;
+    for (name, venv) in venvs {
+        let main = venv
+            .pointer("/metadata/main_package/package")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("pipx venv {name:?} has no main package name"))?;
+        installed |= python_name(main) == wanted;
+    }
+    Ok(installed)
 }
 
 /// `go install` names the binary after the last path element, skipping a `/vN` major-version
@@ -538,36 +618,68 @@ mod tests {
     }
 
     #[test]
-    fn brew_reads_the_installed_field_of_one_entry() {
-        let formula = |installed: &str| {
-            out(
-                0,
-                &format!(r#"{{"formulae":[{{"name":"rg","installed":{installed}}}],"casks":[]}}"#),
-                "",
-            )
+    fn brew_needs_one_entry_for_the_requested_name_with_a_recognized_installed_field() {
+        let formula = |entry: &str| out(0, &format!(r#"{{"formulae":[{entry}],"casks":[]}}"#), "");
+        let rg = |installed: &str| {
+            formula(&format!(
+                r#"{{"name":"ripgrep","full_name":"ripgrep","aliases":["rg"],"oldnames":[],"installed":{installed}}}"#
+            ))
         };
-        assert_eq!(brew(&formula(r#"[{"version":"14.1.0"}]"#), false), Ok(true));
-        assert_eq!(brew(&formula("[]"), false), Ok(false));
+        assert_eq!(
+            brew(&rg(r#"[{"version":"14.1.0"}]"#), "ripgrep", false),
+            Ok(true)
+        );
+        assert_eq!(
+            brew(&rg(r#"[{"version":"14.1.0"}]"#), "rg", false),
+            Ok(true)
+        );
+        assert_eq!(brew(&rg("[]"), "ripgrep", false), Ok(false));
+        for malformed in [r#""14.1.0""#, "null", "[null]", r#"[{"v":"1"}]"#, "{}"] {
+            assert!(
+                brew(&rg(malformed), "ripgrep", false).is_err(),
+                "{malformed}"
+            );
+        }
+        assert!(
+            brew(&rg("[]"), "fd", false).is_err(),
+            "an answer for another formula"
+        );
+        assert!(brew(&formula("null"), "ripgrep", false).is_err());
+
         let cask = |installed: &str| {
             out(
                 0,
                 &format!(
-                    r#"{{"formulae":[],"casks":[{{"token":"firefox","installed":{installed}}}]}}"#
+                    r#"{{"formulae":[],"casks":[{{"token":"firefox","full_token":"firefox","old_tokens":[],"installed":{installed}}}]}}"#
                 ),
                 "",
             )
         };
-        assert_eq!(brew(&cask(r#""130.0""#), true), Ok(true));
-        assert_eq!(brew(&cask("null"), true), Ok(false));
+        assert_eq!(brew(&cask(r#""130.0""#), "firefox", true), Ok(true));
+        assert_eq!(brew(&cask("null"), "firefox", true), Ok(false));
+        for malformed in [r#""""#, "[]", r#"[{"version":"1"}]"#, "true"] {
+            assert!(
+                brew(&cask(malformed), "firefox", true).is_err(),
+                "{malformed}"
+            );
+        }
         assert!(
             brew(
                 &out(1, "", "Error: No available formula with the name \"nope\"."),
+                "nope",
                 false
             )
             .is_err()
         );
-        assert!(brew(&out(0, "not json", ""), false).is_err());
-        assert!(brew(&out(0, r#"{"formulae":[],"casks":[]}"#, ""), false).is_err());
+        assert!(brew(&out(0, "not json", ""), "ripgrep", false).is_err());
+        assert!(
+            brew(
+                &out(0, r#"{"formulae":[],"casks":[]}"#, ""),
+                "ripgrep",
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -644,22 +756,51 @@ mod tests {
         let failure = winget_list(&out(hresult(0x8A15_000F), "", "")).unwrap_err();
         assert!(failure.contains("0x8A15000F"), "{failure}");
         let portable = "Found RipGrep MSVC [BurntSushi.ripgrep.MSVC]\r\nTags:\r\n  ripgrep\r\nInstaller:\r\n  Installer Type: portable (zip)\r\n  Installer Url: https://x/rg.zip\r\n";
-        assert_eq!(winget_show(&out(0, portable, "")), Ok(Scope::User));
-        let machine_only = "Found 7-Zip [7zip.7zip]\r\nTags:\r\n  zip\r\nInstaller:\r\n  No applicable installer found; see logs for more details.\r\n";
-        assert_eq!(winget_show(&out(0, machine_only, "")), Ok(Scope::System));
         assert_eq!(
-            winget_show(&out(hresult(0x8A15_0010), "", "")),
-            Ok(Scope::System)
+            winget_installer(&out(0, portable, "")),
+            Ok(Some("portable (zip)".to_owned()))
+        );
+        let none = "Found 7-Zip [7zip.7zip]\r\nTags:\r\n  zip\r\nInstaller:\r\n  No applicable installer found; see logs for more details.\r\n";
+        assert_eq!(winget_installer(&out(0, none, "")), Ok(None));
+        assert_eq!(
+            winget_installer(&out(hresult(0x8A15_0010), "", "")),
+            Ok(None)
         );
         assert!(
-            winget_show(&out(
+            winget_installer(&out(
                 hresult(0x8A15_0014),
                 "No package found matching input criteria.",
                 ""
             ))
             .is_err()
         );
-        assert!(winget_show(&out(0, "Found Foo [A.B]\r\n", "")).is_err());
+        assert!(winget_installer(&out(0, "Found Foo [A.B]\r\n", "")).is_err());
+        let localized = "Gefunden 7-Zip [7zip.7zip]\r\nInstallationsprogramm:\r\n  Typ: exe\r\n";
+        assert!(winget_installer(&out(0, localized, "")).is_err());
+        let extra =
+            "Found 7-Zip [7zip.7zip]\r\nInstaller:\r\n  Something new\r\n  Installer Type: exe\r\n";
+        assert!(winget_installer(&out(0, extra, "")).is_err());
+    }
+
+    #[test]
+    fn only_portable_installers_count_as_per_user() {
+        assert!(per_user_installer("portable"));
+        assert!(per_user_installer("portable (zip)"));
+        for kind in [
+            "exe",
+            "exe (zip)",
+            "msi (zip)",
+            "inno",
+            "nullsoft",
+            "wix",
+            "burn",
+            "msix",
+            "appx",
+            "zip",
+            "",
+        ] {
+            assert!(!per_user_installer(kind), "{kind}");
+        }
     }
 
     #[test]
@@ -684,25 +825,74 @@ mod tests {
     }
 
     #[test]
-    fn node_managers_read_the_dependency_tree() {
-        let npm = r#"{"name":"lib","dependencies":{"@withgraphite/graphite-cli":{"version":"1.8.6"},"cowsay":{"version":"1.6.0"}}}"#;
-        assert_eq!(node(&out(0, npm, ""), "cowsay"), Ok(true));
+    fn npm_needs_its_global_root_and_a_versioned_entry() {
+        let installed = r#"{"name":"lib","dependencies":{"@withgraphite/graphite-cli":{"version":"1.8.6","overridden":false},"cowsay":{"version":"1.6.0","overridden":false}}}"#;
+        assert_eq!(npm(&out(0, installed, ""), "cowsay"), Ok(true));
         assert_eq!(
-            node(&out(0, npm, ""), "@withgraphite/graphite-cli"),
+            npm(&out(0, installed, ""), "@withgraphite/graphite-cli"),
             Ok(true)
         );
         assert_eq!(
-            node(&out(1, "{\n  \"name\": \"lib\"\n}\n", ""), "cowsay"),
+            npm(&out(1, "{\n  \"name\": \"lib\"\n}\n", ""), "cowsay"),
             Ok(false)
         );
-        let pnpm = r#"[{"path":"/h/.local/share/pnpm/global/5","dependencies":{"cowsay":{"version":"1.6.0"}}}]"#;
-        assert_eq!(node(&out(0, pnpm, ""), "cowsay"), Ok(true));
-        assert_eq!(node(&out(0, "[]", ""), "cowsay"), Ok(false));
-        assert!(node(&out(1, r#"{"error":{"code":"EACCES"}}"#, ""), "cowsay").is_err());
-        assert!(node(&out(1, "ERR_PNPM_NO_GLOBAL_BIN_DIR", ""), "cowsay").is_err());
-        assert!(node(&out(254, "{}", ""), "cowsay").is_err());
-        let missing = r#"{"dependencies":{"cowsay":{"missing":true}}}"#;
-        assert_eq!(node(&out(1, missing, ""), "cowsay"), Ok(false));
+        assert_eq!(npm(&out(0, installed, ""), "figlet"), Ok(false));
+        assert_eq!(
+            npm(
+                &out(
+                    1,
+                    r#"{"name":"lib","dependencies":{"cowsay":{"missing":true}}}"#,
+                    ""
+                ),
+                "cowsay"
+            ),
+            Ok(false)
+        );
+        for (code, malformed) in [
+            (0, r#"{"name":"lib","dependencies":{"cowsay":null}}"#),
+            (0, r#"{"name":"lib","dependencies":{"cowsay":{}}}"#),
+            (0, r#"{"name":"lib","dependencies":{"cowsay":"1.6.0"}}"#),
+            (0, r#"{"name":"lib","dependencies":[]}"#),
+            (1, "null"),
+            (1, "[]"),
+            (1, "{}"),
+            (1, r#"{"error":{"code":"EACCES"}}"#),
+            (1, installed),
+            (1, "ERR_SOMETHING"),
+            (254, r#"{"name":"lib"}"#),
+        ] {
+            assert!(
+                npm(&out(code, malformed, ""), "cowsay").is_err(),
+                "{code} {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn pnpm_needs_its_global_projects_and_a_versioned_entry() {
+        let empty =
+            r#"[{"path":"/h/.local/share/pnpm/global/v11","private":true,"dependencies":{}}]"#;
+        assert_eq!(pnpm(&out(0, empty, ""), "figlet"), Ok(false));
+        let installed = r#"[{"path":"/h/.local/share/pnpm/global/v11","private":true,"dependencies":{"figlet":{"from":"figlet","version":"1.8.0"}}}]"#;
+        assert_eq!(pnpm(&out(0, installed, ""), "figlet"), Ok(true));
+        assert_eq!(pnpm(&out(0, installed, ""), "cowsay"), Ok(false));
+        assert_eq!(pnpm(&out(0, r#"[{"path":"/g"}]"#, ""), "figlet"), Ok(false));
+        for malformed in [
+            "[]",
+            "{}",
+            "null",
+            r#"[{"unexpected":true}]"#,
+            r#"[{"path":"/g","dependencies":{"figlet":null}}]"#,
+            r#"[{"path":"/g","dependencies":[]}]"#,
+            r#"[{"path":"/g","error":{"code":"ERR_PNPM_NO_GLOBAL_BIN_DIR"}}]"#,
+            "ERR_PNPM_NO_GLOBAL_BIN_DIR",
+        ] {
+            assert!(
+                pnpm(&out(0, malformed, ""), "figlet").is_err(),
+                "{malformed}"
+            );
+        }
+        assert!(pnpm(&out(1, empty, ""), "figlet").is_err());
     }
 
     #[test]
@@ -726,17 +916,37 @@ mod tests {
         assert_eq!(uv(&out(0, "", "No tools installed\n"), "ruff"), Ok(false));
         assert!(uv(&out(2, "", "error: failed to read tool receipt"), "ruff").is_err());
 
-        let pipx_list = r#"{"pipx_spec_version":"0.1","venvs":{"pycowsay":{"metadata":{"main_package":{"package":"pycowsay"}}}}}"#;
-        assert_eq!(pipx(&out(0, pipx_list, ""), "PyCowsay"), Ok(true));
-        assert_eq!(pipx(&out(0, pipx_list, ""), "ruff"), Ok(false));
+        let venv = |name: &str, main: &str| {
+            format!(r#""{name}":{{"metadata":{{"main_package":{{"package":"{main}"}}}}}}"#)
+        };
+        let list = |venvs: &str| {
+            out(
+                0,
+                &format!(r#"{{"pipx_spec_version":"0.1","venvs":{{{venvs}}}}}"#),
+                "",
+            )
+        };
+        let two = format!("{},{}", venv("uv", "uv"), venv("pycowsay", "pycowsay"));
+        assert_eq!(pipx(&list(&two), "PyCowsay"), Ok(true));
+        assert_eq!(pipx(&list(&two), "ruff"), Ok(false));
+        assert_eq!(pipx(&list(""), "ruff"), Ok(false));
         assert_eq!(
-            pipx(
-                &out(0, r#"{"pipx_spec_version":"0.1","venvs":{}}"#, ""),
-                "ruff"
-            ),
+            pipx(&list(&venv("cowsay-2", "pycowsay")), "pycowsay"),
+            Ok(true)
+        );
+        assert_eq!(
+            pipx(&list(&venv("pycowsay", "other")), "pycowsay"),
             Ok(false)
         );
+        for malformed in [
+            r#""pycowsay":null"#,
+            r#""pycowsay":{}"#,
+            r#""pycowsay":{"metadata":{"main_package":{}}}"#,
+        ] {
+            assert!(pipx(&list(malformed), "pycowsay").is_err(), "{malformed}");
+        }
         assert!(pipx(&out(0, "nothing has been installed with pipx", ""), "ruff").is_err());
+        assert!(pipx(&out(0, r#"{"venvs":[]}"#, ""), "ruff").is_err());
         assert!(pipx(&out(1, "", "boom"), "ruff").is_err());
     }
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::context::{self, Context};
 use crate::diagnostic::{Check, CheckStatus};
@@ -11,7 +11,9 @@ use crate::resolve::Program;
 
 mod detect;
 mod manager;
+mod process;
 
+use detect::Eligibility;
 use manager::Invocation;
 
 pub const ISOLATED: &str = "programs are not installed under LOADOUT_HOME isolation";
@@ -36,6 +38,10 @@ pub enum Error {
     },
     #[error("programs.{program}: only a missing program can be installed")]
     NotMissing { program: String },
+    #[error(
+        "programs.{program}: the machine changed after the plan ({detail}), so loadout installed nothing; plan again"
+    )]
+    Changed { program: String, detail: String },
     #[error(
         "programs.{program}: {manager} installs {package:?} system-wide, which needs --elevated"
     )]
@@ -78,7 +84,8 @@ pub enum Error {
 
 /// One program's outcome on this machine. `plan::build` turns `Installed` into `unchanged`,
 /// `Missing` into `install` (or `blocked` when it needs elevation the run doesn't have), and
-/// carries `Unsupported` and `Blocked` through.
+/// carries `Unsupported` and `Blocked` through. Only `steps` can produce an `Installed` or
+/// `Missing` payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub program: String,
@@ -88,18 +95,57 @@ pub struct Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
     Installed(Package),
-    Missing { package: Package, scope: Scope },
+    Missing(Missing),
     Unsupported(String),
     Blocked(String),
 }
 
-/// The selected manager, the exact package id the loadout declared for it, and the manager
-/// executable found on PATH, which `install` runs.
+/// The selected manager, the exact package id the loadout declared for it (already validated),
+/// and the manager executable found on PATH.
+///
+/// ```compile_fail
+/// let package = loadout::programs::Package {
+///     manager: loadout::manifest::Manager::Npm,
+///     id: "--prefix=/etc".to_owned(),
+///     executable: "/usr/bin/npm".into(),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
-    pub manager: Manager,
-    pub id: String,
-    pub executable: PathBuf,
+    manager: Manager,
+    id: String,
+    executable: PathBuf,
+}
+
+impl Package {
+    pub fn manager(&self) -> Manager {
+        self.manager
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+/// A package `steps` found missing, and the scope its install needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    package: Package,
+    scope: Scope,
+}
+
+impl Missing {
+    pub fn package(&self) -> &Package {
+        &self.package
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,15 +154,26 @@ pub enum Scope {
     System,
 }
 
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Scope::User => "user",
+            Scope::System => "system",
+        }
+    }
+}
+
+/// What `install` did: installed the program, or found it installed when it looked again just
+/// before installing, and ran nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installed {
+    Now,
+    Already,
+}
+
 impl Step {
     pub fn needs_elevation(&self) -> bool {
-        matches!(
-            self.state,
-            State::Missing {
-                scope: Scope::System,
-                ..
-            }
-        )
+        matches!(&self.state, State::Missing(missing) if missing.scope == Scope::System)
     }
 }
 
@@ -146,29 +203,53 @@ fn state(id: &str, program: &Program, os: Os) -> Result<State, Error> {
         Ok(selected) => selected,
         Err(reason) => return Ok(State::Unsupported(reason)),
     };
-    let error = |detail: String| Error::Detect {
-        program: id.to_owned(),
-        manager: manager.id(),
-        package: package.to_owned(),
-        detail,
-    };
     manager::check_package(manager, package).map_err(|reason| Error::Package {
         program: id.to_owned(),
         manager: manager.id(),
         package: package.to_owned(),
         reason,
     })?;
-    let installed = detect::installed(manager, &executable, package).map_err(error)?;
     let package = Package {
         manager,
         id: package.to_owned(),
         executable,
     };
-    if installed {
-        return Ok(State::Installed(package));
+    Ok(
+        match observe(&package).map_err(|detail| detect_error(id, &package, detail))? {
+            Observation::Installed => State::Installed(package),
+            Observation::Missing(scope) => State::Missing(Missing { package, scope }),
+            Observation::Unsupported(reason) => State::Unsupported(reason),
+        },
+    )
+}
+
+enum Observation {
+    Installed,
+    Missing(Scope),
+    Unsupported(String),
+}
+
+/// The one answer `steps` and `install` both act on: the manager's installed-query, then, for a
+/// missing package, whether and in which scope it can be installed.
+fn observe(package: &Package) -> Result<Observation, String> {
+    if detect::installed(package.manager, &package.executable, &package.id)? {
+        return Ok(Observation::Installed);
     }
-    let scope = detect::scope(manager, &package.executable, &package.id).map_err(error)?;
-    Ok(State::Missing { package, scope })
+    Ok(
+        match detect::eligibility(package.manager, &package.executable, &package.id)? {
+            Eligibility::Scope(scope) => Observation::Missing(scope),
+            Eligibility::Unsupported(reason) => Observation::Unsupported(reason),
+        },
+    )
+}
+
+fn detect_error(program: &str, package: &Package, detail: String) -> Error {
+    Error::Detect {
+        program: program.to_owned(),
+        manager: package.manager.id(),
+        package: package.id.clone(),
+        detail,
+    }
 }
 
 /// The first manager in this OS's order that the program declares and that is on PATH. The
@@ -217,27 +298,89 @@ fn select(
     ))
 }
 
-/// Installs one missing program, then asks the manager again so a reported success that left
-/// nothing installed is an error. A system-scope install runs only with `elevated`: through
-/// `sudo` on Unix (unless already root), and directly on Windows, where the installer raises
-/// UAC. No manager gets stdin, so nothing can wait on a prompt.
-pub fn install(step: &Step, elevated: bool) -> Result<(), Error> {
-    let program = step.program.clone();
-    let State::Missing { package, scope } = &step.state else {
-        return Err(Error::NotMissing { program });
+/// Installs one missing program.
+///
+/// First it checks the step against the machine as it is now: the package id, the manager's
+/// scope, the executable PATH resolves the manager to, and the manager's own answer. A package
+/// that is installed by then is `Installed::Already`, and nothing runs, so a stale step never
+/// reinstalls or upgrades. Only then does elevation matter: a system-scope install runs only with
+/// `elevated`, through `sudo` on Unix (unless already root) and directly on Windows, where the
+/// installer raises UAC. After the manager reports success, it asks again, so a success that left
+/// nothing installed is an error.
+///
+/// Two limits remain. Another process can install the package between that last look and the
+/// installer starting; winget (`--no-upgrade`), Homebrew, apt (`--no-upgrade`), flatpak, Scoop,
+/// Chocolatey, uv, pipx, and snap then skip it themselves, while npm, pnpm, bun, go, cargo, dnf,
+/// pacman, and zypper may upgrade it. And an equal PATH answer means the same path, not the same
+/// file: a manager binary replaced in place isn't detected.
+pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
+    let program = step.program.as_str();
+    let State::Missing(missing) = &step.state else {
+        return Err(Error::NotMissing {
+            program: program.to_owned(),
+        });
     };
+    let package = &missing.package;
     let manager = package.manager;
-    if *scope == Scope::System && !elevated {
+    let changed = |detail: String| Error::Changed {
+        program: program.to_owned(),
+        detail,
+    };
+    manager::check_package(manager, &package.id).map_err(|reason| Error::Package {
+        program: program.to_owned(),
+        manager: manager.id(),
+        package: package.id.clone(),
+        reason,
+    })?;
+    if manager::scope(manager).is_some_and(|scope| scope != missing.scope) {
+        return Err(changed(format!(
+            "{} never installs in {} scope",
+            manager.id(),
+            missing.scope.name()
+        )));
+    }
+    match manager::available(manager) {
+        Some(path) if path == package.executable => {}
+        Some(path) => {
+            return Err(changed(format!(
+                "{} now resolves to {}, not {}",
+                manager.id(),
+                path.display(),
+                package.executable.display()
+            )));
+        }
+        None => {
+            return Err(changed(format!(
+                "{} is no longer on PATH ({})",
+                manager.id(),
+                manager::tools(manager).join(", ")
+            )));
+        }
+    }
+    match observe(package).map_err(|detail| detect_error(program, package, detail))? {
+        Observation::Installed => return Ok(Installed::Already),
+        Observation::Missing(scope) if scope == missing.scope => {}
+        Observation::Missing(scope) => {
+            return Err(changed(format!(
+                "{} now needs {} scope, not {}",
+                package.id,
+                scope.name(),
+                missing.scope.name()
+            )));
+        }
+        Observation::Unsupported(reason) => return Err(changed(reason)),
+    }
+    if missing.scope == Scope::System && !elevated {
         return Err(Error::NeedsElevation {
-            program,
+            program: program.to_owned(),
             manager: manager.id(),
             package: package.id.clone(),
         });
     }
-    let invocation = manager::install(manager, &package.executable, &package.id, *scope);
-    let invocation = if *scope == Scope::System {
+    let invocation = manager::install(manager, &package.executable, &package.id, missing.scope);
+    let invocation = if missing.scope == Scope::System {
         elevate(invocation).ok_or_else(|| Error::NoSudo {
-            program: program.clone(),
+            program: program.to_owned(),
             manager: manager.id(),
             package: package.id.clone(),
         })?
@@ -245,8 +388,8 @@ pub fn install(step: &Step, elevated: bool) -> Result<(), Error> {
         invocation
     };
     let command = invocation.display();
-    let output = detect::capture(&invocation).map_err(|source| Error::Spawn {
-        program: program.clone(),
+    let output = process::install(&invocation).map_err(|source| Error::Spawn {
+        program: program.to_owned(),
         command: command.clone(),
         source,
     })?;
@@ -255,25 +398,20 @@ pub fn install(step: &Step, elevated: bool) -> Result<(), Error> {
         .is_some_and(|code| manager::install_succeeded(manager, code))
     {
         return Err(Error::Install {
-            program,
+            program: program.to_owned(),
             command,
             status: output.status(),
             output: output.tail(),
         });
     }
     match detect::installed(manager, &package.executable, &package.id) {
-        Ok(true) => Ok(()),
+        Ok(true) => Ok(Installed::Now),
         Ok(false) => Err(Error::NotInstalled {
-            program,
+            program: program.to_owned(),
             manager: manager.id(),
             package: package.id.clone(),
         }),
-        Err(detail) => Err(Error::Detect {
-            program,
-            manager: manager.id(),
-            package: package.id.clone(),
-            detail,
-        }),
+        Err(detail) => Err(detect_error(program, package, detail)),
     }
 }
 
@@ -394,7 +532,7 @@ fn flatpak_remotes() -> Check {
         return Check::new("flatpak", CheckStatus::Warn, "flatpak is no longer on PATH");
     };
     let invocation = Invocation::new(&flatpak, ["remotes", "--user", "--columns=name"]);
-    match detect::capture(&invocation) {
+    match process::query(&invocation) {
         Ok(output) if output.code == Some(0) => {
             let remotes: Vec<&str> = output
                 .stdout
@@ -425,7 +563,7 @@ fn flatpak_remotes() -> Check {
         Err(error) => Check::new(
             "flatpak",
             CheckStatus::Warn,
-            format!("cannot run {}: {error}", invocation.display()),
+            format!("{}: {error}", invocation.display()),
         ),
     }
 }
@@ -566,23 +704,36 @@ mod tests {
     }
 
     #[test]
-    fn a_system_install_refuses_to_run_without_elevation() {
+    fn install_rechecks_a_step_against_path_before_anything_runs() {
         let step = Step {
             program: "ripgrep".to_owned(),
-            state: State::Missing {
+            state: State::Missing(Missing {
                 package: Package {
                     manager: Manager::Apt,
                     id: "ripgrep".to_owned(),
                     executable: "/nonexistent/apt-get".into(),
                 },
                 scope: Scope::System,
-            },
+            }),
         };
         assert!(step.needs_elevation());
         let error = install(&step, false).unwrap_err();
+        assert!(matches!(error, Error::Changed { .. }), "{error}");
+
+        let mut wrong_scope = step.clone();
+        if let State::Missing(missing) = &mut wrong_scope.state {
+            missing.scope = Scope::User;
+        }
+        let error = install(&wrong_scope, true).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "programs.ripgrep: apt installs \"ripgrep\" system-wide, which needs --elevated"
+            "programs.ripgrep: the machine changed after the plan (apt never installs in user scope), so loadout installed nothing; plan again"
         );
+
+        let mut option = step;
+        if let State::Missing(missing) = &mut option.state {
+            missing.package.id = "-oDebug=1".to_owned();
+        }
+        assert!(matches!(install(&option, true), Err(Error::Package { .. })));
     }
 }
