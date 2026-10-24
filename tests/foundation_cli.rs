@@ -352,6 +352,60 @@ fn doctor_fails_on_a_broken_machine_file_or_missing_home() {
 }
 
 #[test]
+fn isolated_home_ignores_ambient_xdg_dirs() {
+    let sandbox = Sandbox::new();
+    let real = tempfile::tempdir().unwrap();
+    let saved = real.path().join("state/loadout");
+    fs::create_dir_all(&saved).unwrap();
+    fs::write(
+        saved.join("machine.toml"),
+        "name = \"outside-isolated-home\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .args(["doctor", "--json"])
+        .env("LOADOUT_HOME", &sandbox.home)
+        .env_remove("LOADOUT_STATE_DIR")
+        .env("XDG_CONFIG_HOME", real.path().join("config"))
+        .env("XDG_STATE_HOME", real.path().join("state"))
+        .env("CODEX_HOME", real.path().join("codex"))
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    assert!(!text.contains("outside-isolated-home"), "{text}");
+    assert!(!text.contains(real.path().to_str().unwrap()), "{text}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let detail = |name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(detail("config dir").starts_with(sandbox.home.to_str().unwrap()));
+    assert!(detail("state dir").starts_with(sandbox.home.to_str().unwrap()));
+}
+
+#[test]
+fn empty_home_override_is_not_reported_as_isolation() {
+    let sandbox = Sandbox::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_loadout"))
+        .arg("doctor")
+        .env("HOME", &sandbox.home)
+        .env("LOADOUT_HOME", "")
+        .env("LOADOUT_STATE_DIR", &sandbox.state)
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    assert!(text.contains(sandbox.home.to_str().unwrap()), "{text}");
+    assert!(!text.contains("from LOADOUT_HOME"), "{text}");
+}
+
+#[test]
 fn relative_home_override_is_a_runtime_error() {
     let sandbox = Sandbox::new();
     let output = loadout(&["doctor"], Path::new("relative"), &sandbox.state);

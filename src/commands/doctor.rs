@@ -23,7 +23,7 @@ struct Report<'a> {
 }
 
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
-    let mut checks = vec![
+    let checks = vec![
         Check::new(
             "version",
             CheckStatus::Info,
@@ -41,7 +41,6 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         git(),
         managers(context.os),
     ];
-    checks.retain(|check| !check.name.is_empty());
 
     let healthy = checks.iter().all(|check| check.status != CheckStatus::Fail);
     if args.json {
@@ -96,8 +95,11 @@ fn platform() -> Check {
 }
 
 fn home(context: &Context) -> Check {
-    let source = if std::env::var_os(context::HOME_OVERRIDE).is_some() {
-        format!(" (from {})", context::HOME_OVERRIDE)
+    let source = if context.isolated {
+        format!(
+            " (from {}; ambient XDG and agent dir overrides ignored)",
+            context::HOME_OVERRIDE
+        )
     } else {
         String::new()
     };

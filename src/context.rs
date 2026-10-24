@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,12 @@ use crate::platform::Os;
 
 pub const HOME_OVERRIDE: &str = "LOADOUT_HOME";
 pub const STATE_OVERRIDE: &str = "LOADOUT_STATE_DIR";
+pub const AGENT_DIR_VARS: [&str; 4] = [
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "PI_CODING_AGENT_DIR",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -21,8 +28,11 @@ pub enum Error {
 pub struct Context {
     pub os: Os,
     pub home: PathBuf,
+    pub isolated: bool,
     pub config: PathBuf,
+    pub xdg_config: PathBuf,
     pub state: PathBuf,
+    pub agent_dirs: BTreeMap<&'static str, PathBuf>,
 }
 
 impl Context {
@@ -48,18 +58,18 @@ impl Context {
             }
         };
 
+        let isolated = set(HOME_OVERRIDE).is_some();
         let home = match set(HOME_OVERRIDE) {
             Some(value) => absolute(HOME_OVERRIDE, value)?,
             None => default_home.ok_or(Error::NoHome)?,
         };
-        let xdg = |name: &str, fallback: &[&str]| {
-            set(name)
-                .filter(|value| value.is_absolute())
-                .unwrap_or_else(|| join(&home, fallback))
-        };
+        let ambient = |name: &str| set(name).filter(|value| !isolated && value.is_absolute());
+        let xdg =
+            |name: &str, fallback: &[&str]| ambient(name).unwrap_or_else(|| join(&home, fallback));
 
+        let xdg_config = xdg("XDG_CONFIG_HOME", &[".config"]);
         let config = match os {
-            Os::Linux => xdg("XDG_CONFIG_HOME", &[".config"]),
+            Os::Linux => xdg_config.clone(),
             Os::Macos => join(&home, &["Library", "Application Support"]),
             Os::Windows => join(&home, &["AppData", "Roaming"]),
         };
@@ -71,12 +81,19 @@ impl Context {
                 Os::Windows => join(&home, &["AppData", "Local", "loadout"]),
             },
         };
+        let agent_dirs = AGENT_DIR_VARS
+            .into_iter()
+            .filter_map(|name| ambient(name).map(|value| (name, value)))
+            .collect();
 
         Ok(Self {
             os,
             home,
+            isolated,
             config,
+            xdg_config,
             state,
+            agent_dirs,
         })
     }
 
@@ -87,6 +104,10 @@ impl Context {
             Base::Config => &self.config,
         };
         Some(join(base, &rest.split('/').collect::<Vec<_>>()))
+    }
+
+    pub fn agent_dir(&self, var: &str) -> Option<&Path> {
+        self.agent_dirs.get(var).map(PathBuf::as_path)
     }
 
     pub fn machine_file(&self) -> PathBuf {
@@ -187,11 +208,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(context.home, PathBuf::from("/tmp/h"));
+        assert!(context.isolated);
         assert_eq!(
             context.config,
             PathBuf::from("/tmp/h/Library/Application Support")
         );
         assert_eq!(context.state, PathBuf::from("/tmp/s"));
+    }
+
+    #[test]
+    fn isolated_home_ignores_ambient_xdg_and_agent_dirs() {
+        let ambient = [
+            ("XDG_CONFIG_HOME", "/real/.config"),
+            ("XDG_STATE_HOME", "/real/.local/state"),
+            ("CLAUDE_CONFIG_DIR", "/real/.claude"),
+            ("CODEX_HOME", "/real/.codex"),
+        ];
+        let mut isolated = ambient.to_vec();
+        isolated.push(("LOADOUT_HOME", "/sandbox"));
+        let context = Context::resolve(Os::Linux, vars(&isolated), Some("/real".into())).unwrap();
+        assert_eq!(context.config, PathBuf::from("/sandbox/.config"));
+        assert_eq!(context.xdg_config, PathBuf::from("/sandbox/.config"));
+        assert_eq!(
+            context.state,
+            PathBuf::from("/sandbox/.local/state/loadout")
+        );
+        assert!(context.agent_dirs.is_empty());
+
+        isolated.push(("LOADOUT_STATE_DIR", "/explicit/state"));
+        let context = Context::resolve(Os::Linux, vars(&isolated), Some("/real".into())).unwrap();
+        assert_eq!(context.state, PathBuf::from("/explicit/state"));
+
+        let context = Context::resolve(Os::Linux, vars(&ambient), Some("/real".into())).unwrap();
+        assert!(!context.isolated);
+        assert_eq!(context.config, PathBuf::from("/real/.config"));
+        assert_eq!(context.state, PathBuf::from("/real/.local/state/loadout"));
+        assert_eq!(
+            context.agent_dir("CODEX_HOME"),
+            Some(Path::new("/real/.codex"))
+        );
+        assert_eq!(context.agent_dir("GROK_HOME"), None);
+    }
+
+    #[test]
+    fn empty_home_override_is_not_isolation() {
+        let context = Context::resolve(
+            Os::Linux,
+            vars(&[("LOADOUT_HOME", "")]),
+            Some("/real".into()),
+        )
+        .unwrap();
+        assert!(!context.isolated);
+        assert_eq!(context.home, PathBuf::from("/real"));
+    }
+
+    #[test]
+    fn xdg_config_is_dot_config_on_every_os() {
+        for os in Os::ALL {
+            let context = Context::resolve(os, vars(&[]), Some("/h".into())).unwrap();
+            assert_eq!(context.xdg_config, Path::new("/h").join(".config"), "{os}");
+        }
     }
 
     #[test]

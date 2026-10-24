@@ -316,9 +316,23 @@ State lives in one directory per machine, never in the loadout.
 | macOS | `~/Library/Application Support/loadout` |
 | Windows | `~\AppData\Local\loadout` |
 
-Two overrides exist for tests and isolated homes (foundation, `src/context.rs`). `LOADOUT_HOME`
-replaces the home dir that every `~/` and `{config}/` path resolves under. `LOADOUT_STATE_DIR`
-replaces the state dir. Both must be absolute.
+Two overrides exist for tests and isolated homes (foundation, `src/context.rs`). Both must be
+absolute when set; an empty value counts as unset.
+
+- **`LOADOUT_HOME` (isolation).** When set, it replaces the home dir, and `Context.isolated` is
+  `true`. Every path is then derived from that home and nothing else: `{config}`, `xdg_config`, and
+  the default state dir. The ambient `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are ignored, and so are
+  the agent dir variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `PI_CODING_AGENT_DIR`),
+  so `Context.agent_dirs` is empty. Nothing a run reads or writes can fall outside the isolated
+  home, except an explicit `LOADOUT_STATE_DIR`.
+- **`LOADOUT_STATE_DIR`.** Replaces the state dir, isolated or not.
+- **Without `LOADOUT_HOME`.** Ordinary overrides apply: an absolute `XDG_CONFIG_HOME` and
+  `XDG_STATE_HOME`, and the absolute agent dir variables, which are collected into
+  `Context.agent_dirs`. Units read agent overrides only through `Context::agent_dir(name)` and never
+  call `std::env` themselves, so isolation is enforced in one place.
+- `Context.xdg_config` is `$XDG_CONFIG_HOME` or `~/.config` on every OS, for agents such as OpenCode
+  and Muse that use XDG paths even on macOS and Windows. `Context.config` is the OS-native config dir
+  behind `{config}`.
 
 ```
 <state>/machine.toml       name = "<machine name>", remote = "<loadout url>"   written by init (U9)
@@ -384,8 +398,9 @@ delegated defaults.
 
 Evidence: `reports/agent-inventory.md` (final), T3 Code `4fef307`, and
 [Agent config surfaces](./wayfinder/loadout-v1/tickets/01-agent-config-surfaces.md). `~` is the home
-directory. Each env override below is read from the CLI's own environment, and the background service
-records it at install time (U8).
+directory. Each agent env override below is read through `Context::agent_dir`, which honours it only
+outside `LOADOUT_HOME` isolation (section 4). The background service records the overrides at
+install time (U8).
 
 | Agent | Skills dir | Global instructions | MCP file, map, shape | Env syntax |
 | --- | --- | --- | --- | --- |
