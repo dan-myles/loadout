@@ -816,7 +816,11 @@ mod tests {
     #[test]
     fn private_files_round_trip_and_are_owner_only() {
         let dir = tempfile::tempdir().unwrap();
-        let context = scratch_context(&dir.path().join("state"));
+        // The state root is resolved before anything is written, so the scratch root is given in
+        // its resolved form for the exact path assertion (macOS's /var is /private/var; a Windows
+        // temp dir can be a short 8.3 name, resolved to its long verbatim form).
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let context = scratch_context(&root.join("state"));
         assert_eq!(read_private(&context, Private::LastRun).unwrap(), None);
         let path = write_private(&context, Private::LastRun, b"{}").unwrap();
         assert_eq!(path, Private::LastRun.path(&context));
