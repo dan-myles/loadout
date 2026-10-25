@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake `cargo` for loadout acceptance, shaped like tests/programs.rs's recorder. State lives
+# beside this script so it works under the service's captured environment too.
+S=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/fake-state
+mkdir -p "$S"
+{ printf 'cargo'; for a in "$@"; do printf ' %s' "$a"; done; printf ' | pid=%s\n' "$$"; } >> "$S/log"
+case "$1 $2" in
+"install --list")
+  printf 'pkg-cargo-extra v1.0.0:\n    extra\n'
+  if [ -e "$S/cargo" ]; then printf 'pkg-cargo v1.0.0:\n    pkg-cargo\n'; fi
+  exit 0;;
+"install pkg-cargo")
+  # A present `hang` file holds the install (bounded at one hour) so tests can interrupt it.
+  n=0
+  while [ -e "$S/hang" ] && [ "$n" -lt 3600 ]; do sleep 1; n=$((n + 1)); done
+  if [ -e "$S/fail" ]; then echo 'error: fake install failure' >&2; exit 101; fi
+  : > "$S/cargo"; exit 0;;
+esac
+exit 64

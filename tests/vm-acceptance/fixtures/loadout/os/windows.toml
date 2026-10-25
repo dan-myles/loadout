@@ -1,0 +1,3 @@
+# Fake user-scope manager on the guest PATH (fixtures/fakebin/windows/scoop.cmd); never a real install.
+[programs.e2e-scoop]
+scoop = "pkg-scoop"

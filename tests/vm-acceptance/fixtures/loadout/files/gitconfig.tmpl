@@ -1,0 +1,9 @@
+[user]
+	name = {{ name }}
+	email = {{ email }}
+# greeting {{ greeting }} for {{ machine.name }} on {{ machine.os }}
+{% if tagged %}
+# tagged e2e
+{% else %}
+# untagged
+{% endif %}

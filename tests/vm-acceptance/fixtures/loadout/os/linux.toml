@@ -1,0 +1,3 @@
+# Fake user-scope manager on the guest PATH (fixtures/fakebin/linux/cargo); never a real install.
+[programs.e2e-cargo]
+cargo = "pkg-cargo"

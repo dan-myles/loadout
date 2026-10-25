@@ -1,0 +1,55 @@
+# Acceptance fixture loadout (vm-setup, standing 128). Guest-only: every target is synthetic.
+[loadout]
+version = 1
+
+[machines.vm-linux]
+tags = ["e2e"]
+
+[machines.vm-windows]
+tags = ["e2e"]
+
+[machines.vm-linux-std]
+tags = ["e2e"]
+
+[machines.vm-windows-std]
+tags = ["e2e"]
+
+[machines.vm-macos]
+tags = ["e2e"]
+
+[variables]
+name = "Loadout E2E"
+email = "e2e@example.invalid"
+tagged = false
+greeting = "c1"
+
+[update]
+auto = true
+interval_minutes = 15
+cli = false
+
+[agents]
+enabled = ["claude", "codex"]
+
+[files.hello]
+source = "files/hello.txt"
+target = "~/.config/loadout-e2e/hello.txt"
+
+[files.gitconfig]
+source = "files/gitconfig.tmpl"
+target = "~/.config/loadout-e2e/gitconfig"
+
+[skills.review]
+source = "skills/review"
+
+[instructions.global]
+source = "instructions/AGENTS.md"
+
+[mcp.e2e-stdio]
+command = "e2e-mcp-server"
+args = ["--stdio"]
+env = { LOG_LEVEL = "warn" }
+
+[mcp.e2e-remote]
+url = "https://mcp.example.invalid/mcp"
+headers = { Authorization = { env = "E2E_MCP_TOKEN", prefix = "Bearer " } }

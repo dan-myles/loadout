@@ -1,0 +1,71 @@
+# Native macOS acceptance of one exact head on the free hosted macos-15 and macos-15-intel
+# runners: the real release archive, install.sh, init/update and a real launchd agent, run by
+# tests/vm-acceptance/guest/linux_acceptance.py --mode macos. Manual dispatch only.
+name: macOS native acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      head:
+        description: exact 40-hex commit under test
+        required: true
+permissions:
+  contents: read
+jobs:
+  macos:
+    name: acceptance ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head }}
+          path: loadout
+          persist-credentials: false
+      - name: Bind the exact head
+        run: test "$(git -C loadout rev-parse HEAD)" = "${{ inputs.head }}"
+      - name: Install the pinned toolchain
+        working-directory: loadout
+        run: rustup toolchain install --no-self-update && rustup target add "${{ matrix.target }}"
+      - name: Build and package the release archive (a release target, so installer-managed)
+        working-directory: loadout
+        run: python3 scripts/release/package.py --target "${{ matrix.target }}" --out-dir "$RUNNER_TEMP/dist"
+      - name: Stage the harness inputs
+        run: |
+          set -eu
+          A=loadout/tests/vm-acceptance
+          IN=$RUNNER_TEMP/in
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' loadout/Cargo.toml | head -n 1)
+          mkdir -p "$IN/fixtures" "$IN/fakebin"
+          cp -R "$A/fixtures/loadout" "$IN/fixtures/loadout"
+          cp -R "$A/fixtures/fakebin/linux" "$IN/fakebin/linux"
+          cp loadout/scripts/release/install.sh "$IN/install.sh"
+          python3 -I "$A/host/release_fixture.py" linux --target "${{ matrix.target }}" \
+            --archive "$RUNNER_TEMP/dist/loadout-${{ matrix.target }}.tar.gz" --version "$VERSION" --out "$IN/release"
+          python3 -I - "$IN" "${{ inputs.head }}" "$VERSION" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root, head, version = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          meta = json.loads((root / "release/manifest.json").read_text())
+          (root / "expected.json").write_text(json.dumps({
+              "head": head, "version": version, "network": "online", "managed_macos": True,
+              "binary_sha256": meta["meta"]["binary_sha256"],
+              "release_good_asset_sha256": meta["variants"]["good"]["asset_sha256"]}, indent=2))
+          PY
+      - name: GUI domain evidence (launchd agents need the runner's login session)
+        run: |
+          id; stat -f %Su /dev/console; launchctl print "gui/$(id -u)" | head -n 20 || echo "no gui domain: exit $?"
+      - name: Run the acceptance harness (real install.sh, init, update, launchd agent)
+        run: python3 -I loadout/tests/vm-acceptance/guest/linux_acceptance.py --in "$RUNNER_TEMP/in" --mode macos --long-timer
+      - name: Collect
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-acceptance-${{ matrix.target }}
+          path: ~/acc/out
+          if-no-files-found: error
