@@ -152,8 +152,14 @@ else
   die "sha256sum or shasum is required to verify the download"
 fi
 
+# The file goes in on stdin, not as an argument: for a name holding a backslash or newline,
+# sha256sum and shasum escape the name and prefix the digest with a backslash, which would then be
+# compared and written to the install record as part of the hash.
 sha256_of() {
-  $sha_cmd "$1" | { read -r digest _ && printf '%s' "$digest"; }
+  digest=$($sha_cmd <"$1" | { read -r digest _ && printf '%s' "$digest"; }) || die "could not hash $1"
+  case $digest in *[!0-9a-f]*) die "could not hash $1: the checksum tool printed '$digest'" ;; esac
+  [ ${#digest} -eq 64 ] || die "could not hash $1: the checksum tool printed '$digest'"
+  printf '%s' "$digest"
 }
 
 download() {
@@ -358,6 +364,7 @@ check_destination "$bin_dir"
 
 staged=$(mktemp "$canon_dir/.loadout.new.XXXXXX") || die "could not create a staging file in $canon_dir"
 cat "$new" >"$staged" && chmod 755 "$staged" || die "could not write $staged"
+staged_sha=$(sha256_of "$staged")
 staged_record=$(mktemp "$canon_dir/.loadout.install.toml.new.XXXXXX") ||
   die "could not create a staging file in $canon_dir"
 {
@@ -370,7 +377,7 @@ staged_record=$(mktemp "$canon_dir/.loadout.install.toml.new.XXXXXX") ||
   printf 'version = "%s"\n' "$installed_version"
   printf 'archive_sha256 = "%s"\n' "$want"
   printf 'binary = %s\n' "$(toml_string "$dest")"
-  printf 'binary_sha256 = "%s"\n' "$(sha256_of "$staged")"
+  printf 'binary_sha256 = "%s"\n' "$staged_sha"
 } >"$staged_record" && chmod 644 "$staged_record" || die "could not write $staged_record"
 
 mv -f "$staged" "$dest" || die "could not replace $dest; the previous binary is unchanged"
