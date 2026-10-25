@@ -3,13 +3,17 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use super::disk::{self, Disk, Mode, Node, Planned, Put};
-use super::journal::{self, Backup, BackupKind, Entry, Journal, Status, Step};
+use super::entry::{self, Edit};
+use super::journal::{self, Backup, BackupKind, Entry, Journal, Staged, Status, Step};
 use super::{
-    Error, Lock, Record, State, check_reserved, clean_absolute, digest, label, observed, path_of,
-    refuse_none, tree_files, valid_observed, within_roots,
+    Error, Lock, Record, State, check_reserved, clean_absolute, digest, entry_problem, hash, label,
+    observed, path_of, refuse_none, tree_files, valid_observed, within_roots,
 };
 use crate::context::Context;
+use crate::mcp;
 use crate::plan::{Action, Change, Content, Observed, Plan, Target};
 
 /// One apply: the journal in `<state>/runs/<id>/`, its backups, and the lock it holds.
@@ -20,7 +24,7 @@ pub struct Run {
     dir: PathBuf,
     journal: Journal,
     index: BTreeMap<Target, usize>,
-    _lock: Lock,
+    lock: Lock,
 }
 
 /// What `Run::remove` did with an owned target the loadout no longer declares.
@@ -88,6 +92,18 @@ impl Run {
                     message: format!("{} has an invalid prior", label(&action.target)),
                 });
             }
+            if let Some(problem) = entry_problem(&action.target) {
+                return Err(Error::InvalidContent {
+                    message: format!("{}: {problem}", label(&action.target)),
+                });
+            }
+            if matches!(action.target, Target::Entry { .. }) && action.change == Change::Replace {
+                return Err(Error::WrongChange {
+                    target: label(&action.target),
+                    change: "replace".to_owned(),
+                    operation: "an MCP entry write, which never overwrites a server loadout doesn't own",
+                });
+            }
             let position = entries.len();
             if index.insert(action.target.clone(), position).is_some() {
                 return Err(Error::Duplicate {
@@ -110,6 +126,8 @@ impl Run {
                 after: None,
                 created: Vec::new(),
                 error: None,
+                document: None,
+                rollback: None,
             });
         }
         let runs = disk::internal_dir(&root, &[journal::RUNS], true)?;
@@ -132,7 +150,7 @@ impl Run {
             dir,
             journal,
             index,
-            _lock: lock,
+            lock,
         })
     }
 
@@ -168,6 +186,9 @@ impl Run {
     pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), Error> {
         refuse_none(&action.target, "write")?;
         let index = self.entry(action, false)?;
+        if matches!(action.target, Target::Entry { .. }) {
+            return self.write_entry(index, action, content);
+        }
         let path = path_of(&action.target)?.to_path_buf();
         if matches!(content, Content::Entry(_)) {
             return Err(Error::InvalidContent {
@@ -199,7 +220,8 @@ impl Run {
         let result = disk::put(&real, &put, &tag, || {
             unchanged(&real, &prior, &action.target)
         });
-        self.settle(index, &real, result)
+        let expected = self.journal.entries[index].after.clone();
+        self.settle(index, result, || landed(&real, expected.as_ref()))
     }
 
     /// Deletes an owned target the loadout no longer declares, after backing it up. A target
@@ -207,6 +229,9 @@ impl Run {
     pub fn remove(&mut self, action: &Action) -> Result<Removal, Error> {
         refuse_none(&action.target, "remove")?;
         let index = self.entry(action, true)?;
+        if matches!(action.target, Target::Entry { .. }) {
+            return self.remove_entry(index, action);
+        }
         let path = path_of(&action.target)?.to_path_buf();
         let Some(record) = self.journal.entries[index].record.clone() else {
             return Err(Error::NotOwned {
@@ -232,7 +257,129 @@ impl Run {
         let tag = tag(&self.journal.run, index);
         let result =
             unchanged(&real, &prior, &action.target).and_then(|()| disk::remove(&real, &tag));
-        self.settle(index, &real, result).map(|()| Removal::Removed)
+        let expected = self.journal.entries[index].after.clone();
+        self.settle(index, result, || landed(&real, expected.as_ref()))
+            .map(|()| Removal::Removed)
+    }
+
+    /// One MCP server key, as one transaction (architecture section 5): the KeyMerge check, Grok's
+    /// lock held to the end, one read, the key's prior, a backup of that key's value only, the
+    /// edit, the staged document's hash journaled, then the atomic write that re-reads the whole
+    /// document just before its rename.
+    fn write_entry(&mut self, index: usize, action: &Action, content: &Content) -> Result<(), Error> {
+        let Content::Entry(value) = content else {
+            return Err(Error::InvalidContent {
+                message: format!(
+                    "{} is an MCP entry; only an entry value can be written to it",
+                    label(&action.target)
+                ),
+            });
+        };
+        let place = entry::place(&action.target)?;
+        entry::check(&self.context, &self.loadout, &place)?;
+        let real = disk::real(place.file)?;
+        let after = digest(content)?;
+        let _grok = mcp::lock(&self.context, &self.loadout, place.file)
+            .map_err(|source| entry::mcp_error(&action.target, source))?;
+        let document = entry::read(&place, &real)?;
+        let prior = self.journal.entries[index].prior.clone();
+        if entry::observed(document.value.as_ref()) != prior {
+            return Err(Error::Changed {
+                target: label(&action.target),
+            });
+        }
+        if after == prior {
+            return self.done_without_write(index, after);
+        }
+        // Ownership is the supplied record, whatever the action is labeled: a key that exists,
+        // has no record, and differs from what is wanted belongs to someone else.
+        if prior != Observed::Absent && self.journal.entries[index].record.is_none() {
+            return Err(Error::UnownedEntry {
+                target: label(&action.target),
+            });
+        }
+        let bytes = entry::edit(&place, &document.bytes, &Edit::Set(value))?;
+        self.start_entry(index, &document, after, &real, &bytes)?;
+        let tag = tag(&self.journal.run, index);
+        let result = entry::put(&real, &document, bytes, &tag, &action.target);
+        let expected = self.journal.entries[index].after.clone();
+        self.settle(index, result, || {
+            entry::holds(&place, &real, expected.as_ref())
+        })
+    }
+
+    /// Removes an owned MCP server key the loadout no longer declares, in the same transaction
+    /// as `write_entry`. A key that drifted from its record, or is already gone, is released.
+    fn remove_entry(&mut self, index: usize, action: &Action) -> Result<Removal, Error> {
+        let Some(record) = self.journal.entries[index].record.clone() else {
+            return Err(Error::NotOwned {
+                target: label(&action.target),
+            });
+        };
+        let place = entry::place(&action.target)?;
+        entry::check(&self.context, &self.loadout, &place)?;
+        let real = disk::real(place.file)?;
+        let _grok = mcp::lock(&self.context, &self.loadout, place.file)
+            .map_err(|source| entry::mcp_error(&action.target, source))?;
+        let document = entry::read(&place, &real)?;
+        let prior = self.journal.entries[index].prior.clone();
+        if entry::observed(document.value.as_ref()) != prior {
+            return Err(Error::Changed {
+                target: label(&action.target),
+            });
+        }
+        let owned = matches!(&prior, Observed::Present { sha256 } if *sha256 == record.sha256);
+        if !owned {
+            self.journal.entries[index].step = Step::Released;
+            self.journal.save(&self.dir)?;
+            return Ok(Removal::Released);
+        }
+        let bytes = entry::edit(&place, &document.bytes, &Edit::Remove)?;
+        self.start_entry(index, &document, Observed::Absent, &real, &bytes)?;
+        let tag = tag(&self.journal.run, index);
+        let result = entry::put(&real, &document, bytes, &tag, &action.target);
+        let expected = self.journal.entries[index].after.clone();
+        self.settle(index, result, || {
+            entry::holds(&place, &real, expected.as_ref())
+        })
+        .map(|()| Removal::Removed)
+    }
+
+    fn done_without_write(&mut self, index: usize, after: Observed) -> Result<(), Error> {
+        let entry = &mut self.journal.entries[index];
+        entry.step = Step::Done;
+        entry.after = Some(after);
+        self.journal.save(&self.dir)
+    }
+
+    /// Backs up the owned key's value, if it had one, and journals the staged document's
+    /// identity before anything is staged.
+    fn start_entry(
+        &mut self,
+        index: usize,
+        document: &entry::Document,
+        after: Observed,
+        real: &Path,
+        staged: &[u8],
+    ) -> Result<(), Error> {
+        if let Some(value) = &document.value {
+            let backup = self.journal.entries[index].backup.clone().ok_or_else(|| {
+                Error::InvalidContent {
+                    message: format!("{} has no backup slot", real.display()),
+                }
+            })?;
+            let taken = take_value_backup(&self.dir, &backup.path, value)?;
+            self.journal.entries[index].backup = Some(taken);
+        }
+        let entry = &mut self.journal.entries[index];
+        entry.step = Step::Started;
+        entry.after = Some(after);
+        entry.created = real.parent().map(disk::missing_dirs).unwrap_or_default();
+        entry.document = Some(Staged {
+            base: hash::document(&document.bytes),
+            staged: hash::document(staged),
+        });
+        self.journal.save(&self.dir)
     }
 
     /// Takes the backup and records the planned result before the target is touched.
@@ -265,13 +412,9 @@ impl Run {
     fn settle(
         &mut self,
         index: usize,
-        real: &Path,
         result: Result<(), Error>,
+        landed: impl FnOnce() -> bool,
     ) -> Result<(), Error> {
-        let landed = || {
-            let entry = &self.journal.entries[index];
-            disk::read(real).is_ok_and(|now| Some(observed(now.as_ref())) == entry.after)
-        };
         let reached = result.is_ok() || landed();
         let entry = &mut self.journal.entries[index];
         match result {
@@ -301,8 +444,20 @@ impl Run {
 
     /// Records ownership for every action that reached the disk, drops the records of removed
     /// and released targets, and marks the run finished. Actions that never ran keep their
-    /// old records.
-    pub fn finish(mut self, state: &mut State) -> Result<(), Error> {
+    /// old records. Releases the state lock.
+    pub fn finish(self, state: &mut State) -> Result<(), Error> {
+        self.finish_with_lock(state).1
+    }
+
+    /// `finish`, but hands back the state lock, whether or not finishing succeeded, so the caller
+    /// can keep everything after the file actions (program installs, the report) under the same
+    /// lock without taking it again.
+    pub fn finish_with_lock(mut self, state: &mut State) -> (Lock, Result<(), Error>) {
+        let result = self.close(state);
+        (self.lock, result)
+    }
+
+    fn close(&mut self, state: &mut State) -> Result<(), Error> {
         for entry in &self.journal.entries {
             match (entry.step, &entry.change, &entry.after) {
                 (Step::Done, Change::Remove, _) | (Step::Released, _, _) => {
@@ -324,6 +479,11 @@ impl Run {
         self.journal.status = Status::Finished;
         self.journal.save(&self.dir)
     }
+}
+
+/// Whether a path target now holds the planned result.
+fn landed(real: &Path, expected: Option<&Observed>) -> bool {
+    disk::read(real).is_ok_and(|now| Some(&observed(now.as_ref())) == expected)
 }
 
 /// Re-reads the target just before it is replaced, so a change in the last moment still aborts.
@@ -388,6 +548,30 @@ fn planned(content: &Content, current: Option<&Disk>) -> Result<Put, Error> {
             message: "an MCP entry is not file content".to_owned(),
         }),
     }
+}
+
+/// Backs up one MCP server's value as canonical JSON, private, in this action's own slot. The
+/// shared document holding it is never copied, so other servers' and the agent's own keys (such
+/// as Claude's `oauthAccount`) never reach the state dir.
+fn take_value_backup(run: &Path, relative: &str, value: &Value) -> Result<Backup, Error> {
+    let path = run.join(relative);
+    if fs::symlink_metadata(&path).is_ok() {
+        return Err(Error::Invalid {
+            path,
+            message: "a backup is already in this slot; loadout never overwrites one".to_owned(),
+        });
+    }
+    let planned = Planned {
+        bytes: hash::canonical_json(value),
+        mode: Mode::Exact(0o600),
+    };
+    disk::put(&path, &Put::File(planned), "backup", || Ok(()))?;
+    Ok(Backup {
+        path: relative.to_owned(),
+        kind: BackupKind::Entry,
+        modes: BTreeMap::new(),
+        dirs: BTreeMap::new(),
+    })
 }
 
 fn take_backup(run: &Path, relative: &str, current: &Disk) -> Result<Backup, Error> {

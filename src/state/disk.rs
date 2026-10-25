@@ -129,6 +129,63 @@ pub(super) fn read(path: &Path) -> Result<Option<Disk>, Error> {
     Ok(Some(Disk::Tree { dirs, files }))
 }
 
+/// Reads one shared document, such as an MCP config, as a single regular file. Unlike `read`,
+/// it never lists or reads a folder: a folder is `NotADocument` and a FIFO, socket, or device is
+/// `Special`, both decided from metadata before any open. On Unix the open is non-blocking, so a
+/// file swapped for a FIFO after the check can't hang, and the opened handle must be the same
+/// regular file that was checked. A missing document, or a link to a missing one, is `None`.
+pub(super) fn read_document(path: &Path) -> Result<Option<Node>, Error> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io("inspect", path)(error)),
+    };
+    if metadata.is_dir() {
+        return Err(Error::NotADocument {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(Error::Special {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, O_NONBLOCK);
+    let mut file = options.open(path).map_err(io("open", path))?;
+    let opened = file.metadata().map_err(io("inspect", path))?;
+    if !opened.is_file() || !same_file(&metadata, &opened) {
+        return Err(Error::Changed {
+            target: path.display().to_string(),
+        });
+    }
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut file, &mut bytes).map_err(io("read", path))?;
+    Ok(Some(Node {
+        bytes,
+        mode: mode_of(&opened),
+    }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NONBLOCK: i32 = 0x0004;
+
+#[cfg(unix)]
+fn same_file(checked: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    checked.dev() == opened.dev() && checked.ino() == opened.ino()
+}
+
+/// Windows has no stable file identity in std, so only the opened handle's type is checked.
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    true
+}
+
 fn walk(
     dir: &Path,
     prefix: &str,
@@ -678,6 +735,45 @@ pub(super) fn read_internal(path: &Path, within: &Path) -> Result<Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_document_reads_one_regular_file_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        assert!(read_document(&path).unwrap().is_none());
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_document(&path).unwrap().unwrap().bytes, b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_in_a_documents_place_is_refused_without_listing_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("marker"), b"untouched").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+        let error = read_document(&path).unwrap_err();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(error, Error::NotADocument { .. }),
+            "listing the unreadable folder would have been an I/O error: {error}"
+        );
+        assert_eq!(fs::read(path.join("marker")).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_in_a_documents_place_is_refused_without_opening_it() {
+        let dir = tempfile::Builder::new()
+            .prefix("lo")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("mcp.json");
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(matches!(read_document(&path), Err(Error::Special { .. })));
+    }
 
     #[test]
     fn mode_rule_keeps_read_write_bits_and_gives_x_only_where_readable() {

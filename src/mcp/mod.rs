@@ -14,7 +14,7 @@ use crate::manifest::{EnvSyntax, McpFormat, McpShape};
 use crate::reserved::{self, Merge, Use};
 use crate::resolve::McpServer;
 
-pub use lock::{Lock, lock};
+pub use lock::{Lock, LockId, acquire, lock, lock_id};
 
 pub type Servers = BTreeMap<String, serde_json::Value>;
 

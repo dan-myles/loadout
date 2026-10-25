@@ -110,7 +110,7 @@ template                       -> resolve, machine
 mcp                            -> manifest, resolve, reserved, context
 agents                         -> manifest, resolve, mcp, reserved, plan (types), context, diagnostic, platform
 programs                       -> manifest, resolve, machine, context, diagnostic
-state                          -> context, plan (types)
+state                          -> context, plan (types), reserved, mcp
 plan                           -> resolve, template, agents, programs, state, context, diagnostic
 apply                          -> plan, state, programs, context
 sync                           -> context, manifest, diagnostic
@@ -549,7 +549,7 @@ reserved check and any read. Membership compares path identities by whole compon
 - **Two forms on each side.** A target belongs when its lexical form, or its physical form, equals
   or lies inside the lexical or physical form of a root. The physical form is
   `reserved::normalize`: existing ancestors are canonicalized, and it only stats and reads links.
-  A path that can't be normalized contributes only its lexical form. Normalizing never adds an
+  A path that can't be normalized contributes only its lexical form. Failed normalization never adds an
   acceptance.
 - **Windows spellings.** `\\?\C:\…` and `C:\…` are one drive, and `\\?\UNC\srv\share\…` and
   `\\srv\share\…` are one share. ASCII letters in names compare case-insensitively. A configured
@@ -722,6 +722,14 @@ delegated defaults.
     fails after the new content is already in place is marked `done`.
   - `Run::finish` records ownership for every action that reached the disk, and must run even
     when some actions failed. A `Run` dropped without `finish` leaves an interrupted run.
+    `Run::finish_with_lock` does the same and hands back the state lock, on success and on
+    failure, so U4 can keep holding it; `finish` is `finish_with_lock` with the lock dropped.
+  - `Lock::check(context)` tells a caller holding a lock, read-only, whether it guards
+    `context`'s state dir, compared as `Run::begin` compares them. It creates no folder, opens
+    no file, takes no lock, and leaves the lock held, so U4 checks the lock it was handed before
+    work that may never begin a `Run` (a no-op or program-only plan). A missing or unresolvable
+    state dir is an error, never created. `Run::begin` keeps its own check, after its `None`
+    guard and before any other I/O.
 
   **Durability.** On Unix, every staged file is fsynced, and so is every staged folder. Every
   folder whose entries change is fsynced after the change: the target's parent after each rename
@@ -786,21 +794,107 @@ delegated defaults.
   `in-progress` when another process holds the lock, or unreadable with its error). It exits 4 when
   a record isn't `ok`, or when a run is interrupted or unreadable. The audit uses the default
   checkout `<state>/loadout` as the reserved active checkout.
-- **MCP entries: interim guard (U3), entry transaction follow-up required.** U3 ships the
-  `mcp-entry` hash and per-key `Target::Entry` records. Until the follow-up lands, `observe`,
-  `Run::write`, and `Run::remove` refuse a `Target::Entry` with `state::Error::EntryNeedsMcp` and
-  write nothing, and `status` shows such a record as `unchecked`. This is not the v1 entry feature.
-  `Target::Entry` now carries `shape: McpShape` (U5), so the follow-up has what it needs. It then consumes U6's
-  byte API, with state owning the transaction:
-  1. `reserved::check_path` with `KeyMerge`.
-  2. `mcp::lock(context, loadout, file)`: Grok's `.config-init.lock`, held to the rename.
-  3. One read, then `mcp::parse` and a check of that key's `prior`.
-  4. A backup of that key's value only. The whole shared file is never backed up, since
-     `.claude.json` holds `oauthAccount`.
-  5. `mcp::edit(bytes, format, pointer, shape, set, remove)`.
-  6. A re-read just before the rename, and abort if the bytes moved.
-  7. The atomic write, keeping the mode and links.
-  8. Rollback restores or removes that one key the same way.
+- **MCP entries (built, U3).** An MCP server is a `Target::Entry { file, format, pointer, key,
+  shape }`: one key in an agent's shared config, owned per key. State owns the transaction and
+  imports `mcp`; `mcp` never imports state. `state::Error::EntryNeedsMcp`, the interim refusal, is
+  gone.
+  - **Observe** (plan, status): roots, then `reserved::check_path` with `Use::KeyMerge(Merge {
+    map: pointer, format, shape })` before any read, then one read of the real document,
+    `mcp::parse`, and the key's `hash::entry`. It takes no lock, so plan and status never create
+    Grok's lock file.
+  - **Reading a document.** `disk::read_document` reads one regular file. A folder is
+    `Error::NotADocument` and a FIFO, socket, or device is `Error::Special`, both from metadata
+    before any listing or open. On Unix the open is non-blocking, so a file swapped for a FIFO
+    after the check can't hang, and the opened handle must be the same file (device and inode)
+    that was checked; Windows re-checks only that it is a regular file. The generic tree read
+    never serves documents.
+  - **Write and remove, one key per transaction** (several keys in one document are separate
+    transactions in plan order):
+    1. Roots and the `KeyMerge` check.
+    2. `mcp::lock(context, loadout, file)`, after the state lock, held until the action is
+       journaled done (Grok's `.config-init.lock`; nothing for other agents).
+    3. One read, then `mcp::parse` and the key's `prior`, else `Changed`. A remove of a key that
+       drifted from its record, or is already gone, is released and left.
+    4. An equal value (an adopt, or an equal update) is done with no write: the journal keeps
+       a `pending` backup and no `document`.
+    5. **Ownership is the record, not the label.** A key that exists, has no record, and differs
+       from the wanted value is `Error::UnownedEntry` (blocked, exit 4) whatever the action is
+       labeled (`adopt`, `update`, `drifted`, `create`), before any edit, backup, or `started`.
+       A key that no longer holds `prior` is `Changed` first.
+    6. `mcp::edit(bytes, format, pointer, shape, set, remove)` with that one key.
+    7. A backup of the owned key's value only, as canonical JSON (journal backup kind `entry`).
+       The shared document is never copied, so other servers and agent-written keys such as
+       Claude's `oauthAccount` never reach the state dir.
+    8. The journal records `started`, `after`, and `document { base, staged }`, the
+       `hash::document` of the bytes read and of the bytes about to be staged, before anything
+       is staged.
+    9. The staged, fsynced, atomic `disk::put`. Its verify reads the whole document again just
+       before the rename and requires exactly the bytes read in step 3 (or still no document).
+       An existing document keeps its exact mode and its symlink. **A newly created document is
+       0600**: an explicit privacy choice, since agents later write their own state into these
+       files.
+  - **Replace is refused** for an entry at `Run::begin` (`WrongChange`, a contract fault, exit 1):
+    a server name loadout doesn't own is never overwritten, so a planner never asks. `drifted`
+    (with `--force`) applies to an owned key and backs up the drifted value. The planner labels
+    an unequal unowned key `blocked`; `UnownedEntry` is state's own guard if it doesn't.
+  - **Journal entries match what happened.** An entry that `started`, `failed`, or finished
+    `done` with an `after` other than its `prior` actually edited its document, so it must carry
+    `document`, and if its key existed before, a backup of kind `entry` (not `pending`). A
+    `pending` or `released` entry, or a `done` one whose `after` equals `prior`, edited nothing
+    and carries neither staged hashes nor an `entry` backup. Path entries never carry them, and
+    entries never carry a `file` or `tree` backup. Anything else is `Error::Invalid` before
+    rollback changes anything. Journals from before entries keep loading.
+  - **Rollback**, per key: only the owned key decides. It is restored when it still holds
+    `after`, kept when it already holds `prior`, and otherwise blocks the whole rollback. Other
+    keys changed since the run never block and are kept, because the restore edits the
+    document's current bytes.
+    - **Grok locks first.** After the state lock, the validated journal, and the state file,
+      rollback finds the lock of every Grok config among the entries it could restore (the
+      `GROK_HOME` override and `~/.grok` are two; aliases of one config are one, by
+      `mcp::LockId`), orders them by that same identity (never by the spelling a path happens
+      to keep, so two rollbacks naming one home differently still take the locks in one order),
+      and takes them all before preflight and before any target or scratch is touched. An
+      entry failing its reserved check is skipped here and blocks in preflight. They are held
+      until rollback returns, and released if any can't be taken (blocked, exit 4). Restores
+      never take a lock themselves, so aliases can't deadlock. Taking a lock may create
+      Grok's home and its `.config-init.lock`, even when rollback then blocks: that lock
+      metadata is the one write outside the unchanged-destination guarantee. Observe, `audit`,
+      and `status` take no lock.
+    - **Preflight checks this rollback's restores together.** Before anything changes,
+      preflight reads every entry's current document. Then, per physical document (told apart
+      by resolved path identity, so every alias of one document counts as one) and in the
+      order the restores will run, it checks in memory that each restore finds its key as
+      preflight saw it and is an edit `mcp` will make on the document as the earlier restores
+      leave it. So a document that can't take an edit (a Muse `schema_version` other than 1,
+      mixed newlines, a map that is no longer a table), and a restore that only an earlier
+      restore makes impossible (two Pi names that collide once both are back), both block the
+      whole rollback with every target unchanged. Document and environment problems are
+      blocked; I/O and contract faults, including a document path that can't be resolved,
+      keep their exit 1. The simulated bytes are only checked, never written. Changes made by
+      others after preflight are not covered: the restore below rechecks.
+    - **The restore recomputes.** Each key's restore reads the document again, requires the key
+      to hold what preflight saw (else `Changed`), edits those current bytes, journals a fresh
+      `rollback { base, staged }`, and verifies only across its own read-to-rename window. A
+      whole-document comparison with preflight would block on unrelated edits, so there is
+      none.
+    - The backup must be this run's own slot, one JSON value hashing to `prior`. A document the
+      run created stays after rollback, holding an empty map (and Muse's `schema_version`).
+  - **Scratch.** A scratch name beside a document is never followed: a link is refused before
+    anything reads through it. The run's `.tmp` or rollback's `-rollback.tmp` counts as
+    loadout's own only if it is a regular file whose exact bytes hash to the `staged` value
+    journaled before it was staged. Anything else, including a document holding the same key
+    with other bytes, is kept and reported. When rollback needs that name, it blocks before any
+    change. These hashes check bytes against the recorded intent. They don't authenticate a
+    journal the state dir's owner rewrote; a changed hash only makes loadout refuse.
+  - **Errors.**
+    - `Error::Mcp { target, source: mcp::Error }` and `Error::NotADocument` are blocked (exit
+      4) when the document or its surroundings are the problem: unparseable, duplicate or
+      unrepresentable keys, mixed newlines, a Muse schema or Pi name loadout won't write, a
+      folder in its place, or Grok holding its lock.
+    - Pointer, shape/format, and I/O faults are not blocked (exit 1).
+    - `Error::UnownedEntry` is blocked: a fact about the machine, not a broken contract.
+    - An entry with an invalid pointer, an empty key, or a shape written in another format is
+      invalid in `Run::begin`, `state.json`, and journals.
 
 ## 6. Agents (built: U5 adapters, U6 MCP)
 
@@ -1234,7 +1328,10 @@ pub fn entry(server: &McpServer, shape: McpShape, env: EnvSyntax) -> Result<serd
 pub fn parse(bytes: &[u8], format: McpFormat, pointer: &str) -> Result<Servers, mcp::Error>;      // empty bytes = absent file
 pub fn edit(bytes: &[u8], format: McpFormat, pointer: &str, shape: McpShape, set: &Servers, remove: &[String]) -> Result<Vec<u8>, mcp::Error>; // new bytes; preserves everything else
 pub fn read(context: &Context, loadout: &Path, file: &Path, format: McpFormat, pointer: &str, shape: McpShape) -> Result<Servers, mcp::Error>; // check_path(KeyMerge) before any open
-pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::Lock>, mcp::Error>; // Some only for Grok's config.toml
+pub fn lock(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::Lock>, mcp::Error>; // Some only for Grok's config.toml; lock_id then acquire
+pub fn lock_id(context: &Context, loadout: &Path, file: &Path) -> Result<Option<mcp::LockId>, mcp::Error>; // the same lookup and KeyMerge check, nothing created or taken
+pub fn acquire(id: &mcp::LockId) -> Result<mcp::Lock, mcp::Error>;   // may create Grok's home and .config-init.lock; ~1 s of retries
+// LockId: Clone + Eq + Ord, equal when two paths name one Grok home (lossless identity; case-folded on Windows only), and ordered by that same identity, never by the kept spelling; LockId::path() is its lock file
 // plan::Target::Entry carries `shape: McpShape` (U5) so state runs the exact KeyMerge check and calls edit with it.
 
 // agents (built, U5). `facts` was dropped (context is the one OS input) and `loadout`, the active checkout, added.
@@ -1251,15 +1348,17 @@ pub fn checks(context: &Context) -> Vec<Check>;
 impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; pub fn records(&self) -> impl Iterator<Item = &Record>; }
 pub struct Record { pub target: Target, pub item: ItemRef, pub sha256: String, pub run: String }
 pub fn lock(context: &Context) -> Result<Lock, state::Error>;          // Error::Locked when another run holds it
+impl Lock { pub fn check(&self, context: &Context) -> Result<(), state::Error>; } // read-only: the existing canonical state dir must be the locked one (aliases pass), else WrongLock; missing/unresolvable is Io, not a folder is Invalid; creates, opens and takes nothing, lock stays held
 pub fn busy(context: &Context) -> Result<bool, state::Error>;           // probe only; never creates
 pub fn digest(content: &Content) -> Result<Observed, state::Error>;     // desired side of the one hash definition
-pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, state::Error>; // reserved check first; disk side
+pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, state::Error>; // reserved check first; disk side; an Entry by key, KeyMerge, no lock
 impl Run {
     pub fn begin(context: &Context, loadout: &Path, lock: Lock, state: &State, plan: &Plan) -> Result<Run, state::Error>;
     pub fn id(&self) -> &str;
-    pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), state::Error>;   // create/update/adopt/replace/drifted
+    pub fn write(&mut self, action: &Action, content: &Content) -> Result<(), state::Error>;   // create/update/adopt/replace/drifted; an Entry: one key, never replace
     pub fn remove(&mut self, action: &Action) -> Result<Removal, state::Error>;              // Removed | Released
     pub fn finish(self, state: &mut State) -> Result<(), state::Error>;
+    pub fn finish_with_lock(self, state: &mut State) -> (Lock, Result<(), state::Error>); // the lock back on success and on error
 }
 // Run::write and Run::remove re-observe and return Error::Changed { target } when the result != prior
 pub fn rollback(context: &Context, run: Option<&str>) -> Result<RolledBack, state::Error>; // RolledBack { run, restored: Vec<Target>, leftovers: Vec<PathBuf> }
