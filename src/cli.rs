@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{doctor, rollback, status, validate};
+use crate::commands::{apply, doctor, plan, rollback, status, validate};
 use crate::context::Context;
 
 #[derive(Debug, Parser)]
@@ -27,6 +27,10 @@ pub enum Command {
     Status(status::Args),
     /// Undo a run: restore its backups and delete what it created
     Rollback(rollback::Args),
+    /// Show what apply would change on this machine, without changing anything
+    Plan(plan::Args),
+    /// Bring this machine in line with the loadout
+    Apply(apply::Args),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,5 +70,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
         Command::Validate(args) => validate::run(&args, &context),
         Command::Status(args) => status::run(&args, &context),
         Command::Rollback(args) => rollback::run(&args, &context),
+        Command::Plan(args) => plan::run(&args, &context),
+        Command::Apply(args) => apply::run(&args, &context),
     }
 }

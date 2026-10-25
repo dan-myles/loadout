@@ -10,8 +10,12 @@ Runs on pushes to `main`, every pull request, and manual dispatch.
 | Job | Runner | Command |
 |-----|--------|---------|
 | rustfmt | ubuntu-24.04 | `cargo fmt --all --check` |
-| clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked` |
+| clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --workspace --all-targets -- -D warnings`, then `cargo test --locked --workspace` |
 | release packaging tests | ubuntu-24.04, Python 3.8 and 3.12 | `python -m unittest discover -s scripts/release -v` |
+
+`--workspace` also lints and tests `crates/loadout-winproc`, the Windows-only helper that holds
+the workspace's only `unsafe` code; elsewhere it compiles to an empty crate. Without
+`--workspace`, cargo selects only the root `loadout` package.
 
 Every job runs `rustup toolchain install --no-self-update`, which installs the exact toolchain
 and components pinned in `rust-toolchain.toml`. Bump that file to move CI and releases to a new
@@ -96,7 +100,8 @@ python3 scripts/release/package.py --target x86_64-unknown-linux-musl
 # -> target/dist/loadout-x86_64-unknown-linux-musl.tar.gz and .sha256
 ```
 
-The script runs `cargo build --release --locked --target <target> --bin loadout`, runs
+The script runs `cargo build --release --locked --target <target> --bin loadout` (the root
+package, with `loadout-winproc` built as its Windows dependency), runs
 `loadout --version` when the host can execute the target, and writes the archive and checksum.
 Pass `--out-dir DIR` to write somewhere else, `--expect-version X.Y.Z` to repeat the tag check, and
 `--require-smoke` to fail instead of skipping the smoke test.

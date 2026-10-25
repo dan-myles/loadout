@@ -64,7 +64,9 @@ fn help_lists_only_working_commands() {
     assert!(help.contains("validate"), "{help}");
     assert!(help.contains("status"), "{help}");
     assert!(help.contains("rollback"), "{help}");
-    for future in ["apply", "plan", "update", "service", "init"] {
+    assert!(help.contains("plan"), "{help}");
+    assert!(help.contains("apply"), "{help}");
+    for future in ["update", "service", "init"] {
         assert!(
             !help
                 .lines()
@@ -86,7 +88,7 @@ fn version_prints_package_version() {
 
 #[test]
 fn unknown_command_is_a_usage_error() {
-    let output = Sandbox::new().run(&["apply"]);
+    let output = Sandbox::new().run(&["frobnicate"]);
     assert_eq!(output.status.code(), Some(2));
 }
 

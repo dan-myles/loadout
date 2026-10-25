@@ -26,6 +26,16 @@ async would buy v1 nothing.
 | `minijinja` | templates (U2). Pinned `=3.0.3`, default features off; only `builtins`, `debug`, and `unstable_machinery` |
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
 | `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
+| `process-wrap` (std, job-object, creation-flags; Windows only) | programs: each query runs in a job object, killed as a whole (U7) |
+| `loadout-winproc` (local, `publish = false`; Windows only) | programs: resumes a query created suspended, once loadout owns its job (U7) |
+| `nix` (`signal`; Unix only) | programs: signals the query's process group and confirms it is empty (U7) |
+
+`loadout-winproc` (`crates/loadout-winproc`, a workspace member) is the workspace's only `unsafe`
+code: one safe operation in two steps, `prepare` (find, open and check the child's one thread)
+and `Prepared::resume_before(deadline)`, over `windows` 0.62 (already in the lock through
+`process-wrap`). It denies `unsafe_op_in_unsafe_fn`, gives every `unsafe` block one call and a
+`SAFETY` comment, and owns every handle it opens. The `loadout` crate keeps
+`unsafe_code = "forbid"`. Nothing else goes in that crate: it is not a general Windows wrapper.
 
 A unit adds a dependency only for the module that needs it, and names it in its PR. Expected
 additions: `minijinja` (template), `toml_edit` plus a comment-preserving JSONC editor (mcp), `sha2`
@@ -79,21 +89,28 @@ src/
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
   resolve/                mod.rs (API, Resolved), merge.rs (layer folding), finish.rs (agents,
                           transports, reach), paths.rs (Windows, collisions, reserved), all.rs [built, U1]
-  plan/mod.rs             Desired, Content, Target, Action, Plan            [types: foundation; build(): U4]
+  plan/                   mod.rs (types, build, Steps), files.rs (user files and templates),
+                          compare.rs (one-hash classification, removals), identity.rs (where
+                          destinations lead, MCP addresses), install.rs (program actions), volume.rs
+                          (read-only case proof), check.rs (Plan::check)
+                                                                            [types: foundation; build: U4 source]
   commands/
     doctor.rs             loadout doctor                                    [foundation, contended]
     validate.rs           loadout validate                                  [foundation; U1/U2 extend]
-    plan.rs, apply.rs                                                       [U4]
+    plan.rs, apply.rs     loadout plan, loadout apply                       [U4 source]
     status.rs, rollback.rs                                                  [built, U3]
     update.rs, service.rs                                                   [U8]
     init.rs                                                                 [U9]
   template/               mod.rs (API), strict.rs (guards), builtins.rs     [built: U2]
   state/                  hash, disk, journal, run, rollback                [built, U3]
-  apply/                                                                    [U4]
-  agents/                 mod.rs (materialize, checks), table.rs (adapters), source.rs (skill and
-                          instructions sources), collide.rs (destination collisions), doctor.rs [built, U5]
+  apply/                  mod.rs (run, run_under_lock, Options, Mode, Report)  [U4 source]
+  source/                 mod.rs (the guarded checkout reader: user files, skills, instructions)
+                                                                            [U5 policy, moved by U4]
+  agents/                 mod.rs (materialize, checks), table.rs (adapters), collide.rs
+                          (destination collisions), doctor.rs               [built, U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [built: U6]
-  programs/                                                                 [U7]
+  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries),
+                          process.rs (subprocesses)                         [built, U7]
   sync/                   git clone/fetch, background service               [U8]
   release/                self-update                                       [U9]
 ```
@@ -109,17 +126,18 @@ manifest                       -> platform, machine, context (path syntax), diag
 resolve                        -> manifest, machine, context, reserved, platform, diagnostic
 template                       -> manifest (Loadout, Variable, Guard, source_guard), machine, context, diagnostic
 mcp                            -> manifest, resolve, reserved, context
-agents                         -> manifest, resolve, mcp, reserved, plan (types), context, diagnostic, platform
+source                         -> manifest (git_metadata_guarded), reserved, plan (types), context
+agents                         -> manifest, resolve, mcp, reserved, source, plan (types), context, diagnostic, platform
 programs                       -> manifest, resolve, machine, context, diagnostic
 state                          -> context, plan (types)
-plan                           -> resolve, template, agents, programs, state, context, diagnostic
-apply                          -> plan, state, programs, context
+plan                           -> manifest, machine, resolve, template, agents, programs, source, state, reserved, context, diagnostic, platform
+apply                          -> plan, state, programs, context, diagnostic
 sync                           -> context, manifest, diagnostic
 release                        -> context, diagnostic
 ```
 
-`plan/mod.rs` holds only data types until U4 adds `build`. `agents` and `state` import those
-types and never call `plan::build`, which keeps the graph acyclic. `mcp` imports no `plan` type.
+`agents` and `state` import only `plan`'s data types and never call `plan::build`, which keeps
+the call graph acyclic. `mcp` imports no `plan` type.
 
 ### Contended files
 
@@ -785,7 +803,7 @@ targets under an override that is no longer set are refused.
   time order and the newest run is the greatest id. Rollback accepts only a name that matches a run
   folder exactly, so a run argument can't name a path.
 
-## 5. Apply lifecycle (state built by U3; plan and apply frozen, U4)
+## 5. Apply lifecycle (state built by U3; plan and apply source, U4)
 
 Settles the [Apply lifecycle](./wayfinder/loadout-v1/tickets/04-apply-lifecycle.md) ticket as
 delegated defaults.
@@ -986,6 +1004,78 @@ delegated defaults.
   `in-progress` when another process holds the lock, or unreadable with its error). It exits 4 when
   a record isn't `ok`, or when a run is interrupted or unreadable. The audit uses the default
   checkout `<state>/loadout` as the reserved active checkout.
+- **Plan and apply (U4, source; unexecuted).**
+  - **Producers.** User files are U4's.
+    - Each target is expanded with `Context::expand` and checked with `reserved::check_path(Write)` before its source is read. A conflict is an `unsupported` action with that target.
+    - Sources are read through `source::Sources`, U5's guarded reader moved to a shared subject. It applies the same confinement, the same Git-pointer guard, and `check_source_file` on the reached and canonical identity before any open.
+    - A user file or template keeps its source's execute bit on Unix. Agent instructions clear it.
+    - A `.tmpl` source must be UTF-8, and every template renders before any action exists. A missing variable, a refused source, or any producer or `materialize` error is `plan::Error::Invalid` (exit 3) with nothing written. Diagnostics carry paths, never content.
+  - **One hash.** `d = state::digest(content)`, `h = state::observe(target)`, `r` = the record:
+
+    | Disk | Record | Change |
+    | --- | --- | --- |
+    | absent | none | `create` |
+    | absent | some | `drifted` |
+    | `d` | none | `adopt` |
+    | `d` | `d` | `unchanged` |
+    | `d` | other | `update` |
+    | other | `h` | `update` |
+    | other | other | `drifted` |
+    | other | none | `replace` for a path; for an MCP entry, `blocked`, never `replace`, `--force` included |
+
+    An owned target the loadout no longer declares is `remove`. A blocked entry keeps the observation it was planned from, and carries no content.
+  - **Identity.** Every concrete destination (declared writers, unsupported and blocked declarations, and owned records) is compared as written and as `reserved::normalize` resolves it (lossless, case folded only on Windows, as state's target roots are). So a stable folder link such as `~/alias -> ~/real` makes `~/alias/tool` and `~/real/tool` one place.
+    - Two MCP entries that share a document stay apart only when they declare the same format and neither key's address is the other's or inside it. The address follows U5's rule exactly: the map pointer's parts decoded `~1` then `~0`, then the key, with `_` read as `-` for Pi. U4 keeps a private copy of that rule until a shared home below both callers exists. There is no shape rule.
+    - Roles decide what a relation means:
+      - Two declared writers that are one destination, or one inside the other, are invalid before any write (exit 3), whether or not their bytes agree. Possibly one: both `blocked`.
+      - A removal that reaches, or might reach, any declared destination (unsupported and blocked ones included) or another removal is `blocked`.
+      - An unsupported declaration writes nothing and conflicts with no writer.
+    - **Migrations** are judged on the stored key, not on each shape's logical address. The stored key is the decoded map pointer and the key exactly as written, with nothing folded, so a Cursor `my_docs` and a Pi `my_docs` are one stored key.
+      - **Every** ownership record owns its stored key, whether or not its exact target is still declared (as an ordinary or an unsupported item). A declared key with the same stored key in one document, or possibly one, under another format or shape, is a migration, and that declaration is `blocked`.
+      - A record the loadout no longer declares is not removed when its file, map, and key are declared as written under another contract (one action for that identity). Reached only through a link or a case spelling, its removal is `blocked` too.
+
+      - A record whose exact target is declared but unsupported here is kept the same way, migration or not: nothing writes its key, but the record stays, and so does what it owns. A record still declared as an ordinary writer needs no retained copy, because that writer carries its contract.
+
+      Either way the record stays as it is (loadout never converts ownership) and is kept as **retained ownership** under its OLD format and shape. That retained ownership protects its place: a writer or removal that conflicts with it under the old contract is `blocked`, such as a sibling written in a new format beside an old JSON key. A blocked migrating declaration still counts against other writers, but its new contract never stands in for the retained one, so an old sibling compatible with the old contract is judged against that.
+    - Every block, migration ones included, keeps a reason the action already has (such as an earlier refusal) and appends each new reason once. Unsupported actions are never changed. A blocked action carries no content, and its prior stays what was observed.
+    - A place that can't be resolved blocks that writer, and blocks every removal, since none can be shown to stay clear of it. A retained ownership whose place can't be resolved protects nothing beyond that: writers at other places can't be related to it.
+    - No hard link, bind mount, or link changed after the plan is covered.
+
+    `observe` errors map like this:
+    - `Reserved` is `unsupported` for a declared target and `blocked` for a removal.
+    - `Special`, and on a base without the entry transaction `EntryNeedsMcp`, is `blocked`.
+    - Anything else is exit 1.
+  - **Programs.** `Installed` becomes `unchanged` with prior `Installed`. `Missing` becomes `install`, or `blocked` when it needs `--elevated` the run lacks, with its real `Target::Program`. `Unsupported` and `Blocked` steps have no package, so they get `Target::None`. Two programs that pick one manager and package on this machine are exit 3.
+  - **Case check** (Linux and macOS, where a folder can be either way). Two destinations whose written or resolved paths differ only by case (or one inside the other) are asked about at each component where their spellings differ. The nearest existing folder decides, read-only: a child with an ASCII letter is statted under both spellings.
+    - Same `(dev, ino)`: insensitive.
+    - The swapped spelling missing, or a different file: sensitive.
+    - No usable child, or any error: unproven.
+    - Insensitive at every difference: one destination. Any sensitive folder: apart. Otherwise: possibly one. The roles above then apply, and compatible distinct MCP keys stay apart either way.
+    - A parent is never asked about its child, and the OS default is never taken as proof.
+    - On Windows, ASCII case is already folded in the identity, and nothing read-only can prove more.
+  - **`Plan::check`** runs inside `build` and again in apply:
+    - `Target::None` only with `unsupported`/`blocked`, prior `Absent`, and no content.
+    - A program action only with `install`, `unchanged`, `blocked`, or `unsupported`, a fitting prior, and no content.
+    - A write only with content of its target's kind.
+    - No entry `replace`.
+    - An `unsupported` path or entry observes nothing; a `blocked` one may keep what it observed.
+    - No concrete identity twice: a path, an entry's file, pointer, and key, or a manager and package. `None` has no identity.
+    - A failure is an internal error, exit 1.
+  - **Apply.** `run` builds a read-only preflight first, so an invalid loadout, a missing variable, or an interrupted run leaves no state dir and no lock. It then takes `state::lock` and calls `run_under_lock`, which every route uses.
+    - `run_under_lock` first checks that the lock it was given is the one for `context`'s state dir (`Lock::check`), before any state, plan, manager, or target work. This covers every route, including a no-op or program-only run that never starts a `Run`.
+    - An invalid loadout found under the lock leaves no destination written; only taking the lock may have created the state dir and its lock file.
+    - Under the lock, it checks the interrupted-run gate, reloads state, and rebuilds and rechecks the plan. Preflight program steps are reused only when built for the same programs, facts, and context, and `programs::install` re-checks each step anyway.
+    - The journal gets only path and entry actions that write: `create`, `update`, `adopt`, `remove`, plus `replace` in interactive mode and `drifted` with `--force`. Removes come first.
+    - A run with nothing to journal starts no `Run` and leaves no journal.
+    - After each path write, the target is read back, and anything other than what was written is `mismatch` (exit 4). This catches a file system that drops execute bits, which no read-only plan can see.
+    - Every begun run is finished **before** any program install, so killing a hung installer never interrupts a journal. If finishing fails, the first failure stays reported, no program is installed, and the exit is 1.
+    - In background mode, `replace` and drift are skipped and nothing is elevated.
+    - Exits: 1 for a failed action or finish, 3 invalid, 4 when anything is blocked, skipped, or mismatched, else 0. Unsupported actions alone exit 0, and they are always listed.
+  - **Pending integrations, named rather than stubbed:**
+    - `Run::finish_with_lock(self, &mut State) -> (Lock, Result<(), state::Error>)` (U3) keeps the lock through the installs, and is called as agreed.
+    - `Lock::check(&self, &Context) -> Result<(), state::Error>` (U3) is the read-only association check `run_under_lock` calls first. It returns `WrongLock` for another state dir.
+    - The MCP entry transaction (U3) replaces the interim `EntryNeedsMcp` refusal.
+    - `Options.cancel: Option<process::Cancel>` (U8) adds a check before each journaled action and each install.
 - **MCP entries: interim guard (U3), entry transaction follow-up required.** U3 ships the
   `mcp-entry` hash and per-key `Target::Entry` records. Until the follow-up lands, `observe`,
   `Run::write`, and `Run::remove` refuse a `Target::Entry` with `state::Error::EntryNeedsMcp` and
@@ -1277,7 +1367,7 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
     both its `AGENTS.md` and `~/.claude/CLAUDE.md`; `opencode config` when both OpenCode files
     exist.
 
-## 7. Programs (frozen, U7)
+## 7. Programs (built, U7)
 
 - **Selection.** Loadout uses the first manager the item declares that is available on the machine,
   in this OS order:
@@ -1302,6 +1392,237 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   Real installs are tested only in a disposable VM guest's actual `HOME` (section 4).
 - No direct downloads and no install scripts in v1. Loadout never installs a package manager itself;
   doctor names what is missing.
+
+### How U7 runs each manager (built)
+
+A manager is available when every tool it needs is on PATH (`context::which`); `install` runs the
+executable found there. Every subprocess gets its argv as an array (no shell), a null stdin, and
+`LC_ALL=C`, so the not-found messages below are stable. A null stdin doesn't rule out every prompt:
+with `--elevated`, `sudo` may ask for a password on the terminal, and a Windows installer may raise
+UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' display language.
+
+| Manager | Needs | Installed-query (one per program) | Not installed when | Install |
+| --- | --- | --- | --- | --- |
+| `brew` | brew | `brew info --json=v2 --formula P` | the one entry named `P` (name, full name, alias, or old name) has `installed: []` | `brew install --formula P`, `HOMEBREW_NO_INSTALL_UPGRADE=1` |
+| `cask` | brew | `brew info --json=v2 --cask P` | the one entry for `P` (token, full token, or old token) has `installed: null` | `brew install --cask P`, `HOMEBREW_NO_INSTALL_UPGRADE=1` |
+| `apt` | apt-get, dpkg-query | `dpkg-query -W -f '${db:Status-Status} ' P` | exit 1, or no status is `installed` | `apt-get install -y --no-upgrade P`, `DEBIAN_FRONTEND=noninteractive` |
+| `dnf` | dnf, rpm | `rpm -q P` | exit 1 with "is not installed" | `dnf install -y P` |
+| `pacman` | pacman | `pacman -Q P` | exit 1 with "was not found" | `pacman -S --needed --noconfirm P` |
+| `zypper` | zypper | `zypper --non-interactive --no-refresh search --installed-only --match-exact --type package P` | exit 104 | `zypper --non-interactive install P` |
+| `flatpak` | flatpak | `flatpak info P` (any installation) | exit 1 with "not installed" | `flatpak install --user --noninteractive P` |
+| `snap` | snap | `snap list P` | exit 1 with "no matching snaps installed" | `snap install P` |
+| `winget` | winget | `winget list --id P --exact --source winget` | `0x8A150014` | `winget install --id P --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade --scope user\|machine` |
+| `scoop` | scoop | `scoop prefix APP` (`APP` is `P` after any `bucket/`) | exit 1 with "Could not find app path" | `scoop install P` |
+| `choco` | choco (2.x) | `choco list --exact P --limit-output` | no `P\|version` line, or exit 2 | `choco install P -y --no-progress`; 1641 and 3010 are success |
+| `npm` | npm | `npm ls --global --depth=0 --json P` (and `npm prefix --global` after an exit 254) | the root `{"name": …}` has no `dependencies.P`, or it is `missing: true` (exit 0 or 1); or exit 254 with `ENOENT … lstat '<path>'` where `<path>` is exactly the prefix `npm prefix --global` prints | `npm install --global P` |
+| `pnpm` | pnpm | `pnpm ls --global --depth=0 --json P` | no project in the list `[{"path": …, "dependencies": {…}}]` has `P` (exit 0) | `pnpm add --global P` |
+| `bun` | bun | `bun pm ls --global` | no `── P@…` line | `bun add --global P` |
+| `cargo` | cargo | `cargo install --list` | no `P v…:` line | `cargo install P` |
+| `uv` | uv | `uv tool list` | no `P v…` line (PEP 503 names) | `uv tool install P` |
+| `pipx` | pipx | `pipx list --json` | no venv's `metadata.main_package.package` is `P` (PEP 503 names) | `pipx install P` |
+| `go` | go | `go env GOBIN GOPATH`, then `go version -m BIN` | `BIN` (from `GOBIN` or `GOPATH/bin`) is absent | `go install P@latest` |
+
+- **Installed needs positive evidence.** Every row's other outcomes (an unexpected exit code,
+  unreadable JSON, a missing tool) are `programs::Error::Detect`, so a broken or locked manager is
+  never read as "installed", and `steps` fails before any write. A Go binary at `BIN` built from a
+  different package is an error, never overwritten.
+- **JSON answers must match the manager's real schema before either verdict.** npm's root is an
+  object with a string `name`; pnpm's is a non-empty list of objects with a string `path`; a
+  `dependencies` table is an object whose entry for `P` is an object with a string `version` (or
+  `missing: true`); every pipx venv names its main package; a brew entry must answer for `P`, and
+  its `installed` is a list of `{ "version": … }` records (formula) or a version string or `null`
+  (cask). npm listing `P` while exiting 1 means npm found problems in the tree, and is an error. A
+  configured global prefix that doesn't exist yet makes npm exit 254 with
+  `{"error":{"code":"ENOENT","summary":"ENOENT: no such file or directory, lstat '<path>'"}}`
+  (sampled on npm 9.2). That reads as missing only when the summary has exactly that form, the
+  path holds no quote, and the same npm's `npm prefix --global` (under the same query deadline and
+  cap) prints that one absolute path. Loadout creates no directory to find out. Any other error
+  code, summary, exit code, or prefix answer, including a path below the prefix, is
+  `Error::Detect`, with a message naming the path and npm's prefix. There is no general rule that
+  `ENOENT` means missing.
+  Anything else, such as `null`, a non-object entry, or an empty pnpm list, is `Error::Detect`, so a
+  malformed answer never authorizes an install. The npm and pnpm empty shapes and the npm installed
+  shape were sampled from real managers. The pnpm installed entry, the pipx entry, and brew's
+  records follow the managers' documented output and still need a real sample.
+- **Package ids are passed as one exact argument.** `steps` refuses, before any subprocess, an id
+  that is empty, starts with `-`, has a character outside letters, digits, and `@ / . _ + : ~ -`,
+  or pins a version (`name@1.2` for npm, pnpm, bun; any `@` for cargo, uv, pipx, go). Go is the
+  one manager given `@latest`, because `go install` requires a version.
+- **Scope.** `apt`, `dnf`, `pacman`, `zypper`, `snap`, and `choco` are system scope; the other
+  non-winget managers are user scope. Winget's scope is per package, read from
+  `winget show --id P --exact --source winget --scope user|machine`, whose answer is the line under
+  its `Installer:` heading (winget 1.6 exits 0 even when it prints "No applicable installer
+  found"; `0x8A150010` means the same):
+  - The user scope applies only when its installer is `portable` or `portable (zip)`, a portable
+    package bare or nested in a zip, which installs into the user's WinGet Packages folder (seen
+    natively with `BurntSushi.ripgrep.MSVC`). Other types, other installers nested in a zip, MSIX,
+    and APPX may install machine-wide or raise UAC whatever scope is asked for, so they don't
+    count as per user until native evidence shows otherwise.
+  - Otherwise the machine scope is asked separately. Only an installer winget shows as applicable
+    there makes the package system scope, which needs `--elevated`.
+  - With neither, the step is `Unsupported` with the reason. Any other text, including an
+    `Installer Type:` line with no type, is `Error::Detect`, never a guessed scope, and comes
+    before any install or elevation.
+
+  The `winget` field names an id in the `winget` community source. Every winget call passes
+  `--source winget`, so a broken `msstore` source (as in the Windows test guest) can't stop an
+  install.
+- **Elevation.** `install(step, false)` refuses a system-scope step with `Error::NeedsElevation`.
+  With `elevated`, Unix runs `sudo -- [env K=V] TOOL …` (or the tool directly as root), and an
+  absent `sudo` is `Error::NoSudo`. Windows runs the tool directly. User-scope managers are never
+  elevated.
+- **Checked again at install.** `install` re-checks the step against the machine as it is then:
+  - The package id rule.
+  - The manager's static scope.
+  - The executable PATH resolves the manager to (a different path, or none, is `Error::Changed`).
+  - The manager's own answer, the same installed-query and scope as `steps`.
+
+  A package installed by then is `Installed::Already`, and nothing runs, so a stale step, a second
+  program naming the same package, or an earlier install's dependency never reinstalls or upgrades
+  it. A changed scope or a Go collision is an error before any installer runs, and this re-check
+  comes before the elevation check. Two limits remain:
+  - Another process can install the package between that last look and the installer starting.
+    winget (`--no-upgrade`), Homebrew, apt (`--no-upgrade`), flatpak, Scoop, Chocolatey, uv, pipx,
+    and snap then skip it themselves; npm, pnpm, bun, go, cargo, dnf, pacman, and zypper may
+    upgrade it.
+  - An equal PATH answer means the same path, not the same file, so a manager binary replaced in
+    place isn't detected.
+
+  If a winget too old for `--no-upgrade` rejects it, the install fails with winget's message.
+  Loadout never retries without it.
+- **Producer-only steps.** `Package` and `Missing` have private fields, and only `steps` creates
+  them, so a caller (U4 included) can read a step but never fabricate a trusted one.
+- **Verified.** After the manager exits with success, `install` runs the installed-query again; a
+  success that left the program missing is `Error::NotInstalled`.
+- **Bounded queries.** Every installed-query, scope query, and doctor query runs in its own process
+  group (Unix) or job object (Windows, through `process-wrap`). `QUERY_DEADLINE` (10 minutes)
+  bounds waiting for the query's own process. A query's stdout and stderr are read in full up to
+  `QUERY_OUTPUT_CAP` (8 MiB each). A larger answer stops the query early, and is an error, never
+  parsed truncated.
+- **Every query is settled, success included.** However a query ends (it exits, overflows, times
+  out, can't be waited on, or can't even start), loadout stops everything it started and
+  confirms the stop. One shared `QUERY_CLEANUP_GRACE` (5 seconds) bounds all of it together, with
+  no unbounded wait. If the stop can't be confirmed, the result is `QueryError::Cleanup`, which
+  keeps what ended the query as its cause, and the detection is `Error::Detect`. Only then are
+  the output buffers read, each under its own lock: an overflow first, then a read error, then
+  the bytes. Exactly `QUERY_OUTPUT_CAP` bytes is complete; one byte more is always an error.
+- **One setup deadline.** `QUERY_CLEANUP_GRACE` from just before anything is spawned bounds the
+  cleanup of every setup failure, on both OSes, with no renewed budget for a later stage. A
+  query's setup is its spawn, both reader threads, and on Windows its resume. A reader thread
+  that can't start is a setup failure, returned as the primary `Read` error at once: the query
+  is stopped (and on Windows never resumed), not watched until its deadline. Only a query that
+  fully started moves on to `QUERY_DEADLINE`, and then to its own settle limit, set when its
+  wait ends. The setup deadline never limits a query that started.
+- **Unix: an anchor holds the process group's id.** Every query gets a loadout-owned anchor,
+  `/bin/sh -c 'read -r line'`. It is the leader of a fresh process group and blocks on a pipe
+  only loadout writes, with no access to loadout's own stdio; if loadout dies, the pipe closes and
+  the anchor exits. The query is a plain `std::process::Child` that joins the anchor's group
+  (`CommandExt::process_group`).
+
+  While loadout hasn't reaped the anchor, alive or as a zombie, the group id can't be reused, so:
+  - **Phase A (anchor unreaped)**, the only time a destructive signal is sent:
+    1. `killpg(SIGKILL)` to the group. The anchor is alive and loadout's own, so **any** error,
+       `ESRCH` and `EPERM` included, is a cleanup failure.
+    2. Reap the query's own pid.
+    3. Wait for both readers' EOF.
+    4. `killpg(SIGKILL)` again, for processes forked during the first kill. The anchor may be a
+       zombie by now, and on macOS a group whose members are all zombies answers `EPERM` (XNU's
+       `killpg1` skips zombies, then returns `EPERM`). So `EPERM` here is **pending**, never
+       success. Any other error is a failure.
+    5. Kill and reap the anchor by its own pid; an anchor that ended any other way is an error.
+  - **Phase B:** signal 0 only, polled within the same cleanup limit. `Ok` (members remain) and
+    `EPERM` (zombies awaiting their reaper, or members loadout can't signal) mean wait. Only
+    `ESRCH`, the group freed because every member has been reaped, means the group is gone, and
+    only that clears a pending second-kill `EPERM`. If the limit runs out first, cleanup fails and
+    says which. An earlier, unrelated failure is never cleared. A reused id can only make cleanup
+    fail, never kill another group.
+
+  Which macOS call returns `EPERM` in practice, and the zombie state behind it, come from XNU's
+  source and the CI failure pattern. They still need native confirmation.
+
+  Only each child's own pid is ever waited on, never the group, so nothing reaps the anchor
+  early. A query that fails to start, after its anchor started, still has its anchor killed and
+  reaped within the same bound.
+
+  **Unix doesn't use `process-wrap`.** Its group `try_wait` reaps every child of ours in the
+  group, and `ProcessGroup::attach_to` records the child's own pid as the group id; both are
+  incompatible with an anchor.
+
+  A system without `/bin/sh` can't run queries: the anchor's spawn fails, and detection is an
+  error. Loadout doesn't claim every Unix has `/bin/sh`.
+- **Windows: a job object.** A job is addressed through loadout's own handle, so there is no id
+  to reuse. No safe API reports that a job has no processes left, so the job's
+  `TerminateJobObject` (checked), the query's exit, and both readers' EOF are the confirmation.
+  A descendant whose output is redirected is covered only by `TerminateJobObject`'s documented
+  semantics, and `process-wrap`'s first-message job wait is not used as proof.
+
+  **The query runs only once loadout owns its job.** Loadout passes `CREATE_SUSPENDED` itself
+  (`process-wrap`'s `CreationFlags`), so `process-wrap` assigns the job and **never resumes**
+  the query. Its own resume can fail after a thread already ran, and then discards the job's
+  termination result. Setup, in order:
+  1. Loadout spawns the `std::process::Child` itself (`spawn_with_child`) and keeps it
+     (`Arc<Mutex<Child>>`) before anything fallible, handle duplication included. The innermost
+     wrapper `process-wrap` sees shares that child.
+  2. If anything fails before loadout holds the job (handle duplication, `process-wrap`'s
+     no-handle branch, creating or assigning the job), the query never ran, so it started
+     nothing. Loadout kills its one process (checked) and reaps it. The setup deadline bounds
+     `process-wrap`'s wait on that process (the innermost wrapper's `wait` polls only up to it)
+     and loadout's own disposal together. The result is the spawn error, or `Cleanup` with the
+     spawn error as its cause.
+  3. Once `process-wrap` returns the job's owner, the readers start. If one can't, the query is
+     not resumed, and the whole job is stopped within the setup deadline, with the `Read` error
+     as the cause.
+  4. If the setup deadline has already passed, the query is **not resumed**. Loadout still
+     terminates the job at once (checked) and confirms what it can within the spent limit. The
+     result is the setup error, or `Cleanup` with it as the cause; never success.
+  5. Otherwise `loadout_winproc::prepare` finds the child's threads in one snapshot, requires
+     exactly one, opens it, and checks it still belongs to the child. Then
+     `Prepared::resume_before` reads the clock once more, after all that preparation, as the
+     last step before `ResumeThread`: if the setup deadline has passed, `ResumeThread` is not
+     called, and the result is a setup timeout. A previous suspend count other than 1 is an
+     error. Reading the clock and resuming aren't one atomic step, and no real-time guarantee
+     is made: the thread can be preempted between them. So after the resume returns, loadout
+     checks the deadline again, and setup succeeds only if it still hasn't passed. Otherwise it
+     is a setup timeout, handled as in step 6.
+  6. **Any** resume error, or a resume that returned after the deadline, is treated as "the
+     query may have run": there is no `watch`, and the whole job is stopped within the **same**
+     setup deadline, with that error as the cause. Only a successful resume that returned in
+     time ends setup and clears the deadline. From then on, the
+     innermost wrapper's blocking `wait` refuses rather than block without a bound; loadout
+     itself only ever polls.
+
+  A real `TerminateJobObject` failure can't be constructed in a test: only that its error is
+  kept is unit-covered.
+- **A process that leaves the group** (`setsid`) while holding the output makes cleanup fail.
+  The reader blocked on it stays blocked until that process exits; that is a resource limit, not
+  success.
+- **Installs have no deadline, and U7 can't cancel them.** An install runs in loadout's own
+  process group, so `sudo` can prompt and Ctrl-C reaches it. Errors keep the last 64 KiB of each
+  output stream. After the installer exits, loadout reads its output for at most 30 more seconds.
+  That drain only stops *reading*: it cancels nothing, and a process the installer started keeps
+  running. `programs::install` has no timeout and no cancel handle. A hung install, a hung
+  descendant, or a UAC or `sudo` prompt blocks it until the process tree ends or something outside
+  loadout kills it.
+- **What U8 must supply.** Before automatic updates can be claimed to finish safely in the
+  background, the supervisor that starts `update --background` must bound the whole run and kill
+  every descendant on all three OSes:
+  - Linux: the systemd unit's time limit (`RuntimeMaxSec`), with its control-group kill.
+  - Windows: Task Scheduler's `ExecutionTimeLimit` covers only the task's own process, so
+    `update --background` itself needs a job object for its descendants.
+  - macOS: launchd has no runtime limit, so `update --background` needs its own watchdog, which
+    kills its process group.
+
+  Until U8 proves that natively, no claim is made that a background run completes or cancels
+  cleanly. Native negative tests of hung installs and UAC use an external finite watchdog.
+- **Doctor** (`programs::checks`) adds three checks:
+  - `programs`: this OS's managers, grouped as per user, with `--elevated`, per package, and not on
+    PATH; a warning when none is available.
+  - `elevation`, on macOS and Linux when a system-scope manager is present: sudo found, root, or a
+    warning.
+  - `flatpak`: its per-user remotes, or a warning when there is none or its query fails or times
+    out.
+
+  Under isolation it only looks on PATH and runs no manager.
 
 ## 8. Updates (frozen, U8 + U9)
 
@@ -1347,8 +1668,8 @@ Automatic updates are required, so they are on by default.
 | `loadout --help`, `--version` | foundation | |
 | `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
 | `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes (U1, built) and the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid. Loads with `Loadout::load_guarded` and the active `Context`, and reads each template source through the same source guard (`template::check_all_guarded`) | foundation; resolution built (U1); template syntax built (U2); guarded load (U5) | |
-| `loadout plan [--loadout DIR] [--json]` | frozen | U4 |
-| `loadout apply [--loadout DIR] [--force] [--elevated]` | frozen | U4 |
+| `loadout plan [--loadout DIR] [--json]`: what apply would change; never writes, locks, or creates the state dir; exit 3 invalid, 4 blocked or drifted | source, unexecuted | U4 |
+| `loadout apply [--loadout DIR] [--force] [--elevated]`: read-only preflight, then the lock and a rebuilt plan; exit 1 on a failed action, 3 invalid, 4 when anything is left undone | source, unexecuted | U4 |
 | `loadout status [--json]`: ownership records with drift, runs with interrupted ones; exit 4 when not healthy; never writes | built | U3 |
 | `loadout rollback [RUN]`: undo the newest or the named run; exit 4 when later changes block it | built | U3 |
 | `loadout update [--background]` | frozen | U8 (+U9 self-update) |
@@ -1448,10 +1769,21 @@ pub fn materialize(resolved: &Resolved, context: &Context, loadout: &Path) -> Re
 pub enum Error { Invalid(Diagnostics) }                          // source or collision problems; exit 3, nothing written
 pub fn checks(context: &Context) -> Vec<Check>;
 
-// programs (U7)
+// programs (U7, built)
+pub struct Step { pub program: String, pub state: State }       // Step::needs_elevation(): Missing with Scope::System
+pub enum State { Installed(Package), Missing(Missing), Unsupported(String), Blocked(String) }
+pub struct Package { .. }   // private; manager() -> Manager, id() -> &str, executable() -> &Path; only steps() makes one
+pub struct Missing { .. }   // private; package() -> &Package, scope() -> Scope
+pub enum Scope { User, System }
+pub enum Installed { Now, Already }                             // Already: found installed on the re-check; nothing ran
+pub const ISOLATED: &str;                                       // the Blocked reason under LOADOUT_HOME
 pub fn steps(programs: &BTreeMap<String, Program>, facts: &Facts, context: &Context) -> Result<Vec<Step>, programs::Error>; // every step blocked when context.isolated
-pub fn install(step: &Step, elevated: bool) -> Result<(), programs::Error>;
+pub fn install(step: &Step, elevated: bool) -> Result<Installed, programs::Error>;   // Missing steps only; re-checks before, re-queries after
 pub fn checks(context: &Context) -> Vec<Check>;
+// plan::build: Installed -> unchanged (prior Installed); Missing -> install (prior Absent), or blocked when it
+// needs elevation the run lacks; Unsupported and Blocked carry their reason. Order follows `programs` (by id).
+// apply: Installed::Already -> report unchanged; Error::Changed -> the action failed and nothing ran (plan again).
+// U4 gets steps only from steps() and never fabricates Package or Missing.
 
 // state (built, U3)
 impl State { pub fn load(context: &Context) -> Result<State, state::Error>; pub fn record(&self, target: &Target) -> Option<&Record>; pub fn records(&self) -> impl Iterator<Item = &Record>; }
@@ -1480,14 +1812,29 @@ pub fn runs(context: &Context) -> Result<Vec<RunSummary>, state::Error>;
 
 // plan (U4; Desired, Content, FileContent, Target, Observed, Change, Action, Plan types foundation)
 // Target::{Path, Entry { .., shape }, Program, None}; Action::unsupported(item, target, reason) builds prior Absent, no content
-pub fn build(resolved: &Resolved, facts: &Facts, context: &Context, loadout: &Path, state: &State) -> Result<Plan, Diagnostics>;
-// U4 contract: the checkout is loaded with Loadout::load_guarded(loadout, context), never Loadout::load, then resolve,
-// check_targets, and agents::materialize(resolved, context, loadout), which re-runs the guarded pointer detection itself.
-// U4/U8 contract: every user-file and template source is read under manifest::source_guard before render(); template::render
-// and check take text and never read. Where the shared guarded reader lives is decided with U4; never re-read through check_all.
-// `loadout` = the active checkout root (default clone or --loadout DIR); passed to every reserved::check_path call
+// Target::None: Unsupported or Blocked only, prior Absent, no content (B2); it has no identity, so several may share a plan.
+pub struct Options { pub elevated: bool }
+pub struct Steps(..);                       // only build makes them; get(program); reused only for identical programs, facts, context
+pub struct Built { pub plan: Plan, pub steps: Steps, pub checkout: PathBuf /* canonical */, pub machine: String, pub warnings: Diagnostics }
+pub enum Error { Invalid(Diagnostics) /* 3 */, Blocked(String) /* 4 */, Runtime(anyhow::Error) /* 1 */ }
+pub fn build(context: &Context, checkout: &Path, state: &State, steps: Option<Steps>, options: Options) -> Result<Built, plan::Error>;
+pub fn checkout(context: &Context, chosen: Option<&Path>) -> anyhow::Result<PathBuf>; pub fn default_checkout(context: &Context) -> PathBuf;
+impl Plan { pub fn check(&self) -> Result<(), String>; pub fn blocked(&self) -> bool; }
+// build: interrupted-run gate, Loadout::load_guarded, machine::detect, resolve, source::Sources + template::render for user
+// files, agents::materialize, programs::steps, then state::digest/observe per target. It never writes, locks, or creates
+// the state dir. resolve::check_targets stays public for synthetic use but is not on this host pipeline: each user-file
+// target goes through reserved::check_path(Write) and a conflict is an unsupported action.
 // apply (U4)
-pub fn run(plan: &Plan, context: &Context, loadout: &Path, options: Options) -> Result<Report, apply::Error>; // re-checks reserved paths before each backup and write
+pub enum Mode { Interactive, Background }   // Background: never replace, force, elevate, or prompt
+pub struct Options { pub force: bool, pub elevated: bool, pub mode: Mode }
+pub fn run(context: &Context, checkout: &Path, options: Options) -> Result<Report, apply::Error>;            // preflight, lock, run_under_lock
+pub fn run_under_lock(context: &Context, checkout: &Path, lock: state::Lock, options: Options) -> Result<Report, apply::Error>;
+pub struct Report { pub checkout, pub machine, pub run: Option<String>, pub outcomes: Vec<(Action, Outcome)>, pub warnings, pub finish_error: Option<String> }
+impl Report { pub fn failed(&self) -> bool /* exit 1 */; pub fn unhealthy(&self) -> bool /* exit 4 */; }
+pub enum Error { Plan(plan::Error), State(state::Error) }
+// Pending integrations: Run::finish_with_lock (U3) keeps the lock through program installs; Lock::check (U3) is
+// run_under_lock's first call on every route; Options.cancel (U8 process::Cancel) with checks before each
+// journaled action and each install.
 
 // sync (U8)
 pub fn clone(url: &str, context: &Context) -> Result<(), sync::Error>;

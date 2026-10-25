@@ -9,6 +9,7 @@ use crate::diagnostic::{Check, CheckStatus};
 use crate::machine::{self, NameSource};
 use crate::manifest::Manager;
 use crate::platform::{Arch, Os};
+use crate::programs;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -24,7 +25,12 @@ struct Report<'a> {
 }
 
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
-    let checks: Vec<Check> = [foundation(context), agents::checks(context)].concat();
+    let checks: Vec<Check> = [
+        foundation(context),
+        agents::checks(context),
+        programs::checks(context),
+    ]
+    .concat();
 
     let healthy = checks.iter().all(|check| check.status != CheckStatus::Fail);
     if args.json {

@@ -11,17 +11,16 @@ use crate::reserved;
 const SKILL_FILE: &str = "SKILL.md";
 const GIT_DIR: &str = ".git";
 
-/// Reads skill and instructions sources from the active checkout, copied as they are and never
-/// rendered. Validate confined them already; this runs again because the checkout can change
-/// between validate and plan.
-pub(super) struct Sources<'a> {
+/// Reads user file, skill, and instructions sources from the active checkout. Validate confined
+/// them already; this runs again because the checkout can change between validate and plan.
+pub struct Sources<'a> {
     context: &'a Context,
     root: PathBuf,
     git: Vec<PathBuf>,
 }
 
 impl<'a> Sources<'a> {
-    pub(super) fn new(context: &'a Context, loadout: &Path) -> Result<Self, String> {
+    pub fn new(context: &'a Context, loadout: &Path) -> Result<Self, String> {
         let root = loadout.canonicalize().map_err(|error| {
             format!("cannot resolve the loadout {}: {error}", loadout.display())
         })?;
@@ -33,14 +32,14 @@ impl<'a> Sources<'a> {
         Ok(Self { context, root, git })
     }
 
-    pub(super) fn file(&self, source: &Path) -> Result<FileContent, String> {
+    /// One source file, with its execute bit on Unix. A caller that never writes executables,
+    /// such as agent instructions, clears the bit itself.
+    pub fn file(&self, source: &Path) -> Result<FileContent, String> {
         let real = self.confine(source)?;
-        let mut content = self.read(source, &real)?;
-        content.executable = false;
-        Ok(content)
+        self.read(source, &real)
     }
 
-    pub(super) fn tree(&self, source: &Path) -> Result<BTreeMap<PathBuf, FileContent>, String> {
+    pub fn tree(&self, source: &Path) -> Result<BTreeMap<PathBuf, FileContent>, String> {
         let real = self.confine(source)?;
         if !real.is_dir() {
             return Err(format!("{} is not a skill folder", self.shown(source)));

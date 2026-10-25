@@ -1,6 +1,5 @@
 mod collide;
 mod doctor;
-mod source;
 mod table;
 
 use std::collections::BTreeMap;
@@ -15,8 +14,8 @@ use crate::plan::{Action, Content, Desired, ItemKind, ItemRef, Target};
 use crate::platform::Os;
 use crate::reserved::{self, Merge, Use};
 use crate::resolve::{Agent, Resolved};
+use crate::source::Sources;
 
-use source::Sources;
 use table::{Capability, McpPlace};
 
 #[derive(Debug, thiserror::Error)]
@@ -106,10 +105,11 @@ pub fn materialize(
                 continue;
             }
             let read = file.get_or_insert_with(|| {
-                out.source(
-                    format!("instructions.{id}"),
-                    sources.file(&instructions.source),
-                )
+                let copy = sources.file(&instructions.source).map(|mut copy| {
+                    copy.executable = false;
+                    copy
+                });
+                out.source(format!("instructions.{id}"), copy)
             });
             if let Some(copy) = read {
                 let copy = Content::File(copy.clone());
