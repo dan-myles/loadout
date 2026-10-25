@@ -136,6 +136,18 @@ fn not_loaded(answer: &crate::process::Captured) -> bool {
         || answer.stderr.contains("Could not find specified service")
 }
 
+/// How the plist differs from the one `install` would write for this record, if it does.
+pub(super) fn differs(
+    context: &Context,
+    exe: &str,
+    service: &str,
+    interval_minutes: u32,
+) -> Option<String> {
+    let actual = super::definition(&file(context))?;
+    (actual != plist(exe, service, interval_minutes))
+        .then(|| super::differs_from_record(&format!("{LABEL}.plist")))
+}
+
 pub(super) fn registered(context: &Context, owned: &Path) -> Scheduler {
     let owned = if std::fs::symlink_metadata(owned).is_ok() {
         owned.to_path_buf()

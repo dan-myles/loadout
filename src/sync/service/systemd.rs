@@ -41,7 +41,7 @@ fn quote(arg: &str) -> String {
     out
 }
 
-fn service_unit(exe: &str, service: &str) -> String {
+pub(super) fn service_unit(exe: &str, service: &str) -> String {
     let command = [exe, "update", "--background", "--service", service]
         .iter()
         .map(|arg| quote(arg))
@@ -62,7 +62,7 @@ fn service_unit(exe: &str, service: &str) -> String {
     )
 }
 
-fn timer_unit(interval_minutes: u32) -> String {
+pub(super) fn timer_unit(interval_minutes: u32) -> String {
     format!(
         "[Unit]\n\
          Description=Run the loadout background update every {interval_minutes} minutes\n\
@@ -148,6 +148,23 @@ pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     }
     required(context, "systemctl", &["--user", "daemon-reload"])?;
     Ok(())
+}
+
+/// How the unit files differ from the ones `install` would write for this record, if they do.
+pub(super) fn differs(
+    context: &Context,
+    exe: &str,
+    service: &str,
+    interval_minutes: u32,
+) -> Option<String> {
+    let expected = [
+        (SERVICE, service_unit(exe, service)),
+        (TIMER, timer_unit(interval_minutes)),
+    ];
+    expected.into_iter().find_map(|(name, text)| {
+        let actual = super::definition(&dir(context).join(name))?;
+        (actual != text).then(|| super::differs_from_record(name))
+    })
 }
 
 pub(super) fn registered(context: &Context) -> Scheduler {

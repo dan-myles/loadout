@@ -285,6 +285,8 @@ pub fn uninstall(context: &Context) -> Result<(), Error> {
 pub struct File {
     pub path: PathBuf,
     pub present: bool,
+    /// A regular file, not a folder or a link: something the scheduler can use as written.
+    pub regular: bool,
 }
 
 /// What the scheduler itself says about the job.
@@ -306,6 +308,10 @@ pub struct Status {
     pub scheduler: Option<Scheduler>,
     /// Whether the recorded executable is the one running now.
     pub exe_current: Option<bool>,
+    /// How the installed definition differs from what this `service.toml` would install: another
+    /// executable, another `service.toml` (another state dir), another interval, or a missing
+    /// Windows launcher.
+    pub mismatch: Option<String>,
 }
 
 impl Status {
@@ -329,7 +335,8 @@ impl Status {
         }
         self.recorded.is_some()
             && self.problem.is_none()
-            && self.files.iter().all(|file| file.present)
+            && self.mismatch.is_none()
+            && self.files.iter().all(|file| file.present && file.regular)
             && self
                 .scheduler
                 .as_ref()
@@ -366,9 +373,13 @@ pub fn status(context: &Context) -> Result<Status, Error> {
         Os::Windows => Vec::new(),
     }
     .into_iter()
-    .map(|path| File {
-        present: fs::symlink_metadata(&path).is_ok(),
-        path,
+    .map(|path| {
+        let metadata = fs::symlink_metadata(&path);
+        File {
+            present: metadata.is_ok(),
+            regular: metadata.is_ok_and(|metadata| metadata.is_file()),
+            path,
+        }
     })
     .collect();
     let scheduler = if context.isolated {
@@ -385,13 +396,63 @@ pub fn status(context: &Context) -> Result<Status, Error> {
             .and_then(fs::canonicalize)
             .is_ok_and(|current| current == recorded.exe)
     });
+    let mismatch = match (&recorded, &problem) {
+        (Some(recorded), None) => mismatch(context, recorded),
+        _ => None,
+    };
     Ok(Status {
         recorded,
         problem,
         files,
         scheduler,
         exe_current,
+        mismatch,
     })
+}
+
+/// The program a scheduler starts for `exe`: the launcher beside it on Windows, else `exe`.
+fn program(os: Os, exe: &Path) -> PathBuf {
+    match os {
+        Os::Windows => exe.with_file_name(format!("{LAUNCHER}.exe")),
+        Os::Linux | Os::Macos => exe.to_path_buf(),
+    }
+}
+
+/// How the installed definition differs from the one `recorded` would install for `context`.
+/// Read-only: local definitions are read only when they are regular files, and the Windows task
+/// is read back from Task Scheduler (never under isolation).
+fn mismatch(context: &Context, recorded: &Recorded) -> Option<String> {
+    let program = program(context.os, &recorded.exe);
+    if context.os == Os::Windows && !fs::metadata(&program).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Some(Error::MissingLauncher { path: program }.to_string());
+    }
+    let service = Private::Service.path(context);
+    let (Ok(program), Ok(service)) = (safe(&program), safe(&service)) else {
+        return Some("the recorded paths can't be written into a scheduler file".to_owned());
+    };
+    let interval = recorded.interval_minutes;
+    match context.os {
+        Os::Linux => systemd::differs(context, program, service, interval),
+        Os::Macos => launchd::differs(context, program, service, interval),
+        Os::Windows if context.isolated => None,
+        Os::Windows => schtasks::differs(context, program, service, interval),
+    }
+}
+
+/// The contents of a local definition, when it is a regular file.
+fn definition(path: &Path) -> Option<String> {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| fs::read_to_string(path).ok())
+        .flatten()
+}
+
+/// The answer for a definition that isn't the one this record would install.
+fn differs_from_record(what: &str) -> String {
+    format!(
+        "{what} doesn't run this record's executable and service.toml at its interval (it was installed for another state dir, executable, or interval)"
+    )
 }
 
 pub(super) fn checks(context: &Context) -> Vec<Check> {
@@ -432,6 +493,15 @@ pub fn describe(status: &Status) -> String {
             "{} is missing; run `loadout service install` again",
             missing.path.display()
         );
+    }
+    if let Some(odd) = status.files.iter().find(|file| !file.regular) {
+        return format!(
+            "{} is not a regular file; run `loadout service install` again",
+            odd.path.display()
+        );
+    }
+    if let Some(mismatch) = &status.mismatch {
+        return format!("{mismatch}; run `loadout service install` again");
     }
     if let Some(scheduler) = &status.scheduler
         && !scheduler.registered
@@ -992,6 +1062,88 @@ mod tests {
             fakes
                 .calls("schtasks")
                 .contains("/Delete /TN Loadout Update /F")
+        );
+    }
+
+    /// A `service.toml` for `fakes`' context, as `install` records it, running `exe`.
+    #[cfg(unix)]
+    fn record_for(fakes: &Fakes, exe: &Path) -> Recorded {
+        let context = &fakes.context;
+        let recorded = Recorded {
+            version: VERSION,
+            exe: exe.to_path_buf(),
+            interval_minutes: 60,
+            installed: 1,
+            home: context.home.clone(),
+            config: context.config.clone(),
+            state: context.state.clone(),
+            env: BTreeMap::from([(
+                STATE_OVERRIDE.to_owned(),
+                context.state.to_str().unwrap().to_owned(),
+            )]),
+        };
+        state::write_private(
+            context,
+            Private::Service,
+            toml::to_string(&recorded).unwrap().as_bytes(),
+        )
+        .unwrap();
+        recorded
+    }
+
+    /// Two state dirs share one per-user job: installed for B, the job no longer runs A's
+    /// `service.toml`, so A's status must not call it healthy. A different executable or a
+    /// definition that isn't a regular file is caught the same way.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_a_job_installed_for_another_record_as_a_mismatch() {
+        let fakes = Fakes::new(Os::Linux);
+        fakes.tool("systemctl", "echo enabled");
+        let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
+        let exe_text = exe.to_str().unwrap();
+        record_for(&fakes, &exe);
+        let [service, timer] = [
+            systemd::files(&fakes.context)[0].clone(),
+            systemd::files(&fakes.context)[1].clone(),
+        ];
+        let own = Private::Service.path(&fakes.context);
+        let write_units = |exe: &str, record: &str| {
+            fakes.plant(&service);
+            fs::write(&service, systemd::service_unit(exe, record)).unwrap();
+            fs::write(&timer, systemd::timer_unit(60)).unwrap();
+        };
+
+        write_units(exe_text, own.to_str().unwrap());
+        let matching = status(&fakes.context).unwrap();
+        assert_eq!(matching.mismatch, None);
+        assert!(matching.healthy(), "{}", describe(&matching));
+
+        let other_state = fakes.dir.path().join("state-b").join("service.toml");
+        write_units(exe_text, other_state.to_str().unwrap());
+        let other = status(&fakes.context).unwrap();
+        assert!(other.mismatch.is_some());
+        assert!(!other.healthy());
+        assert!(
+            describe(&other).contains("service install"),
+            "{}",
+            describe(&other)
+        );
+
+        write_units("/opt/other/loadout", own.to_str().unwrap());
+        assert!(
+            !status(&fakes.context).unwrap().healthy(),
+            "another executable"
+        );
+
+        write_units(exe_text, own.to_str().unwrap());
+        fs::remove_file(&timer).unwrap();
+        fs::create_dir(&timer).unwrap();
+        let folder = status(&fakes.context).unwrap();
+        assert!(!folder.healthy(), "a folder is not a usable timer");
+        assert!(
+            describe(&folder).contains("not a regular file"),
+            "{}",
+            describe(&folder)
         );
     }
 

@@ -153,6 +153,48 @@ fn not_found(answer: &crate::process::Captured) -> bool {
     answer.stderr.contains("cannot find") || answer.stdout.contains("cannot find")
 }
 
+/// How the registered task differs from the one `install` would register for this record, if
+/// it does: its command, arguments, or interval, read back from Task Scheduler. A task that
+/// can't be read here is left to `registered`.
+///
+/// `schtasks` may print the XML as UTF-16; its NUL bytes are dropped before reading, which
+/// keeps ASCII text exact. A path with other characters may then read as different, which is
+/// reported as a mismatch, never as a match.
+pub(super) fn differs(
+    context: &Context,
+    launcher: &str,
+    service: &str,
+    interval_minutes: u32,
+) -> Option<String> {
+    let answer = query(context, "schtasks", &["/Query", "/TN", NAME, "/XML"]).ok()?;
+    if !answer.success() {
+        return None;
+    }
+    let text: String = answer
+        .stdout
+        .chars()
+        .filter(|character| *character != '\0' && *character != '\u{feff}')
+        .collect();
+    let element = |tag: &str| {
+        let open = format!("<{tag}>");
+        let start = text.find(&open)? + open.len();
+        let end = text[start..].find(&format!("</{tag}>"))? + start;
+        Some(text[start..end].to_owned())
+    };
+    let expected = [
+        ("Command", xml(launcher)),
+        (
+            "Arguments",
+            xml(&format!("--service {}", argv_quote(service))),
+        ),
+        ("Interval", format!("PT{interval_minutes}M")),
+    ];
+    expected
+        .into_iter()
+        .any(|(tag, value)| element(tag).as_deref() != Some(value.as_str()))
+        .then(|| super::differs_from_record(&format!("the task {NAME}")))
+}
+
 pub(super) fn registered(context: &Context) -> Scheduler {
     match query(context, "schtasks", &["/Query", "/TN", NAME]) {
         Ok(answer) => Scheduler {
