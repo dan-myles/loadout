@@ -38,7 +38,10 @@ const NO_HOOKS: &str = "loadout.no-hooks";
 pub(super) struct Git<'a> {
     program: PathBuf,
     context: &'a Context,
-    hooks: PathBuf,
+    /// The canonical state dir, which loadout checks every path against.
+    state: PathBuf,
+    /// The same folder as git is given it (see `native`).
+    native: PathBuf,
 }
 
 /// What a local read printed, and whether it succeeded.
@@ -62,21 +65,39 @@ impl<'a> Git<'a> {
     /// The `git` on PATH, or `Error::NoGit`. `state` is the canonical state dir.
     pub(super) fn find(context: &'a Context, state: &Path) -> Result<Self, Error> {
         let program = context::which("git").ok_or(Error::NoGit)?;
+        #[cfg(windows)]
+        let native = native(state)?;
+        #[cfg(not(windows))]
+        let native = state.to_path_buf();
         Ok(Self {
             program,
             context,
-            hooks: state.join(NO_HOOKS),
+            state: state.to_path_buf(),
+            native,
         })
+    }
+
+    /// `path`, a path inside the canonical state dir, as git is given it: the same components
+    /// below the state dir's native form.
+    pub(super) fn path(&self, path: &Path) -> Result<PathBuf, Error> {
+        let below = path.strip_prefix(&self.state).map_err(|_| Error::Io {
+            action: "hand git",
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "it is outside the state dir"),
+        })?;
+        Ok(self.native.join(below))
     }
 
     fn background(&self) -> bool {
         matches!(self.context.containment, Containment::Inherited(_))
     }
 
-    /// The settings every call starts with, before the subcommand.
-    fn base(&self, repo: Option<&Path>) -> Vec<OsString> {
+    /// The settings every call starts with, before the subcommand. `repo` is inside the
+    /// canonical state dir, and git is given it in native form.
+    fn base(&self, repo: Option<&Path>) -> Result<Vec<OsString>, Error> {
         let mut args: Vec<OsString> = Vec::new();
         if let Some(repo) = repo {
+            let repo = self.path(repo)?;
             let mut dir = OsString::from("--git-dir=");
             dir.push(repo.join(".git"));
             let mut tree = OsString::from("--work-tree=");
@@ -85,7 +106,7 @@ impl<'a> Git<'a> {
             args.push(tree);
         }
         let mut hooks = OsString::from("core.hooksPath=");
-        hooks.push(&self.hooks);
+        hooks.push(self.native.join(NO_HOOKS));
         for setting in [
             hooks,
             OsString::from("core.fsmonitor=false"),
@@ -95,12 +116,12 @@ impl<'a> Git<'a> {
             args.push(OsString::from("-c"));
             args.push(setting);
         }
-        args
+        Ok(args)
     }
 
     /// A local read in `repo`, bounded like a package manager query.
     pub(super) fn read(&self, repo: &Path, args: &[&str]) -> Result<Answer, Error> {
-        let mut all = self.base(Some(repo));
+        let mut all = self.base(Some(repo))?;
         all.extend(args.iter().map(OsString::from));
         let mut invocation = Invocation::new(&self.program, all);
         invocation.env = QUIET;
@@ -129,7 +150,7 @@ impl<'a> Git<'a> {
     /// Clone, fetch or merge: it may talk to the remote and changes the checkout. `repo` is
     /// `None` for a clone, whose destination is in `args`.
     pub(super) fn change(&self, repo: Option<&Path>, args: &[OsString]) -> Result<(), Error> {
-        let mut all = self.base(repo);
+        let mut all = self.base(repo)?;
         all.extend(args.iter().cloned());
         let action = describe_os(args);
         if self.background() {
@@ -166,6 +187,49 @@ impl<'a> Git<'a> {
                 })
             }
         }
+    }
+}
+
+/// The canonical state dir as git is given it on Windows (elsewhere it is the canonical path
+/// itself). The canonical form is verbatim (`\\?\C:\...`, `\\?\UNC\server\share\...`), which git
+/// can't use as a clone destination or a repository: a verbatim disk or UNC prefix becomes its
+/// plain form (`C:`, `\\server\share`) with every component kept, and the result is used only if
+/// it resolves back to exactly the canonical folder, so nothing in it is read differently. Any
+/// other verbatim prefix (a volume GUID, say) has no such form and is refused.
+#[cfg(windows)]
+fn native(state: &Path) -> Result<PathBuf, Error> {
+    use std::path::{Component, Prefix};
+    let refuse = |reason: &str| Error::Io {
+        action: "hand git",
+        path: state.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, reason.to_owned()),
+    };
+    let mut components = state.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Ok(state.to_path_buf());
+    };
+    let mut native = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            PathBuf::from(unc)
+        }
+        Prefix::Disk(_) | Prefix::UNC(..) => return Ok(state.to_path_buf()),
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(refuse("it has no drive or UNC form that git can use"));
+        }
+    };
+    for component in components {
+        native.push(component.as_os_str());
+    }
+    match std::fs::canonicalize(&native) {
+        Ok(back) if back == state => Ok(native),
+        _ => Err(refuse(
+            "its drive or UNC form doesn't resolve back to the same folder",
+        )),
     }
 }
 

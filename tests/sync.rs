@@ -66,6 +66,11 @@ impl Scratch {
     /// A bare remote whose `main` holds `loadout.toml`, a work clone to push from, and a
     /// context with its own home and state dir.
     fn new() -> Self {
+        Self::with_state(|dir| dir.join("state"))
+    }
+
+    /// `new`, with the state dir `state` gives for the scratch folder.
+    fn with_state(state: impl FnOnce(&Path) -> PathBuf) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let remote = dir.path().join("remote.git");
         let work = dir.path().join("work");
@@ -83,7 +88,7 @@ impl Scratch {
         git(&work, &["push", "--quiet", "-u", "origin", "main"]);
         let home = dir.path().join("home");
         fs::create_dir(&home).unwrap();
-        let state = dir.path().join("state");
+        let state = state(dir.path());
         let vars: Vec<(&str, OsString)> = vec![
             ("LOADOUT_HOME", home.into_os_string()),
             ("LOADOUT_STATE_DIR", state.into_os_string()),
@@ -164,6 +169,57 @@ fn a_clone_is_up_to_date_and_then_fast_forwards_to_a_new_remote_commit() {
     );
     assert_eq!(head(&clone), second);
     assert_eq!(fs::read_to_string(clone.join("notes")).unwrap(), "new\n");
+}
+
+/// On Windows the canonical state dir is a verbatim path (`\\?\C:\...`), which git can't use as a
+/// clone destination or a repository. With the state dir given in exactly that form, the real
+/// git still clones, fetches, and fast-forwards, and doctor's local reads of the clone pass.
+#[cfg(windows)]
+#[test]
+fn a_verbatim_state_dir_clones_fetches_and_reads_with_the_real_git() {
+    let scratch = Scratch::with_state(|dir| {
+        let state = dir.join("state");
+        fs::create_dir(&state).unwrap();
+        let canonical = fs::canonicalize(&state).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            canonical.display()
+        );
+        canonical
+    });
+    scratch.clone();
+    // The test's own git runs in the clone through the plain path, not the verbatim one.
+    let clone = scratch.work.with_file_name("state").join("loadout");
+    assert!(clone.join("loadout.toml").is_file());
+    let first = head(&clone);
+    assert_eq!(
+        scratch.fetch(),
+        Fetched::UpToDate {
+            head: first.clone()
+        }
+    );
+    let second = scratch.push("notes", "new\n");
+    assert_eq!(
+        scratch.fetch(),
+        Fetched::Advanced {
+            from: first,
+            to: second.clone(),
+        }
+    );
+    assert_eq!(head(&clone), second);
+    assert_eq!(fs::read_to_string(clone.join("notes")).unwrap(), "new\n");
+    let checks = sync::checks(&scratch.context);
+    let checkout = checks
+        .iter()
+        .find(|check| check.name == "checkout")
+        .unwrap();
+    assert_eq!(
+        checkout.status,
+        loadout::diagnostic::CheckStatus::Pass,
+        "{}",
+        checkout.detail
+    );
 }
 
 /// A password, or a token in the user name of an HTTP(S) URL, is refused before git runs: no
