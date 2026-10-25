@@ -1807,7 +1807,8 @@ Automatic updates are required, so they are on by default.
     - Still under the lock, the binaries and record must be exactly the ones `latest` checked, so a
       release found before another install or self-update finished never replaces that install.
       Then the binaries are published and the record last. On Windows, running executables are
-      moved aside and every completed move is undone if a later one fails. The lock is held until
+      moved aside and every completed move is undone if a later one fails (each one attempted,
+      and any that can't be named in the error). The lock is held until
       publication, any undo and this run's own cleanup are done.
     - After the record, it deletes the executables it moved aside. One still running is listed
       with its sha256 in `.loadout.install.asides`, and a later completed self-update deletes

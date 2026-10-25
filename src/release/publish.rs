@@ -188,7 +188,11 @@ pub(super) struct Failure {
 /// On Unix each binary is one atomic rename over the old file, which a running process keeps
 /// using. Windows can't rename over a running executable, but it can rename the running file, so
 /// each existing binary is first moved aside to `.<name>.old.<nonce>`, a name this run owns. If a
-/// later binary step fails, every completed move is undone in reverse; the record is untouched.
+/// later binary step fails, every completed move is undone in reverse, each attempted even when
+/// another can't be, and the record is untouched. Staging files moved back are this run's to
+/// remove again; files whose move back failed stay where they are, for recovery, and are named in
+/// the failure. On Unix a rename over a binary can't be undone, so a later failure there is never
+/// reported as restored.
 /// Once every binary is in place the record is renamed over the old one. If that last rename
 /// fails, the new binaries stay and the old record no longer matches them, which fails closed.
 /// Only after the record is in place are moved-aside executables deleted (see `settle_asides`).
@@ -197,10 +201,29 @@ pub(super) fn publish(
     record: (Staged, PathBuf),
 ) -> Result<(), Failure> {
     let mut done: Vec<Move> = Vec::new();
-    let mut published = Vec::new();
+    let mut published: Vec<Staged> = Vec::new();
     for (mut staged, dest) in binaries {
         if let Err(detail) = place(&staged, &dest, &mut done) {
-            let restored = undo(&done);
+            let failed = undo(&done);
+            for staged in &mut published {
+                staged.published = failed.iter().any(|(step, _)| step.from == staged.path);
+            }
+            let restored = failed.is_empty() && (cfg!(windows) || published.is_empty());
+            let detail = if failed.is_empty() {
+                detail
+            } else {
+                let unrestored: Vec<String> = failed
+                    .iter()
+                    .map(|(step, error)| {
+                        format!(
+                            "{} could not be moved back to {} ({error})",
+                            step.to.display(),
+                            step.from.display()
+                        )
+                    })
+                    .collect();
+                format!("{detail}; then {}", unrestored.join("; "))
+            };
             return Err(Failure { detail, restored });
         }
         staged.published = true;
@@ -265,11 +288,17 @@ fn place(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), Strin
     Ok(())
 }
 
-/// Reverses completed moves, newest first. True when all of them were undone.
-fn undo(done: &[Move]) -> bool {
+/// Reverses completed moves, newest first, attempting every one even after another fails. Returns
+/// the moves that couldn't be reversed, each with why.
+fn undo(done: &[Move]) -> Vec<(&Move, io::Error)> {
     done.iter()
         .rev()
-        .all(|step| fs::rename(&step.to, &step.from).is_ok())
+        .filter_map(|step| {
+            fs::rename(&step.to, &step.from)
+                .err()
+                .map(|error| (step, error))
+        })
+        .collect()
 }
 
 /// The ledger of executables completed self-updates moved aside on Windows but couldn't delete,
@@ -451,6 +480,121 @@ mod tests {
             names.len(),
             2,
             "only the record and the folder remain: {names:?}"
+        );
+    }
+
+    #[test]
+    fn undo_attempts_every_move_and_names_each_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // What Windows publication of the launcher, then the aside of the main, leaves.
+        let steps = [
+            Move {
+                from: path.join("loadout-background.exe"),
+                to: path.join(".loadout-background.exe.old.1"),
+                aside: true,
+            },
+            Move {
+                from: path.join(".loadout-background.new.2.exe"),
+                to: path.join("loadout-background.exe"),
+                aside: false,
+            },
+            Move {
+                from: path.join("loadout.exe"),
+                to: path.join(".loadout.exe.old.3"),
+                aside: true,
+            },
+        ];
+        fs::write(path.join(".loadout-background.exe.old.1"), b"old launcher").unwrap();
+        fs::write(path.join("loadout-background.exe"), b"new launcher").unwrap();
+        fs::write(path.join(".loadout.exe.old.3"), b"old main").unwrap();
+        // The newest move can't be reversed: something now sits where the main was.
+        fs::create_dir(path.join("loadout.exe")).unwrap();
+        fs::write(path.join("loadout.exe").join("keep"), b"blocker").unwrap();
+
+        let failed = undo(&steps);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0.to, path.join(".loadout.exe.old.3"));
+        assert_eq!(
+            fs::read(path.join("loadout-background.exe")).unwrap(),
+            b"old launcher"
+        );
+        assert_eq!(
+            fs::read(path.join(".loadout-background.new.2.exe")).unwrap(),
+            b"new launcher"
+        );
+        assert_eq!(
+            fs::read(path.join(".loadout.exe.old.3")).unwrap(),
+            b"old main",
+            "the move that failed leaves its file for recovery"
+        );
+        assert!(!path.join(".loadout-background.exe.old.1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_later_failure_after_a_unix_rename_is_not_called_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("first"), b"old first").unwrap();
+        fs::create_dir(path.join("second")).unwrap();
+        fs::write(path.join("second").join("keep"), b"blocker").unwrap();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        let first = stage(path, "first", "", b"new first", true).unwrap();
+        let second = stage(path, "second", "", b"new second", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        let failure = publish(
+            vec![(first, path.join("first")), (second, path.join("second"))],
+            (record, path.join("loadout.install.toml")),
+        )
+        .unwrap_err();
+        assert!(!failure.restored, "{}", failure.detail);
+        assert_eq!(
+            fs::read(path.join("loadout.install.toml")).unwrap(),
+            b"old record"
+        );
+        assert_eq!(
+            names(path),
+            ["first", "loadout.install.toml", "second"],
+            "no staging file is left"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_windows_publication_puts_everything_back_and_cleans_its_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("loadout-background.exe"), b"old launcher").unwrap();
+        fs::write(path.join("loadout.exe"), b"old main").unwrap();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"new launcher", true).unwrap();
+        let main = stage(path, "loadout", ".exe", b"new main", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        // The main's staging file disappears, so placing it fails after the launcher is in.
+        fs::remove_file(main.path()).unwrap();
+        let failure = publish(
+            vec![
+                (launcher, path.join("loadout-background.exe")),
+                (main, path.join("loadout.exe")),
+            ],
+            (record, path.join("loadout.install.toml")),
+        )
+        .unwrap_err();
+        assert!(failure.restored, "{}", failure.detail);
+        assert_eq!(fs::read(path.join("loadout.exe")).unwrap(), b"old main");
+        assert_eq!(
+            fs::read(path.join("loadout-background.exe")).unwrap(),
+            b"old launcher"
+        );
+        assert_eq!(
+            names(path),
+            [
+                "loadout-background.exe",
+                "loadout.exe",
+                "loadout.install.toml"
+            ],
+            "the launcher's staging file, moved back, is removed again"
         );
     }
 

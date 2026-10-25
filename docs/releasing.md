@@ -190,7 +190,9 @@ Neither script installs git; each names the per-OS command instead.
    binary and record untouched.
    - On Windows the launcher goes first, then `loadout.exe`. Each existing binary, which may be
      running, is first moved aside to `.<name>.old.<guid>`, and if a later move fails every
-     completed move is undone in reverse. Then the record is replaced (`File.Replace`, no backup).
+     completed move is undone in reverse, each attempted even when another can't be. Files that
+     can't be moved back stay where they are and are named in the error. Then the record is
+     replaced (`File.Replace`, no backup).
    - The script deletes its own aside copies once the record is in place. One that is still
      running can't be deleted and stays; the script never deletes an aside it didn't make in that
      run, whatever its name. Self-update keeps a ledger of its own (below).
