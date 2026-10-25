@@ -29,6 +29,9 @@ async would buy v1 nothing.
 | `process-wrap` (std, job-object, creation-flags; Windows only) | process: each query runs in a job object, killed as a whole (U7) |
 | `loadout-winproc` (local, `publish = false`; Windows only) | process: resumes a child created suspended, once loadout owns its job (U7); the background supervisor's own kill-on-close job and its process count, and the worker's cooperative-startup checks (some job, stdin is a pipe) and nonce (U8) |
 | `nix` (`process`, `signal`; Unix only) | process: signals a query's or the background worker's process group and confirms it is empty (U7); the worker's handshake checks of its parent and group (U8) |
+| `ureq` 3 (`rustls` only: ring, webpki roots) | release: the HTTPS-only release redirect and downloads, no token (U9) |
+| `semver` | release: only a strictly newer stable release is offered (U9) |
+| `flate2` (`rust_backend`), `tar` (not Windows), `zip` (`deflate-flate2`, Windows only) | release: reading the binaries out of a release archive, in memory and bounded (U9) |
 
 `loadout-winproc` (`crates/loadout-winproc`, a workspace member) is the workspace's only `unsafe`
 code, over `windows` 0.62 (already in the lock through `process-wrap`): U7's resume in two steps,
@@ -103,7 +106,7 @@ src/
     plan.rs, apply.rs     loadout plan, loadout apply                       [U4 source]
     status.rs, rollback.rs                                                  [built, U3]
     update.rs, service.rs                                                   [U8]
-    init.rs                                                                 [U9]
+    init.rs                                                                 [U9 source]
   template/               mod.rs (API), strict.rs (guards), builtins.rs     [built: U2]
   state/                  hash, disk, journal, run, rollback                [built, U3]
   apply/                  mod.rs (run, run_under_lock, Options, Mode, Report)  [U4 source]
@@ -118,7 +121,9 @@ src/
                           installs, moved from programs), background.rs (supervisor, handshake,
                           bounded log)                                      [core: U8]
   sync/                   git clone/fetch, background service               [U8]
-  release/                self-update                                       [U9]
+  release/                mod.rs (latest, install, checks), record.rs (install record), download.rs
+                          (HTTPS, sidecar), archive.rs (bounded reads), publish.rs (staging)
+                                                                            [U9 source]
 ```
 
 Which subject may import which:
@@ -140,7 +145,7 @@ state                          -> context, plan (types), reserved, mcp
 plan                           -> manifest, machine, resolve, template, agents, programs, source, state, reserved, context, diagnostic, platform
 apply                          -> plan, state, programs, context, diagnostic
 sync                           -> context, manifest, diagnostic
-release                        -> context, diagnostic
+release                        -> context, diagnostic, process (bounded --version checks)
 ```
 
 `agents` and `state` import only `plan`'s data types and never call `plan::build`, which keeps
@@ -1742,10 +1747,24 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
 
 Automatic updates are required, so they are on by default.
 
-- `loadout init <url>` clones the loadout into `<state>/loadout` with the system `git`, writes
-  `machine.toml`, plans, applies, and installs the background service unless `[update] auto = false`.
-  A private loadout works through the user's existing Git credentials or SSH keys. Loadout stores no
-  token.
+- `loadout init <url>` (U9, source) clones the loadout into `<state>/loadout` with the system `git`,
+  writes `machine.toml`, plans, applies, and installs the background service unless
+  `[update] auto = false`. A private loadout works through the user's existing Git credentials or
+  SSH keys. Loadout stores no token. As built:
+  - Everything that can refuse runs before a write: an existing clone, or a `--name` that differs
+    from a saved name (a saved name never changes).
+  - It holds the state lock from `sync::clone(url, context, &lock)` through
+    `apply::run_under_lock(context, &sync::checkout(context), lock, …)`.
+  - The machine name is `--name`, else the saved name, else in a terminal the user's pick (it lists
+    the loadout's `[machines]`, defaulting to the hostname's name), else the hostname's. A name the
+    loadout doesn't list is noted: it gets the global and OS layers only.
+  - `machine::save` writes `name` and `remote` atomically (0600 on Unix), and refuses a remote with a
+    password.
+  - The service is installed with `sync::service::install(context, interval)` unless `--no-service`,
+    the resolved `[update] auto` is false, or the loadout is invalid. Its warnings are printed, and
+    an unhealthy refusal exits 4.
+  - `init` does not self-update: the install scripts that run it have just fetched the latest
+    release.
 - `loadout update` fetches and fast-forwards the clone, then plans and applies. If the clone has
   local changes or the remote doesn't fast-forward, it is left untouched and reported (exit 4).
 - `loadout service install|uninstall|status` manages a per-user job:
@@ -1759,16 +1778,40 @@ Automatic updates are required, so they are on by default.
   The job runs `loadout update --background` every `interval_minutes`, with no prompts, no
   elevation, and no `--force`. Drift and blocked actions are recorded for `status`. A Linux machine
   without a systemd user session gets a doctor warning, and `service install` exits 4.
-- **Self-update** (U9) runs when `[update] cli = true` and the install script installed the binary.
+- **Self-update** (U9, source) runs when `[update] cli = true` and the install script installed the binary.
   `update` reads the latest public GitHub release with no token, verifies the asset's `.sha256`, and
   replaces itself. A binary from `cargo install` or a package manager is never replaced; doctor
-  reports how the CLI was installed.
+  reports how the CLI was installed. As built in `src/release/`:
+  - **Calling it.** After its apply, `update` calls `release::latest(context)`, then
+    `release::install(&release)` on `Some`.
+  - **Newer only.** `Some` means a strictly newer stable release; `None` means up to date, so
+    nothing is ever downgraded. The release tag comes from the `releases/latest` redirect.
+  - **Skips.** `Error::skipped()` covers LOADOUT_HOME isolation, a binary without a matching
+    install record, and no published release. Those are reported, not failures. Every other error
+    fails the self-update.
+  - **Managed binaries.** A binary counts as managed only when its install record
+    (`docs/releasing.md`, schema 1 or 2) parses exactly and binds this platform's installer, the
+    build's target, the canonical running executable, its current SHA-256 and the running version.
+    Schema 2 also binds the Windows background launcher.
+  - **Replacing it.**
+    - The archive and sidecar come over HTTPS only (max 5 redirects, size limits). The sidecar must
+      be the exact line, and the hash must match.
+    - The expected binaries are read from memory after name, type and size checks, and each is
+      staged with `create_new` beside its destination.
+    - Each staged binary must print exactly `loadout <version>` or `loadout-background <version>`.
+    - Then the binaries are published and the record last. On Windows, running executables are
+      moved aside and every completed move is undone if a later one fails.
+    - A Windows schema-1 install is upgraded to schema 2 with the launcher.
+    - Interrupted publication is not atomic across files and fails closed: a binary that no longer
+      matches its record is unmanaged until it is reinstalled.
 
 ## 9. Bootstrap and release (frozen, U9 + release CI)
 
 - Release CI (PR #2) builds `loadout-<target>.tar.gz`, or `.zip` on Windows, each with a `.sha256`,
   for x86_64 and aarch64 Linux (musl), macOS, and Windows. The repo is public, so
-  `releases/latest/download/` URLs need no token.
+  `releases/latest/download/` URLs need no token. The Windows zip holds exactly two binaries,
+  `loadout.exe` and the windowless launcher `loadout-background.exe` (U8's bin target in this
+  package), and installers and self-update install both under an install record of schema 2.
 - `install.sh` (macOS, Linux) and `install.ps1` (Windows) are owned by U9 and live beside the release
   scripts. They download the right archive, verify it, and install to `~/.local/bin` or
   `%LOCALAPPDATA%\Programs\loadout`. Given a loadout URL, they then run `loadout init <url>`.
@@ -1788,7 +1831,7 @@ Automatic updates are required, so they are on by default.
 | `loadout rollback [RUN]`: undo the newest or the named run; exit 4 when later changes block it | built | U3 |
 | `loadout update [--background]` | frozen | U8 (+U9 self-update) |
 | `loadout service install\|uninstall\|status` | frozen | U8 |
-| `loadout init <URL> [--name NAME] [--no-service]` | frozen | U9 |
+| `loadout init <URL> [--name NAME] [--no-service]`: clone, name the machine, apply, install the service; exit 3 invalid, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
 
 `plan`, `apply`, and `update` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
 at another checkout.
@@ -1962,9 +2005,15 @@ pub fn clone(url: &str, context: &Context) -> Result<(), sync::Error>;
 pub fn fetch(context: &Context) -> Result<Fetched, sync::Error>;   // UpToDate | Advanced { from, to } | Blocked(reason)
 pub mod service { pub fn install(context: &Context, interval_minutes: u32) -> Result<(), Error>; pub fn uninstall(context: &Context) -> Result<(), Error>; pub fn status(context: &Context) -> Result<Status, Error>; }
 
-// release (U9)
-pub fn latest(context: &Context) -> Result<Option<Release>, release::Error>;
-pub fn install(release: &Release) -> Result<(), release::Error>;
+// release (U9, source)
+pub struct Release { .. }                 // only latest makes one; tag(), version(), current() -> &str
+pub fn latest(context: &Context) -> Result<Option<Release>, release::Error>;   // Some: strictly newer stable release of a managed binary
+pub fn install(release: &Release) -> Result<(), release::Error>;              // re-verifies provenance; captured Containment for --version checks
+pub fn checks(context: &Context) -> Vec<Check>;                              // doctor: how the CLI was installed
+pub enum Error { Isolated, Unmanaged { reason }, NoRelease, Download { detail }, Verify { detail }, Changed { detail }, Io { .. }, Publish { detail, restored } }
+impl Error { pub fn skipped(&self) -> bool; }                                // Isolated | Unmanaged | NoRelease: report, don't fail
+// machine (U9 addition)
+pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), machine::Error>; // atomic, 0600 on Unix; refuses links, invalid names, password remotes
 ```
 
 A unit that must change a foundation type or a frozen signature changes it in its own PR, updates
