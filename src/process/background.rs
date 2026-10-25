@@ -87,7 +87,7 @@ impl Limits {
 
 /// How far past a run's furthest planned deadline the clock must still reach, so that the
 /// fresh `Instant`s taken later in the run (after scheduling delays) still add up.
-const HEADROOM: Duration = Duration::from_secs(24 * 60 * 60);
+const HEADROOM: Duration = Duration::from_hours(24);
 
 /// `now + duration`, or `now` when the clock can't represent it: a spent budget, which makes
 /// the step that uses it a single attempt that fails honestly rather than a panic. Validated
@@ -245,16 +245,16 @@ fn start(
     setup: Instant,
 ) -> Result<(), String> {
     #[cfg(test)]
-    seam::hit(&seam::Point::BeforeStart, setup)?;
+    seam::hit(seam::Point::BeforeStart, setup)?;
     within(setup)?;
     #[cfg(test)]
-    seam::hit(&seam::Point::AfterSpawn, setup)?;
+    seam::hit(seam::Point::AfterSpawn, setup)?;
     drain(tree.take_stdout(), sink)?;
     #[cfg(test)]
-    seam::hit(&seam::Point::BetweenDrainers, setup)?;
+    seam::hit(seam::Point::BetweenDrainers, setup)?;
     drain(tree.take_stderr(), sink)?;
     #[cfg(test)]
-    seam::hit(&seam::Point::BeforeSend, setup)?;
+    seam::hit(seam::Point::BeforeSend, setup)?;
     send(control, line.as_bytes())?;
     within(setup)
 }
@@ -343,7 +343,7 @@ fn run(mut worker: Command, nonce: &str, setup: Instant, limits: Limits) -> Resu
 #[cfg(windows)]
 fn join(child: &Child, setup: Instant) -> io::Result<loadout_winproc::Job> {
     #[cfg(test)]
-    seam::hit(&seam::Point::BeforeMembership, setup).map_err(io::Error::other)?;
+    seam::hit(seam::Point::BeforeMembership, setup).map_err(io::Error::other)?;
     #[cfg(not(test))]
     let _ = setup;
     let job = loadout_winproc::Job::new()?;
@@ -364,17 +364,17 @@ fn start(
     setup: Instant,
 ) -> Result<Instant, String> {
     #[cfg(test)]
-    seam::hit(&seam::Point::AfterMembership, setup)?;
+    seam::hit(seam::Point::AfterMembership, setup)?;
     drain(child.stdout.take(), sink)?;
     #[cfg(test)]
-    seam::hit(&seam::Point::BetweenDrainers, setup)?;
+    seam::hit(seam::Point::BetweenDrainers, setup)?;
     drain(child.stderr.take(), sink)?;
     send(control, line.as_bytes())?;
     #[cfg(test)]
-    seam::hit(&seam::Point::BeforeResume, setup)?;
+    seam::hit(seam::Point::BeforeResume, setup)?;
     let started = resume(child, setup)?;
     #[cfg(test)]
-    seam::hit(&seam::Point::AfterResume, setup)?;
+    seam::hit(seam::Point::AfterResume, setup)?;
     Ok(started)
 }
 
@@ -390,13 +390,13 @@ fn resume(child: &Child, setup: Instant) -> Result<Instant, String> {
     let prepared =
         loadout_winproc::prepare(child).map_err(|error| format!("cannot resume it: {error}"))?;
     #[cfg(test)]
-    seam::hit(&seam::Point::AfterPrepare, setup)?;
+    seam::hit(seam::Point::AfterPrepare, setup)?;
     prepared
         .resume_before(setup)
         .map_err(|error| format!("cannot resume it: {error}"))?;
     let resumed = Instant::now();
     #[cfg(test)]
-    seam::hit(&seam::Point::AfterResumeCall, setup)?;
+    seam::hit(seam::Point::AfterResumeCall, setup)?;
     if Instant::now() >= setup {
         return Err(
             "it was resumed only as its setup limit passed, so loadout stopped it".to_owned(),
@@ -791,8 +791,8 @@ fn parse(line: &str) -> Result<Line, String> {
     };
     Ok(Line {
         nonce: (*nonce).to_owned(),
-        group: number(*group)?,
-        supervisor: number(*supervisor)?,
+        group: number(group)?,
+        supervisor: number(supervisor)?,
     })
 }
 
@@ -1079,20 +1079,20 @@ mod seam {
         }
     }
 
-    pub(super) fn hit(point: &Point, setup: Instant) -> Result<(), String> {
-        REACHED.with(|cell| cell.borrow_mut().push(*point));
+    pub(super) fn hit(point: Point, setup: Instant) -> Result<(), String> {
+        REACHED.with(|cell| cell.borrow_mut().push(point));
         let injected = || Err(format!("injected: setup failure at {point:?}"));
         match current() {
-            Some(Fault::Fail(at)) if at == *point => injected(),
-            Some(Fault::ExhaustThenFail(at)) if at == *point => {
+            Some(Fault::Fail(at)) if at == point => injected(),
+            Some(Fault::ExhaustThenFail(at)) if at == point => {
                 wait_out(setup);
                 injected()
             }
-            Some(Fault::ExhaustThenContinue(at)) if at == *point => {
+            Some(Fault::ExhaustThenContinue(at)) if at == point => {
                 wait_out(setup);
                 Ok(())
             }
-            Some(Fault::FailWhenReady(at, ready)) if at == *point => {
+            Some(Fault::FailWhenReady(at, ready)) if at == point => {
                 let limit = Instant::now() + Duration::from_secs(20);
                 while !ready.exists() {
                     if Instant::now() >= limit {

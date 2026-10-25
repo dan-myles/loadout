@@ -85,7 +85,7 @@ fn worker() {
         }
         "flood" => {
             let chunk = vec![b'x'; 64 * 1024];
-            let mut stdout = std::io::stdout().lock();
+            let mut stdout = io::stdout().lock();
             for _ in 0..48 {
                 stdout.write_all(&chunk).unwrap();
             }
@@ -1080,7 +1080,7 @@ mod refusals {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("line");
         std::fs::write(&path, line()).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
+        let file = File::open(&path).unwrap();
         assert_eq!(direct(Stdio::from(file), None).code(), Some(REFUSED));
     }
 

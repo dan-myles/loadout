@@ -11,7 +11,7 @@ use crate::programs::State;
 pub(super) fn actions(steps: &Steps, options: Options, problems: &mut Diagnostics) -> Vec<Action> {
     let mut seen: BTreeMap<(Manager, String), &str> = BTreeMap::new();
     let mut actions = Vec::new();
-    for (id, step) in &steps.steps {
+    for (id, step) in &steps.by_program {
         let item = ItemRef {
             kind: ItemKind::Program,
             id: id.clone(),

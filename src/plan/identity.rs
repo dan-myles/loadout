@@ -8,6 +8,12 @@ use crate::manifest::McpShape;
 use crate::platform::Os;
 use crate::reserved::{self, Part};
 
+/// Asks the nearest existing folder at or above a path how it treats case.
+pub(super) type Probe<'a> = &'a dyn Fn(&Path) -> (PathBuf, Case);
+
+/// The probe a platform provides; see `case_probe`.
+pub(super) type ProbeFn = fn(&Path) -> (PathBuf, Case);
+
 /// Where a destination lies: its path as written, and with every existing link resolved
 /// (`reserved::normalize`). Two destinations are compared in every pair of forms, so a stable
 /// link such as `~/alias -> ~/real` makes `~/alias/tool` and `~/real/tool` one place. Names stay
@@ -168,11 +174,7 @@ pub(super) fn storage(target: &Target) -> Option<Vec<String>> {
 
 /// Whether two places are one document: the same file as written or resolved, or two
 /// spellings that the deciding folder proves, or might prove, to be one.
-pub(super) fn document(
-    one: &Place,
-    other: &Place,
-    probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
-) -> Verdict {
+pub(super) fn document(one: &Place, other: &Place, probe: Option<Probe<'_>>) -> Verdict {
     let file = Target::Path {
         path: PathBuf::new(),
     };
@@ -192,7 +194,7 @@ fn nested(one: &[String], other: &[String]) -> bool {
 pub(super) fn relate(
     one: (&Target, &Place),
     other: (&Target, &Place),
-    probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
+    probe: Option<Probe<'_>>,
 ) -> Verdict {
     if let Some(relation) = relation(one.1, other.1) {
         return if apart(one.0, other.0, relation) {
@@ -243,7 +245,7 @@ pub(super) fn relate(
 /// The case probe to use on this machine. Linux and macOS volumes can each be either way, folder
 /// by folder on Linux, so the actual folder decides there. On Windows, `Place` already folds
 /// ASCII case, as state does, and no read-only probe can prove more.
-pub(super) fn case_probe(context: &Context) -> Option<fn(&Path) -> (PathBuf, Case)> {
+pub(super) fn case_probe(context: &Context) -> Option<ProbeFn> {
     match context.os {
         Os::Linux | Os::Macos => Some(volume::probe),
         Os::Windows => None,
@@ -252,6 +254,7 @@ pub(super) fn case_probe(context: &Context) -> Option<fn(&Path) -> (PathBuf, Cas
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
 
     use super::*;
@@ -289,7 +292,7 @@ mod tests {
         context: &Context,
         one: &Target,
         other: &Target,
-        probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
+        probe: Option<Probe<'_>>,
     ) -> Verdict {
         let one_place = place(context, file(one).unwrap()).unwrap();
         let other_place = place(context, file(other).unwrap()).unwrap();

@@ -1,5 +1,7 @@
 use std::ffi::OsString;
-use std::fs::{self, Metadata};
+use std::fs;
+#[cfg(unix)]
+use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -36,7 +38,7 @@ pub(super) fn case_pair(a: &Path, b: &Path) -> Option<CasePair> {
         .filter(|index| ours[*index] != theirs[*index])
         .map(|index| a.components().take(index).collect::<PathBuf>())
         .collect();
-    (!divergences.is_empty()).then(|| CasePair {
+    (!divergences.is_empty()).then_some(CasePair {
         same: ours.len() == theirs.len(),
         divergences,
     })
@@ -95,11 +97,21 @@ fn case_of(dir: &Path) -> Case {
             return Case::Unknown;
         };
         return match fs::symlink_metadata(dir.join(swapped)) {
-            Ok(other) => match same_file(&original, &other) {
-                Some(true) => Case::Insensitive,
-                Some(false) => Case::Sensitive,
-                None => Case::Unknown,
-            },
+            Ok(other) => {
+                #[cfg(unix)]
+                let same = Some(same_file(&original, &other));
+                // No stable file identity here: two spellings can't be proven one or two.
+                #[cfg(not(unix))]
+                let same = {
+                    let _ = (&original, &other);
+                    None
+                };
+                match same {
+                    Some(true) => Case::Insensitive,
+                    Some(false) => Case::Sensitive,
+                    None => Case::Unknown,
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Case::Sensitive,
             Err(_) => Case::Unknown,
         };
@@ -107,15 +119,11 @@ fn case_of(dir: &Path) -> Case {
     Case::Unknown
 }
 
+/// Whether two entries are one file.
 #[cfg(unix)]
-fn same_file(one: &Metadata, other: &Metadata) -> Option<bool> {
+fn same_file(one: &Metadata, other: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    Some(one.dev() == other.dev() && one.ino() == other.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file(_: &Metadata, _: &Metadata) -> Option<bool> {
-    None
+    one.dev() == other.dev() && one.ino() == other.ino()
 }
 
 #[cfg(test)]

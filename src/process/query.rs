@@ -3060,7 +3060,7 @@ mod inherited_tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = marker(&dir, "descendant");
         let script = format!(
-            "sleep 8 >/dev/null 2>&1 & echo $! > '{}'; sleep 30",
+            "sleep 8 >/dev/null 2>&1 & echo $! > '{}'; exec sleep 30",
             pid_file.display()
         );
         let error = run_inherited_query(

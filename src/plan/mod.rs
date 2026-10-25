@@ -205,7 +205,7 @@ pub struct Options {
 /// `programs::steps`, so a caller can pass them back but never forge one.
 #[derive(Debug, Clone)]
 pub struct Steps {
-    steps: BTreeMap<String, programs::Step>,
+    by_program: BTreeMap<String, programs::Step>,
     programs: BTreeMap<String, Program>,
     facts: Facts,
     context: Context,
@@ -213,7 +213,7 @@ pub struct Steps {
 
 impl Steps {
     pub fn get(&self, program: &str) -> Option<&programs::Step> {
-        self.steps.get(program)
+        self.by_program.get(program)
     }
 
     /// Steps are reused only for the same declared programs, facts, and context; anything else
@@ -303,7 +303,7 @@ pub fn build(
             #[cfg(test)]
             observe::reached(observe::Stage::Query);
             Steps {
-                steps: programs::steps(&resolved.programs, &facts, context)
+                by_program: programs::steps(&resolved.programs, &facts, context)
                     .map_err(program_error)?
                     .into_iter()
                     .map(|step| (step.program.clone(), step))
@@ -442,7 +442,7 @@ mod tests {
             },
         )]);
         let steps = Steps {
-            steps: BTreeMap::new(),
+            by_program: BTreeMap::new(),
             programs: declared.clone(),
             facts: facts.clone(),
             context: context.clone(),

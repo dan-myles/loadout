@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::files::Produced;
-use super::identity::{self, Place, Unresolved, Verdict};
+use super::identity::{self, Place, Probe, Unresolved, Verdict};
 use super::volume::Case;
 use super::{Action, Change, Desired, Error, ItemKind, ItemRef, Observed, Target, error};
 use crate::context::Context;
@@ -25,7 +25,7 @@ pub(super) fn actions(
         let wanted = match state::digest(&desired.content) {
             Ok(Observed::Present { sha256 }) => sha256,
             Ok(other) => {
-                return Err(internal(format!(
+                return Err(internal(&format!(
                     "the digest of {} is {other:?}",
                     state::label(&desired.target)
                 )));
@@ -121,7 +121,7 @@ fn places(context: &Context, actions: &mut [Action]) -> Result<(Vec<Option<Place
         };
         match identity::place(context, path) {
             Ok(place) => places.push(Some(place)),
-            Err(Unresolved::Internal(message)) => return Err(internal(message)),
+            Err(Unresolved::Internal(message)) => return Err(internal(&message)),
             Err(Unresolved::Unknown(reason)) => {
                 unknown = true;
                 places.push(None);
@@ -155,7 +155,7 @@ fn removals(
     declared_places: &[Option<Place>],
     declared: usize,
     unknown: bool,
-    probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
+    probe: Option<Probe<'_>>,
     owned: &mut Owned,
 ) -> Result<(Vec<Action>, Vec<Option<Place>>), Error> {
     owned.migrating = vec![false; declared];
@@ -176,14 +176,14 @@ fn removals(
             content: None,
         };
         let Some(path) = identity::file(&record.target) else {
-            return Err(internal(format!(
+            return Err(internal(&format!(
                 "a record has no file: {}",
                 state::label(&record.target)
             )));
         };
         let place = match identity::place(context, path) {
             Ok(place) => place,
-            Err(Unresolved::Internal(message)) => return Err(internal(message)),
+            Err(Unresolved::Internal(message)) => return Err(internal(&message)),
             Err(Unresolved::Unknown(reason)) => {
                 // A declaration at this exact path has the same unknown place, which already
                 // blocks it and every removal.
@@ -270,7 +270,7 @@ fn migrations(
     declared: usize,
     owned: &Target,
     owned_place: &Place,
-    probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
+    probe: Option<Probe<'_>>,
 ) -> Vec<usize> {
     let Some(stored) = identity::storage(owned) else {
         return Vec::new();
@@ -396,7 +396,7 @@ fn relate_all(
     actions: &mut [Action],
     places: &[Option<Place>],
     declared: usize,
-    probe: Option<&dyn Fn(&Path) -> (PathBuf, Case)>,
+    probe: Option<Probe<'_>>,
     owned: &Owned,
     problems: &mut Diagnostics,
 ) {
@@ -418,8 +418,7 @@ fn relate_all(
             let writer =
                 |role: Role| matches!(role, Role::Writer | Role::Migrating { writes: true });
             let relevant = match roles {
-                (Role::Removal, Role::Removal) => true,
-                (Role::Removal, Role::Writer | Role::Silent)
+                (Role::Removal, Role::Removal | Role::Writer | Role::Silent)
                 | (Role::Writer | Role::Silent, Role::Removal) => true,
                 (a, b) => writer(a) && writer(b),
             };
@@ -525,7 +524,7 @@ fn classify(
         }
         Observed::Present { sha256 } => sha256.as_str(),
         Observed::Installed => {
-            return Err(internal(format!(
+            return Err(internal(&format!(
                 "{} was observed as an installed program",
                 state::label(target)
             )));
@@ -604,7 +603,7 @@ pub(super) fn item_key(item: &ItemRef) -> String {
     format!("{section}.{}", item.id)
 }
 
-fn internal(message: String) -> Error {
+fn internal(message: &str) -> Error {
     Error::Runtime(anyhow::anyhow!("internal error: {message}"))
 }
 
@@ -954,7 +953,7 @@ mod tests {
         state: &State,
     ) -> (Vec<Action>, Diagnostics) {
         let mut problems = Diagnostics::default();
-        let actions = super::actions(
+        let actions = actions(
             Produced {
                 desired,
                 unsupported: Vec::new(),
@@ -1443,7 +1442,7 @@ mod tests {
                             desired_list.insert(0, desired(owned.clone()));
                         }
                         let mut problems = Diagnostics::default();
-                        let actions = super::actions(
+                        let actions = actions(
                             Produced {
                                 desired: desired_list,
                                 unsupported,
@@ -1507,7 +1506,7 @@ mod tests {
         state: &State,
     ) -> (Vec<Action>, Diagnostics) {
         let mut problems = Diagnostics::default();
-        let actions = super::actions(
+        let actions = actions(
             Produced {
                 desired,
                 unsupported,
@@ -1834,7 +1833,7 @@ mod tests {
         let owned_search = at(McpFormat::Json, "search");
         let declared_docs = at(McpFormat::Jsonc, "docs");
         let jsonc_sibling = at(McpFormat::Jsonc, "other");
-        let json_sibling = at(McpFormat::Json, "third");
+        let plain_sibling = at(McpFormat::Json, "third");
 
         for order in [
             vec![
@@ -1887,7 +1886,7 @@ mod tests {
             &machine,
             vec![
                 desired(declared_docs.clone()),
-                desired(json_sibling.clone()),
+                desired(plain_sibling.clone()),
             ],
             &state,
         );

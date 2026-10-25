@@ -100,7 +100,7 @@ def main(argv=None):
         env = dict(os.environ, LOADOUT_HOME=str(home), LOADOUT_STATE_DIR=str(state))
 
         expect("--help", binary, ["--help"], 0, env, contains="validate")
-        expect("unknown command", binary, ["apply"], 2, env)
+        expect("unknown command", binary, ["no-such-command"], 2, env)
         doctor(binary, env)
         expect("validate complete", binary, ["validate", str(fixtures / "complete")], 0, env,
                contains="valid: ")

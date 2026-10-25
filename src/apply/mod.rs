@@ -306,27 +306,27 @@ fn execute(run: &mut Run, context: &Context, checkout: &Path, action: &Action) -
             Err(error) => failure(&error),
         };
     }
-    let Some(content) = &action.content else {
+    let Some(wanted) = &action.content else {
         return Outcome::Failed("internal error: a write without content".to_owned());
     };
-    if let Err(error) = run.write(action, content) {
+    if let Err(error) = run.write(action, wanted) {
         return failure(&error);
     }
     if action.change == Change::Adopt {
         return Outcome::Adopted;
     }
-    verify(context, checkout, action, content)
+    verify(context, checkout, action, wanted)
 }
 
 /// A file system that ignores Unix modes, such as FAT, can't keep the execute bit loadout set,
 /// and nothing read-only could have told the plan. Reading the target back is where it shows.
-fn verify(context: &Context, checkout: &Path, action: &Action, content: &Content) -> Outcome {
+fn verify(context: &Context, checkout: &Path, action: &Action, wanted: &Content) -> Outcome {
     if !matches!(action.target, Target::Path { .. }) {
         return Outcome::Done;
     }
     let label = state::label(&action.target);
     match (
-        state::digest(content),
+        state::digest(wanted),
         state::observe(context, checkout, &action.target),
     ) {
         (Ok(wanted), Ok(now)) if wanted == now => Outcome::Done,
@@ -639,6 +639,23 @@ mod tests {
             .cancel();
     }
 
+    /// Whether the state lock is free within a few seconds. Other tests in this process spawn
+    /// children in parallel, and each child holds a copy of this process's descriptors until it
+    /// execs, so a lock dropped a moment ago can still look held. One that is really kept stays
+    /// held past the deadline.
+    fn released(context: &Context) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !state::busy(context).unwrap() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     const BACKGROUND: Options = Options {
         force: false,
         elevated: false,
@@ -675,7 +692,7 @@ mod tests {
         assert!(!sandbox.home.join(".a").exists() && !sandbox.home.join(".b").exists());
         assert!(state::runs(&context).unwrap().is_empty());
         assert_eq!(State::load(&context).unwrap().records().count(), 0);
-        assert!(!state::busy(&context).unwrap(), "the lock is released");
+        assert!(released(&context), "the lock is released");
     }
 
     /// Cancelled after the first journaled action: that action's outcome and record stay, the
@@ -719,7 +736,7 @@ mod tests {
         let records = State::load(&context).unwrap();
         assert_eq!(records.records().count(), 1);
         assert!(records.record(&done[0].target).is_some());
-        assert!(!state::busy(&context).unwrap());
+        assert!(released(&context));
     }
 
     /// A cancelled run with nothing to write is not a clean success, whether the loadout
@@ -748,6 +765,7 @@ mod tests {
         )
         .unwrap();
         assert!(!first.unhealthy(), "{first:#?}");
+        assert!(released(&settled.context), "the first run let the lock go");
         let context = supervised(&settled.context);
         cancel(&context);
         let report = run_under_lock(
@@ -937,7 +955,7 @@ mod tests {
         assert!(report.finish_error.is_some(), "{report:#?}");
         assert!(report.cancelled);
         assert!(report.failed(), "a real failure and a failed finish exit 1");
-        assert!(!state::busy(&context).unwrap());
+        assert!(released(&context));
     }
 
     /// The finish saves the records, then the journal. With the run's own folder read-only
@@ -997,14 +1015,11 @@ mod tests {
             ],
             "the lock is held at every boundary"
         );
-        assert!(
-            !state::busy(&sandbox.context).unwrap(),
-            "and released after"
-        );
+        assert!(released(&sandbox.context), "and released after");
     }
 
     /// Controls that need a real package manager: `programs::steps` finds a genuinely missing
-    /// program only outside LOADOUT_HOME isolation, through a manager on PATH. Each scenario
+    /// program only outside `LOADOUT_HOME` isolation, through a manager on `PATH`. Each scenario
     /// runs `flow` in a child process of this test binary, the way U8's producer controls do,
     /// with a cleared environment whose PATH holds only a fake `cargo`, and owned by U8's
     /// child guard from the moment it exists. The fake records every call it gets, answers the

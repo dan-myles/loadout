@@ -75,7 +75,10 @@ enum Identity {
     /// Unix only: a real error means the child may have been reaped elsewhere. Never cleared.
     /// `reported` is set once an explicit call returned the loss, so `Drop` doesn't fail a
     /// test twice for it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only Unix can lose a child's identity")
+    )]
     Lost { why: String, reported: bool },
 }
 

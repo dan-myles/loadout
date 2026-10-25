@@ -101,8 +101,10 @@ fn outcome_at<'a>(report: &'a apply::Report, path: &Path) -> &'a Outcome {
                     path: path.to_path_buf(),
                 }
         })
-        .map(|(_, outcome)| outcome)
-        .unwrap_or_else(|| panic!("no outcome for {}: {:#?}", path.display(), report.outcomes))
+        .map_or_else(
+            || panic!("no outcome for {}: {:#?}", path.display(), report.outcomes),
+            |(_, outcome)| outcome,
+        )
 }
 
 const TWO_FILES: &str =
@@ -455,7 +457,7 @@ fn two_owned_spellings_of_one_file_are_never_removed_while_one_is_declared_or_bo
 
     // Records left by an older build: both spellings adopted. U4 itself now refuses to declare
     // both, so the fixture writes them through state's own public run API.
-    let content = loadout::plan::Content::File(loadout::plan::FileContent {
+    let content = plan::Content::File(plan::FileContent {
         bytes: b"x".to_vec(),
         executable: false,
     });
@@ -776,8 +778,10 @@ fn entry_outcome<'a>(report: &'a apply::Report, wanted: &str) -> &'a Outcome {
         .outcomes
         .iter()
         .find(|(action, _)| matches!(&action.target, plan::Target::Entry { key, .. } if key == wanted))
-        .map(|(_, outcome)| outcome)
-        .unwrap_or_else(|| panic!("no outcome for {wanted}: {:#?}", report.outcomes))
+        .map_or_else(
+            || panic!("no outcome for {wanted}: {:#?}", report.outcomes),
+            |(_, outcome)| outcome,
+        )
 }
 
 /// The ownership record of the MCP key `wanted`, as its hash and run.
@@ -1040,6 +1044,7 @@ fn custom_agent(name: &str, dir: &str, format: &str, shape: &str, env_syntax: &s
 ///   path, so the two are never declared together);
 /// - a JSON `search` is compatible with the old contract: it is written, and `old` is removed;
 /// - with no record at all, the JSONC `search` is simply created.
+///
 /// Both link orientations and both agent orders are run. The unsupported `docs` keeps its
 /// record and its value throughout.
 #[cfg(unix)]
