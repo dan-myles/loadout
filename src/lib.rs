@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod mcp;
 pub mod plan;
 pub mod platform;
+pub mod process;
 pub mod programs;
 pub mod reserved;
 pub mod resolve;

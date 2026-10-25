@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::context;
@@ -116,33 +115,7 @@ pub(super) fn check_package(manager: Manager, package: &str) -> Result<(), Strin
     Ok(())
 }
 
-pub(super) struct Invocation {
-    pub(super) program: PathBuf,
-    pub(super) args: Vec<OsString>,
-    pub(super) env: &'static [(&'static str, &'static str)],
-}
-
-impl Invocation {
-    pub(super) fn new<I, S>(program: &Path, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<OsString>,
-    {
-        Self {
-            program: program.to_path_buf(),
-            args: args.into_iter().map(Into::into).collect(),
-            env: &[],
-        }
-    }
-
-    pub(super) fn display(&self) -> String {
-        std::iter::once(self.program.as_os_str())
-            .chain(self.args.iter().map(OsString::as_os_str))
-            .map(|part| part.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
+pub(super) use crate::process::Invocation;
 
 pub(super) fn install(manager: Manager, program: &Path, package: &str, scope: Scope) -> Invocation {
     let args: Vec<&str> = match manager {

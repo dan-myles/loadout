@@ -20,7 +20,7 @@ use nix::unistd::Pid;
 #[cfg(windows)]
 use process_wrap::std::{ChildWrapper, CommandWrap, CreationFlags, JobObject};
 
-use super::manager::Invocation;
+use super::{Containment, Invocation, WORKER_NONCE};
 
 /// How long loadout waits for one installed-query's (or doctor's query's) own process. Generous:
 /// a query can refresh a source index or fetch an API. Stopping what it leaves behind is bounded
@@ -37,21 +37,21 @@ const INSTALL_DRAIN: Duration = Duration::from_secs(30);
 /// child, the empty process group (Unix), and both readers reaching EOF. It bounds no query and
 /// no install.
 const QUERY_CLEANUP_GRACE: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(20);
+pub(super) const POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
-pub(super) struct Captured {
-    pub(super) code: Option<i32>,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
+pub(crate) struct Captured {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl Captured {
-    pub(super) fn success(&self) -> bool {
+    pub(crate) fn success(&self) -> bool {
         self.code == Some(0)
     }
 
-    pub(super) fn hresult(&self) -> Option<u32> {
+    pub(crate) fn hresult(&self) -> Option<u32> {
         #[expect(
             clippy::cast_sign_loss,
             reason = "winget reports HRESULTs as negative i32 codes"
@@ -59,7 +59,7 @@ impl Captured {
         self.code.map(|code| code as u32)
     }
 
-    pub(super) fn status(&self) -> String {
+    pub(crate) fn status(&self) -> String {
         match self.code {
             #[expect(
                 clippy::cast_sign_loss,
@@ -73,7 +73,7 @@ impl Captured {
 
     /// The tail of what the manager printed, as a terminal would show it: a progress bar that
     /// redraws with `\r` keeps only its last state.
-    pub(super) fn tail(&self) -> String {
+    pub(crate) fn tail(&self) -> String {
         let text = format!("{}\n{}", self.stdout.trim(), self.stderr.trim());
         let lines: Vec<&str> = text
             .lines()
@@ -89,13 +89,13 @@ impl Captured {
         }
     }
 
-    pub(super) fn unexpected(&self) -> String {
+    pub(crate) fn unexpected(&self) -> String {
         format!("unexpected {}{}", self.status(), self.tail())
     }
 }
 
 #[derive(Debug)]
-pub(super) enum QueryError {
+pub(crate) enum QueryError {
     Spawn(io::Error),
     Wait(io::Error),
     Read(io::Error),
@@ -109,6 +109,8 @@ pub(super) enum QueryError {
         cause: Option<Box<QueryError>>,
         detail: String,
     },
+    /// The supervised background run was cancelled, so no query was started.
+    Cancelled,
 }
 
 impl fmt::Display for QueryError {
@@ -137,6 +139,10 @@ impl fmt::Display for QueryError {
                     None => Ok(()),
                 }
             }
+            QueryError::Cancelled => write!(
+                f,
+                "the background run was cancelled, so loadout started no further query"
+            ),
         }
     }
 }
@@ -150,14 +156,42 @@ fn command(invocation: &Invocation) -> Command {
         .args(&invocation.args)
         .envs(invocation.env.iter().copied())
         .env("LC_ALL", "C")
+        .env_remove(WORKER_NONCE)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
 }
 
-pub(super) fn query(invocation: &Invocation) -> Result<Captured, QueryError> {
-    run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP)
+/// Runs one query. In the foreground (`OwnGroup`) it is exactly U7's bounded query. In a
+/// supervised background worker (`Inherited`) a cancelled run starts no query, every failure
+/// cancels the run, and on Unix the query stays in the supervisor's group (see
+/// `run_inherited_query`).
+pub(crate) fn query(
+    invocation: &Invocation,
+    containment: &Containment,
+) -> Result<Captured, QueryError> {
+    let Containment::Inherited(supervised) = containment else {
+        return run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
+    };
+    if supervised.cancel().is_cancelled() {
+        return Err(QueryError::Cancelled);
+    }
+    #[cfg(unix)]
+    let result = run_inherited_query(
+        invocation,
+        QUERY_DEADLINE,
+        QUERY_OUTPUT_CAP,
+        QUERY_CLEANUP_GRACE,
+    );
+    // Windows: the query's own job nests inside the supervisor's kill-on-close job, so ending
+    // that job ends this one too.
+    #[cfg(windows)]
+    let result = run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
+    if result.is_err() {
+        supervised.cancel().cancel();
+    }
+    result
 }
 
 /// Runs a query in a process tree loadout can stop as a whole: on Unix a process group whose id
@@ -200,7 +234,7 @@ fn run_query_with(
     let started = started.and_then(|()| query.start(setup));
     let (outcome, limit) = match started {
         Ok(()) => {
-            let outcome = watch(&mut query, &stdout, &stderr, deadline, cap);
+            let outcome = watch(|| query.try_exit(), &stdout, &stderr, deadline, cap);
             (outcome, Instant::now() + grace)
         }
         Err(error) => (Err(error), setup),
@@ -226,7 +260,7 @@ fn run_query_with(
 /// Waits for the query's own process to exit, stopping early on an oversized stream or at the
 /// deadline. Whatever it leaves behind belongs to `settle`.
 fn watch(
-    query: &mut Query,
+    mut try_exit: impl FnMut() -> io::Result<Option<ExitStatus>>,
     stdout: &Shared,
     stderr: &Shared,
     deadline: Duration,
@@ -239,7 +273,7 @@ fn watch(
                 return Err(QueryError::Oversized { stream, cap });
             }
         }
-        if let Some(status) = query.try_exit().map_err(QueryError::Wait)? {
+        if let Some(status) = try_exit().map_err(QueryError::Wait)? {
             return Ok(status.code());
         }
         if Instant::now() >= limit {
@@ -249,8 +283,91 @@ fn watch(
     }
 }
 
+/// A query inside a supervised background worker (Unix). It runs in the group the supervisor
+/// made for the worker, not a fresh one: a fresh group would outlive the supervisor's group kill.
+/// Only the query's own, still unreaped process is ever signalled here; anything it started is
+/// left to the supervisor, which kills and confirms the whole group after the worker exits. A
+/// descendant still holding the output, or a query that can't be stopped and reaped, is a
+/// `Cleanup` error, so the run is cancelled rather than credited.
+#[cfg(unix)]
+fn run_inherited_query(
+    invocation: &Invocation,
+    deadline: Duration,
+    cap: usize,
+    grace: Duration,
+) -> Result<Captured, QueryError> {
+    let setup = Instant::now() + grace;
+    let mut child = command(invocation).spawn().map_err(QueryError::Spawn)?;
+    let (stdout, stdout_started) = query_reader(child.stdout.take(), cap, "stdout");
+    let (stderr, stderr_started) = query_reader(child.stderr.take(), cap, "stderr");
+    let started = stdout_started.and(stderr_started).map_err(QueryError::Read);
+    let (outcome, limit) = match started {
+        Ok(()) => {
+            let outcome = watch(|| child.try_wait(), &stdout, &stderr, deadline, cap);
+            (outcome, Instant::now() + grace)
+        }
+        Err(error) => (Err(error), setup),
+    };
+    if let Err(detail) = settle_inherited(&mut child, &stdout, &stderr, limit, grace) {
+        return Err(QueryError::Cleanup {
+            cause: outcome.err().map(Box::new),
+            detail,
+        });
+    }
+    let code = outcome?;
+    Ok(Captured {
+        code,
+        stdout: validated(&stdout, "stdout", cap)?,
+        stderr: validated(&stderr, "stderr", cap)?,
+    })
+}
+
+/// Stops an inherited query: SIGKILL to its own pid only while it is unreaped (so the pid is
+/// still the query's), reap it, and require both readers' EOF, all within `limit`.
+#[cfg(unix)]
+fn settle_inherited(
+    child: &mut Child,
+    stdout: &Shared,
+    stderr: &Shared,
+    limit: Instant,
+    grace: Duration,
+) -> Result<(), String> {
+    let mut problem = None;
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = child.kill() {
+                problem = Some(format!("cannot stop it: {error}"));
+            }
+        }
+        Err(error) => problem = Some(format!("cannot check it: {error}")),
+    }
+    let reaped = until(limit, || {
+        child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|error| format!("cannot reap it: {error}"))
+    });
+    first(&mut problem, reaped, "it has not exited");
+    let drain = until(limit, || Ok(drained(stdout, stderr)));
+    first(
+        &mut problem,
+        drain,
+        "a process it started still holds its output open; the background supervisor stops it when the run ends",
+    );
+    problem.map_or(Ok(()), |detail| {
+        Err(format!(
+            "{detail} (within the {} second cleanup limit)",
+            grace.as_secs()
+        ))
+    })
+}
+
 /// Polls `done` until it holds or `limit` passes; `Ok(false)` means time ran out.
-fn until(limit: Instant, mut done: impl FnMut() -> Result<bool, String>) -> Result<bool, String> {
+pub(super) fn until(
+    limit: Instant,
+    mut done: impl FnMut() -> Result<bool, String>,
+) -> Result<bool, String> {
     loop {
         if done()? {
             return Ok(true);
@@ -267,7 +384,7 @@ fn drained(stdout: &Shared, stderr: &Shared) -> bool {
 }
 
 /// Keeps the first thing that went wrong while cleanup carries on with the rest.
-fn first(problem: &mut Option<String>, step: Result<bool, String>, pending: &str) {
+pub(super) fn first(problem: &mut Option<String>, step: Result<bool, String>, pending: &str) {
     let detail = match step {
         Ok(true) => return,
         Ok(false) => pending.to_owned(),
@@ -285,7 +402,7 @@ fn first(problem: &mut Option<String>, step: Result<bool, String>, pending: &str
 /// ever waited on, never the group, so nothing reaps the anchor early. A system without `/bin/sh`
 /// can't run queries: the spawn fails, and detection is an error.
 #[cfg(unix)]
-struct Query {
+pub(super) struct Query {
     child: Child,
     anchor: Child,
     anchor_input: Option<ChildStdin>,
@@ -293,13 +410,24 @@ struct Query {
 }
 
 #[cfg(unix)]
-const ANCHOR_SHELL: &str = "/bin/sh";
+pub(super) const ANCHOR_SHELL: &str = "/bin/sh";
 
 #[cfg(unix)]
 impl Query {
     /// A query that fails to start still has its anchor released, within the setup deadline.
     fn spawn(
         invocation: &Invocation,
+        setup: Instant,
+        trace: &mut Trace,
+    ) -> Result<Self, QueryError> {
+        Self::spawn_in_group(command(invocation), setup, trace)
+    }
+
+    /// Starts `command` in a fresh group whose id a new anchor holds. The background supervisor
+    /// starts its worker this way too, with its own stdio. A command that fails to start still
+    /// has its anchor released, within the setup deadline.
+    pub(super) fn spawn_in_group(
+        mut command: Command,
         setup: Instant,
         trace: &mut Trace,
     ) -> Result<Self, QueryError> {
@@ -310,7 +438,6 @@ impl Query {
         let spawned = i32::try_from(anchor.id())
             .map_err(|_| io::Error::other(format!("pid {} is out of range", anchor.id())))
             .and_then(|group| {
-                let mut command = command(invocation);
                 command.process_group(group);
                 command.spawn().map(|child| (child, Pid::from_raw(group)))
             });
@@ -341,16 +468,25 @@ impl Query {
         }
     }
 
-    fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub(super) fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
     }
 
-    fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(super) fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.child.stderr.take()
     }
 
+    pub(super) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// The process group the anchor holds.
+    pub(super) fn group(&self) -> Pid {
+        self.group
+    }
+
     /// Waits on the query's own pid only.
-    fn try_exit(&mut self) -> io::Result<Option<ExitStatus>> {
+    pub(super) fn try_exit(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 
@@ -364,6 +500,24 @@ impl Query {
         stdout: &Shared,
         stderr: &Shared,
         limit: Instant,
+        trace: &mut Trace,
+    ) -> Result<(), String> {
+        self.settle_with(
+            || drained(stdout, stderr),
+            limit,
+            QUERY_CLEANUP_GRACE,
+            trace,
+        )
+    }
+
+    /// `settle` with the caller's own "output fully read" test and the grace its message names.
+    /// The background supervisor uses it with its log drains and its own settle limit; the steps
+    /// and their order are exactly the query's.
+    pub(super) fn settle_with(
+        &mut self,
+        mut drained: impl FnMut() -> bool,
+        limit: Instant,
+        grace: Duration,
         trace: &mut Trace,
     ) -> Result<(), String> {
         let mut problem = None;
@@ -381,7 +535,7 @@ impl Query {
             note(trace, Event::ReapedQuery);
         }
         first(&mut problem, reaped, "it has not exited");
-        let drain = until(limit, || Ok(drained(stdout, stderr)));
+        let drain = until(limit, || Ok(drained()));
         if drain == Ok(true) {
             note(trace, Event::ReadersDone);
         }
@@ -417,7 +571,7 @@ impl Query {
             None => Ok(()),
             Some(detail) => Err(format!(
                 "{detail} (within the {} second cleanup limit)",
-                QUERY_CLEANUP_GRACE.as_secs()
+                grace.as_secs()
             )),
         }
     }
@@ -834,20 +988,31 @@ impl ChildWrapper for Leaf {
 }
 
 /// Stops a query whose job setup failed. Nothing resumed it, so it never ran and started
-/// nothing: killing and reaping this one process within `limit` is the whole cleanup.
+/// nothing: killing and reaping this one process within `limit` is the whole cleanup. No job is
+/// assumed to exist yet, so only loadout's own retained handle on the process is used.
+///
+/// The kill is skipped only when the process has positively exited. A first observation that
+/// fails is no such proof, so the kill and the reap still follow, and every problem is kept, in
+/// order: the observation, the kill, the reap.
 #[cfg(windows)]
 fn dispose_never_run(root: &Mutex<Child>, limit: Instant) -> Result<(), String> {
     let mut child = guard(root);
-    let mut problem = None;
-    match child.try_wait() {
+    let mut problems = Vec::new();
+    #[cfg(test)]
+    let observed = seam::observation().map_or_else(|| child.try_wait(), Err);
+    #[cfg(not(test))]
+    let observed = child.try_wait();
+    match observed {
         Ok(Some(_)) => return Ok(()),
-        Ok(None) => {
-            if let Err(error) = child.kill() {
-                problem = Some(format!("cannot stop the query loadout created: {error}"));
-            }
-        }
-        Err(error) => problem = Some(format!("cannot check the query loadout created: {error}")),
+        Ok(None) => {}
+        Err(error) => problems.push(format!("cannot check the query loadout created: {error}")),
     }
+    #[cfg(test)]
+    seam::count_kill();
+    if let Err(error) = child.kill() {
+        problems.push(format!("cannot stop the query loadout created: {error}"));
+    }
+    let mut reap = None;
     let reaped = until(limit, || {
         child
             .try_wait()
@@ -855,16 +1020,20 @@ fn dispose_never_run(root: &Mutex<Child>, limit: Instant) -> Result<(), String> 
             .map_err(|error| format!("cannot reap the query loadout created: {error}"))
     });
     first(
-        &mut problem,
+        &mut reap,
         reaped,
         "the query loadout created has not exited",
     );
-    problem.map_or(Ok(()), |detail| {
+    problems.extend(reap);
+    if problems.is_empty() {
+        Ok(())
+    } else {
         Err(format!(
-            "{detail} (within the {} second cleanup limit)",
+            "{} (within the {} second cleanup limit)",
+            problems.join("; "),
             QUERY_CLEANUP_GRACE.as_secs()
         ))
-    })
+    }
 }
 
 #[cfg(windows)]
@@ -916,14 +1085,44 @@ mod seam {
         /// After a real resume, waits until the test's descendant writes this file, then fails.
         #[cfg(windows)]
         FailAfterResume(PathBuf),
+        /// The first observation of a never-run query in `dispose_never_run` fails, once.
+        #[cfg(windows)]
+        FailObservation,
     }
 
     thread_local! {
         static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+        /// How many kills `dispose_never_run` attempted since the last `set`.
+        #[cfg(windows)]
+        static KILLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     pub(super) fn set(seam: Option<Seam>) {
         SEAM.with(|cell| *cell.borrow_mut() = seam);
+        #[cfg(windows)]
+        KILLS.with(|kills| kills.set(0));
+    }
+
+    /// The injected first-observation failure, consumed so later observations are real.
+    #[cfg(windows)]
+    pub(super) fn observation() -> Option<io::Error> {
+        SEAM.with(|cell| {
+            let mut seam = cell.borrow_mut();
+            (seam.as_ref() == Some(&Seam::FailObservation)).then(|| {
+                *seam = None;
+                io::Error::other("injected: the query could not be observed")
+            })
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn count_kill() {
+        KILLS.with(|kills| kills.set(kills.get() + 1));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn kills() -> u32 {
+        KILLS.with(std::cell::Cell::get)
     }
 
     #[cfg(windows)]
@@ -1013,7 +1212,7 @@ mod seam {
 /// termination attempt (Windows); and the absolute setup deadline and the limit actually given
 /// to cleanup, to check that a setup failure's cleanup gets no renewed budget.
 #[derive(Default)]
-struct Trace {
+pub(super) struct Trace {
     #[cfg(all(test, unix))]
     events: Vec<Event>,
     #[cfg(all(test, windows))]
@@ -1070,8 +1269,16 @@ fn validated(
 
 /// Runs an install in loadout's own process group, so `sudo` can still prompt on the terminal
 /// and Ctrl-C reaches it. There is no deadline: installs legitimately take minutes. Only the
-/// tail of each output stream is kept.
-pub(super) fn install(invocation: &Invocation) -> io::Result<Captured> {
+/// tail of each output stream is kept. In a supervised background worker the installer is in
+/// the supervisor's group or job like the worker itself, which bounds it; a cancelled run starts
+/// no installer.
+pub(crate) fn install(invocation: &Invocation, containment: &Containment) -> io::Result<Captured> {
+    if containment.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the background run was cancelled, so loadout started no installer",
+        ));
+    }
     run_install(invocation, INSTALL_TAIL, INSTALL_DRAIN)
 }
 
@@ -1600,16 +1807,15 @@ mod tests {
 
     #[test]
     fn output_held_by_a_process_that_left_the_group_is_a_bounded_cleanup_error() {
-        match fixture::output(Command::new("python3").arg("--version"), fixture::HELPER) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            result => assert!(result.unwrap().status.success()),
+        if !python() {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let escapee = dir.path().join("escapee");
-        let script = format!(
-            "python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], \"w\").write(str(os.getpid())); time.sleep(30)' '{}' & sleep 0.5; echo done",
-            escapee.display()
+        let (lock, ready) = (
+            dir.path().join("escapee.lock"),
+            dir.path().join("escapee.ready"),
         );
+        let script = format!("{} & sleep 0.5; echo done", escapee(&lock, &ready, 3));
         let started = Instant::now();
         let result = run_query_with(
             &sh(&script),
@@ -1619,15 +1825,10 @@ mod tests {
             &mut Trace::default(),
         );
         let elapsed = started.elapsed();
-        // The escapee is no child of the test (init reaps it), so it is killed by its pid, which
-        // it wrote itself, and then checked gone within a bound.
-        let escapee_gone = std::fs::read_to_string(&escapee).map(|pid| {
-            let pid = pid.trim().to_owned();
-            let _ = kill(Pid::from_raw(pid.parse().unwrap()), Signal::SIGKILL);
-            until(Instant::now() + Duration::from_secs(10), || {
-                Ok(!alive(&pid))
-            })
-        });
+        // The escapee is no child of the test (init reaps it), so the test holds no identity it
+        // could safely signal. It ends by itself after 3 seconds and is only observed: its lock's
+        // release shows it reached its end, not a confirmed exit.
+        let escapee_released = released_after_ready(&lock, &ready, Duration::from_secs(20));
         let error = result.unwrap_err();
         assert!(
             matches!(&error, QueryError::Cleanup { cause: None, .. }),
@@ -1638,10 +1839,140 @@ mod tests {
             "{error}"
         );
         assert!(elapsed < Duration::from_secs(10));
-        assert!(
-            matches!(escapee_gone, Ok(Ok(true))),
-            "the escapee must be found and gone after the test kills it: {escapee_gone:?}"
+        assert_eq!(
+            escapee_released,
+            Ok(true),
+            "the escapee must have been ready and then released its lock by ending"
         );
+    }
+
+    /// The negative: an escapee that already exited holds nothing, so the query is a plain
+    /// success, and nothing anywhere signals the pid it once had.
+    #[test]
+    fn an_escapee_that_already_exited_is_observed_never_signalled() {
+        if !python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (lock, ready) = (
+            dir.path().join("escapee.lock"),
+            dir.path().join("escapee.ready"),
+        );
+        let script = format!("{}; echo done", escapee(&lock, &ready, 0));
+        let captured = run_query(&sh(&script), Duration::from_secs(20), 1024).unwrap();
+        assert_eq!(captured.code, Some(0));
+        assert_eq!(
+            released_after_ready(&lock, &ready, Duration::from_secs(10)),
+            Ok(true)
+        );
+    }
+
+    /// The observer's positive: a live lock holder this test owns counts as running, and only
+    /// its owned handle confirms its exit (`stop` reaps it); the lock's release follows.
+    #[test]
+    fn the_escapee_observer_sees_an_owned_holder_alive_then_ended() {
+        if !python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (lock, ready) = (
+            dir.path().join("holder.lock"),
+            dir.path().join("holder.ready"),
+        );
+        let mut holder = fixture::Owned::new(
+            Command::new("python3")
+                .args(["-c", &escapee_code(false, 30)])
+                .arg(&lock)
+                .arg(&ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let became_ready = until(Instant::now() + Duration::from_secs(20), || {
+            Ok(ready.exists())
+        });
+        let alive_while_owned = released(&lock);
+        let stopped = holder.stop(Duration::from_secs(10));
+        assert_eq!(
+            became_ready,
+            Ok(true),
+            "the owned holder never became ready"
+        );
+        assert_eq!(
+            alive_while_owned,
+            Ok(false),
+            "a live holder must count as running"
+        );
+        assert_eq!(stopped, Ok(()), "the owned handle must confirm the exit");
+        assert_eq!(
+            released_after_ready(&lock, &ready, Duration::from_secs(10)),
+            Ok(true)
+        );
+    }
+
+    fn python() -> bool {
+        match fixture::output(Command::new("python3").arg("--version"), fixture::HELPER) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            result => {
+                assert!(result.unwrap().status.success());
+                true
+            }
+        }
+    }
+
+    /// Python code that optionally leaves the process group (`setsid`), takes an exclusive lock
+    /// on `argv[1]`, writes and closes `argv[2]`, sleeps `seconds`, and ends with `os._exit`.
+    /// Nothing in it closes the lock file: there is no interpreter shutdown to release it early,
+    /// so only the kernel releases it, as the process ends. That release is all an observer
+    /// sees; it is not a confirmed exit.
+    fn escapee_code(leave: bool, seconds: u32) -> String {
+        let leave = if leave { "os.setsid(); " } else { "" };
+        format!(
+            "import fcntl,os,sys,time; {leave}f=open(sys.argv[1], \"w\"); fcntl.flock(f, fcntl.LOCK_EX); r=open(sys.argv[2], \"w\"); r.write(\"ready\"); r.close(); time.sleep({seconds}); os._exit(0)"
+        )
+    }
+
+    /// A shell command running `escapee_code`, leaving the group when it sleeps at all.
+    fn escapee(lock: &Path, ready: &Path, seconds: u32) -> String {
+        format!(
+            "python3 -c '{}' '{}' '{}'",
+            escapee_code(seconds > 0, seconds),
+            lock.display(),
+            ready.display()
+        )
+    }
+
+    /// Whether the lock is free (its holder's process released it by ending); an error for a
+    /// missing file or any lock error but "held".
+    fn released(lock: &Path) -> Result<bool, String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock)
+            .map_err(|error| format!("cannot open {}: {error}", lock.display()))?;
+        match file.try_lock() {
+            Ok(()) => file
+                .unlock()
+                .map(|()| true)
+                .map_err(|error| format!("cannot unlock: {error}")),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(format!("cannot test the lock: {error}"))
+            }
+        }
+    }
+
+    /// Waits for the holder's ready file (it ran), then for its lock to be released (it reached
+    /// its end), within `limit`. A holder that never became ready is an error, never released.
+    fn released_after_ready(lock: &Path, ready: &Path, limit: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + limit;
+        if until(deadline, || Ok(ready.exists()))? {
+            until(deadline, || released(lock))
+        } else {
+            Err(format!("{} never appeared", ready.display()))
+        }
     }
 
     #[test]
@@ -2213,6 +2544,94 @@ mod windows_tests {
         assert!(!marker.exists(), "the query must never have run");
     }
 
+    /// A suspended `cmd.exe` that would exit 7 if it ever ran, owned from the moment it exists,
+    /// as `Query::spawn` keeps its root before any job exists. It is never resumed, so it has no
+    /// self-exit; only a kill ends it, and the guard's own checked stop is the fallback.
+    fn never_run_root() -> crate::process::owned::Owned {
+        use std::os::windows::process::CommandExt;
+        crate::process::owned::Owned::new(
+            Command::new("cmd.exe")
+                .args(["/c", "exit 7"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(loadout_winproc::CREATE_SUSPENDED.0)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    /// F3: a first observation that fails is no proof the query exited, so `dispose_never_run`
+    /// still kills it and reaps it, and keeps the observation error first.
+    #[test]
+    fn a_failed_first_observation_of_a_never_run_query_still_kills_and_reaps_it() {
+        let mut root = never_run_root();
+        seam::set(Some(seam::Seam::FailObservation));
+        let disposed = dispose_never_run(root.shared(), Instant::now() + QUERY_CLEANUP_GRACE);
+        let kills = seam::kills();
+        seam::set(None);
+        let detail = disposed.unwrap_err();
+        assert!(
+            detail.starts_with("cannot check the query loadout created: injected"),
+            "{detail}"
+        );
+        assert!(!detail.contains("has not exited"), "{detail}");
+        assert_eq!(kills, 1, "the kill must follow a failed observation");
+        let status = root
+            .observe()
+            .unwrap()
+            .expect("the query must have been reaped");
+        assert_ne!(
+            status.code(),
+            Some(7),
+            "the never-resumed query must not have run"
+        );
+        assert_eq!(
+            root.kills(),
+            0,
+            "nothing was left for the test's own guard to stop"
+        );
+    }
+
+    #[test]
+    fn a_live_never_run_query_is_killed_and_reaped() {
+        let mut root = never_run_root();
+        seam::set(None);
+        let disposed = dispose_never_run(root.shared(), Instant::now() + QUERY_CLEANUP_GRACE);
+        let kills = seam::kills();
+        assert_eq!(disposed, Ok(()));
+        assert_eq!(kills, 1);
+        let status = root
+            .observe()
+            .unwrap()
+            .expect("the query must have been reaped");
+        assert_ne!(
+            status.code(),
+            Some(7),
+            "the never-resumed query must not have run"
+        );
+    }
+
+    /// The negative: a process that has positively exited is not killed.
+    #[test]
+    fn a_query_that_already_exited_is_not_killed() {
+        let mut root = crate::process::owned::Owned::new(
+            Command::new("cmd.exe")
+                .args(["/c", "exit 7"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let status = root.wait_within(Duration::from_secs(20)).unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(7));
+        seam::set(None);
+        let disposed = dispose_never_run(root.shared(), Instant::now() + QUERY_CLEANUP_GRACE);
+        assert_eq!(disposed, Ok(()));
+        assert_eq!(seam::kills(), 0, "an exited process must not be killed");
+    }
+
     #[test]
     fn a_withheld_process_handle_takes_the_dependency_no_handle_branch() {
         let scratch = tempdir().unwrap();
@@ -2579,5 +2998,182 @@ mod windows_tests {
         assert!(text.contains("the stdout drainer is finished"), "{text}");
         let pid = fixture::last_helper().unwrap();
         assert!(!alive(pid), "the helper {pid} must be gone at return");
+    }
+}
+
+/// The supervised background mode (`Containment::Inherited`) on Unix. These run in the test
+/// process's own group, standing in for the supervisor's: an inherited query must stay in it
+/// and signal nothing but its own process.
+///
+/// Descendants a fixture leaves are not this test's children, so no test holds an identity it
+/// could safely signal. They are therefore self-bounded (each sleeps a few seconds and exits by
+/// itself), and the tests only observe them with signal 0, which delivers nothing, never killing
+/// a recorded numeric pid that might by then belong to another process.
+#[cfg(all(test, unix))]
+mod inherited_tests {
+    use std::path::{Path, PathBuf};
+
+    use nix::sys::signal::kill;
+    use nix::unistd::getpgrp;
+
+    use super::*;
+
+    fn sh(script: &str) -> Invocation {
+        Invocation::new(Path::new("/bin/sh"), ["-c", script])
+    }
+
+    fn supervised() -> Containment {
+        Containment::inherited_for_tests()
+    }
+
+    /// Signal 0 only: an observation, never a destructive signal.
+    fn alive(pid: i32) -> bool {
+        match kill(Pid::from_raw(pid), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(error) => panic!("cannot check process {pid}: {error}"),
+        }
+    }
+
+    fn written_pid(file: &Path) -> Option<i32> {
+        std::fs::read_to_string(file).ok()?.trim().parse().ok()
+    }
+
+    /// Waits, without signalling, for a self-bounded fixture descendant to exit by itself.
+    fn exits_by_itself(pid: i32, within: Duration) -> bool {
+        until(Instant::now() + within, || Ok(!alive(pid))) == Ok(true)
+    }
+
+    fn marker(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
+    }
+
+    #[test]
+    fn an_inherited_query_runs_in_the_callers_group() {
+        let captured = query(&sh("ps -o pgid= -p $$"), &supervised()).unwrap();
+        let group: i32 = captured.stdout.trim().parse().unwrap();
+        assert_eq!(group, getpgrp().as_raw());
+    }
+
+    #[test]
+    fn a_hung_inherited_query_is_stopped_alone_and_its_descendant_left_to_the_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = marker(&dir, "descendant");
+        let script = format!(
+            "sleep 8 >/dev/null 2>&1 & echo $! > '{}'; sleep 30",
+            pid_file.display()
+        );
+        let error = run_inherited_query(
+            &sh(&script),
+            Duration::from_millis(500),
+            1024,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let descendant = written_pid(&pid_file);
+        let left_alive = descendant.is_some_and(alive);
+        let gone = descendant.is_none_or(|pid| exits_by_itself(pid, Duration::from_secs(20)));
+        assert!(matches!(error, QueryError::TimedOut(_)), "{error}");
+        assert!(
+            left_alive,
+            "only the query's own process may be signalled; its descendant is the supervisor's"
+        );
+        assert!(gone, "the self-bounded descendant did not exit by itself");
+    }
+
+    #[test]
+    fn a_descendant_holding_the_output_is_a_cleanup_error_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = marker(&dir, "holder");
+        let script = format!("sleep 3 & echo $! > '{}'", pid_file.display());
+        let started = Instant::now();
+        let result = run_inherited_query(
+            &sh(&script),
+            Duration::from_secs(20),
+            1024,
+            Duration::from_millis(500),
+        );
+        let elapsed = started.elapsed();
+        let gone =
+            written_pid(&pid_file).is_none_or(|pid| exits_by_itself(pid, Duration::from_secs(20)));
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, QueryError::Cleanup { cause: None, .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("still holds its output open"),
+            "{error}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        assert!(gone, "the self-bounded holder did not exit by itself");
+    }
+
+    #[test]
+    fn oversized_output_stops_an_inherited_query_too() {
+        let error = run_inherited_query(
+            &sh("head -c 65 /dev/zero"),
+            Duration::from_secs(20),
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(error, QueryError::Oversized { .. }), "{error}");
+        let exact = run_inherited_query(
+            &sh("head -c 64 /dev/zero"),
+            Duration::from_secs(20),
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(exact.stdout.len(), 64);
+    }
+
+    #[test]
+    fn a_failed_query_cancels_the_run_and_nothing_starts_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let containment = supervised();
+        let missing = Invocation::new(Path::new("/nonexistent/loadout-manager"), ["x"]);
+        assert!(matches!(
+            query(&missing, &containment),
+            Err(QueryError::Spawn(_))
+        ));
+        assert!(containment.is_cancelled());
+
+        let ran = marker(&dir, "ran");
+        let touch = sh(&format!("touch '{}'", ran.display()));
+        assert!(matches!(
+            query(&touch, &containment),
+            Err(QueryError::Cancelled)
+        ));
+        let installed = install(&touch, &containment).unwrap_err();
+        assert_eq!(installed.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            !ran.exists(),
+            "a cancelled run must start no query or installer"
+        );
+    }
+
+    #[test]
+    fn the_foreground_is_unchanged_and_never_cancelled() {
+        let foreground = Containment::OwnGroup;
+        let missing = Invocation::new(Path::new("/nonexistent/loadout-manager"), ["x"]);
+        assert!(query(&missing, &foreground).is_err());
+        assert!(!foreground.is_cancelled());
+        let captured = query(&sh("echo ok"), &foreground).unwrap();
+        assert_eq!(captured.stdout, "ok\n");
+    }
+
+    #[test]
+    fn queries_and_installs_never_pass_on_the_worker_nonce() {
+        let script = format!("printf '%s' \"${{{WORKER_NONCE}-unset}}\"");
+        let invocation = Invocation {
+            env: &[(WORKER_NONCE, "a-nonce")],
+            ..sh(&script)
+        };
+        let captured = query(&invocation, &Containment::OwnGroup).unwrap();
+        assert_eq!(captured.stdout, "unset");
+        let installed = install(&invocation, &Containment::OwnGroup).unwrap();
+        assert_eq!(installed.stdout, "unset");
     }
 }

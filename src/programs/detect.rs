@@ -7,11 +7,12 @@ use serde_json::{Map, Value};
 use crate::context;
 use crate::manifest::Manager;
 
+use crate::process::{self, Captured, Containment};
+
 use super::Scope;
 use super::manager::{self, Invocation};
-use super::process::{self, Captured};
 
-fn query<I, S>(program: &Path, args: I) -> Result<Captured, String>
+fn query<I, S>(containment: &Containment, program: &Path, args: I) -> Result<Captured, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -20,7 +21,8 @@ where
         program,
         args.into_iter().map(|arg| arg.as_ref().to_os_string()),
     );
-    process::query(&invocation).map_err(|error| format!("{}: {error}", invocation.display()))
+    process::query(&invocation, containment)
+        .map_err(|error| format!("{}: {error}", invocation.display()))
 }
 
 fn helper(tool: &str) -> Result<PathBuf, String> {
@@ -30,25 +32,40 @@ fn helper(tool: &str) -> Result<PathBuf, String> {
 /// Answers "is this exact package installed?" with the manager's own query. `Ok(true)` needs
 /// positive evidence; `Ok(false)` needs the manager's documented not-found answer. Anything
 /// else is an error, so a broken manager is never read as "installed".
-pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Result<bool, String> {
+pub(super) fn installed(
+    containment: &Containment,
+    manager: Manager,
+    program: &Path,
+    package: &str,
+) -> Result<bool, String> {
     match manager {
         Manager::Brew => brew(
-            &query(program, ["info", "--json=v2", "--formula", package])?,
+            &query(
+                containment,
+                program,
+                ["info", "--json=v2", "--formula", package],
+            )?,
             package,
             false,
         ),
         Manager::Cask => brew(
-            &query(program, ["info", "--json=v2", "--cask", package])?,
+            &query(
+                containment,
+                program,
+                ["info", "--json=v2", "--cask", package],
+            )?,
             package,
             true,
         ),
         Manager::Apt => dpkg(&query(
+            containment,
             &helper("dpkg-query")?,
             ["-W", "-f", "${db:Status-Status} ", package],
         )?),
-        Manager::Dnf => rpm(&query(&helper("rpm")?, ["-q", package])?),
-        Manager::Pacman => pacman(&query(program, ["-Q", package])?),
+        Manager::Dnf => rpm(&query(containment, &helper("rpm")?, ["-q", package])?),
+        Manager::Pacman => pacman(&query(containment, program, ["-Q", package])?),
         Manager::Zypper => zypper(&query(
+            containment,
             program,
             [
                 "--non-interactive",
@@ -61,9 +78,10 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
                 package,
             ],
         )?),
-        Manager::Flatpak => flatpak(&query(program, ["info", package])?),
-        Manager::Snap => snap(&query(program, ["list", package])?),
+        Manager::Flatpak => flatpak(&query(containment, program, ["info", package])?),
+        Manager::Snap => snap(&query(containment, program, ["list", package])?),
         Manager::Winget => winget_list(&query(
+            containment,
             program,
             [
                 "list",
@@ -76,29 +94,52 @@ pub(super) fn installed(manager: Manager, program: &Path, package: &str) -> Resu
                 "--disable-interactivity",
             ],
         )?),
-        Manager::Scoop => scoop(&query(program, ["prefix", scoop_app(package)])?),
+        Manager::Scoop => scoop(&query(
+            containment,
+            program,
+            ["prefix", scoop_app(package)],
+        )?),
         Manager::Choco => choco(
-            &query(program, ["list", "--exact", package, "--limit-output"])?,
+            &query(
+                containment,
+                program,
+                ["list", "--exact", package, "--limit-output"],
+            )?,
             package,
         ),
         Manager::Npm => match npm(
-            &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
+            &query(
+                containment,
+                program,
+                ["ls", "--global", "--depth=0", "--json", package],
+            )?,
             package,
         )? {
             Npm::Answered(installed) => Ok(installed),
             Npm::AbsentPath(path) => {
-                npm_prefix_absent(&query(program, ["prefix", "--global"])?, &path).map(|()| false)
+                npm_prefix_absent(&query(containment, program, ["prefix", "--global"])?, &path)
+                    .map(|()| false)
             }
         },
         Manager::Pnpm => pnpm(
-            &query(program, ["ls", "--global", "--depth=0", "--json", package])?,
+            &query(
+                containment,
+                program,
+                ["ls", "--global", "--depth=0", "--json", package],
+            )?,
             package,
         ),
-        Manager::Bun => bun(&query(program, ["pm", "ls", "--global"])?, package),
-        Manager::Cargo => cargo(&query(program, ["install", "--list"])?, package),
-        Manager::Uv => uv(&query(program, ["tool", "list"])?, package),
-        Manager::Pipx => pipx(&query(program, ["list", "--json"])?, package),
-        Manager::Go => go(program, package),
+        Manager::Bun => bun(
+            &query(containment, program, ["pm", "ls", "--global"])?,
+            package,
+        ),
+        Manager::Cargo => cargo(
+            &query(containment, program, ["install", "--list"])?,
+            package,
+        ),
+        Manager::Uv => uv(&query(containment, program, ["tool", "list"])?, package),
+        Manager::Pipx => pipx(&query(containment, program, ["list", "--json"])?, package),
+        Manager::Go => go(containment, program, package),
     }
 }
 
@@ -117,6 +158,7 @@ pub(super) enum Eligibility {
 /// shown to apply before the package counts as installable with `--elevated`. Winget's own
 /// applicability answers both questions; loadout never assumes a machine installer exists.
 pub(super) fn eligibility(
+    containment: &Containment,
     manager: Manager,
     program: &Path,
     package: &str,
@@ -126,6 +168,7 @@ pub(super) fn eligibility(
     }
     let show = |scope: &str| {
         query(
+            containment,
             program,
             [
                 "show",
@@ -597,8 +640,8 @@ fn go_binary(package: &str) -> &str {
 
 /// Go keeps no list of installed tools, so this finds the binary `go install` would write and
 /// asks `go version -m` which package built it.
-fn go(program: &Path, package: &str) -> Result<bool, String> {
-    let env = query(program, ["env", "GOBIN", "GOPATH"])?;
+fn go(containment: &Containment, program: &Path, package: &str) -> Result<bool, String> {
+    let env = query(containment, program, ["env", "GOBIN", "GOPATH"])?;
     if !env.success() {
         return Err(env.unexpected());
     }
@@ -627,6 +670,7 @@ fn go(program: &Path, package: &str) -> Result<bool, String> {
         Ok(_) => {}
     }
     let built = query(
+        containment,
         program,
         [OsStr::new("version"), OsStr::new("-m"), binary.as_os_str()],
     )?;
@@ -908,7 +952,7 @@ mod tests {
             })
             .collect();
         for ((user, machine, expected), winget) in cases.iter().zip(&scripts) {
-            let decided = eligibility(Manager::Winget, winget, "A.B");
+            let decided = eligibility(&Containment::OwnGroup, Manager::Winget, winget, "A.B");
             let label = format!("user {user:?}, machine {machine:?}: {decided:?}");
             match *expected {
                 "user" => assert_eq!(decided, Ok(Eligibility::Scope(Scope::User)), "{label}"),

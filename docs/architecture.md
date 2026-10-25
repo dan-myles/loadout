@@ -26,14 +26,17 @@ async would buy v1 nothing.
 | `minijinja` | templates (U2). Pinned `=3.0.3`, default features off; only `builtins`, `debug`, and `unstable_machinery` |
 | `toml_edit` | mcp: format-preserving TOML key merges (U6) |
 | `jsonc-parser` (`cst`) | mcp: comment-preserving JSON and JSONC key merges (U6) |
-| `process-wrap` (std, job-object, creation-flags; Windows only) | programs: each query runs in a job object, killed as a whole (U7) |
-| `loadout-winproc` (local, `publish = false`; Windows only) | programs: resumes a query created suspended, once loadout owns its job (U7) |
-| `nix` (`signal`; Unix only) | programs: signals the query's process group and confirms it is empty (U7) |
+| `process-wrap` (std, job-object, creation-flags; Windows only) | process: each query runs in a job object, killed as a whole (U7) |
+| `loadout-winproc` (local, `publish = false`; Windows only) | process: resumes a child created suspended, once loadout owns its job (U7); the background supervisor's own kill-on-close job and its process count, and the worker's cooperative-startup checks (some job, stdin is a pipe) and nonce (U8) |
+| `nix` (`process`, `signal`; Unix only) | process: signals a query's or the background worker's process group and confirms it is empty (U7); the worker's handshake checks of its parent and group (U8) |
 
 `loadout-winproc` (`crates/loadout-winproc`, a workspace member) is the workspace's only `unsafe`
-code: one safe operation in two steps, `prepare` (find, open and check the child's one thread)
-and `Prepared::resume_before(deadline)`, over `windows` 0.62 (already in the lock through
-`process-wrap`). It denies `unsafe_op_in_unsafe_fn`, gives every `unsafe` block one call and a
+code, over `windows` 0.62 (already in the lock through `process-wrap`): U7's resume in two steps,
+`prepare` (find, open and check the child's one thread) and `Prepared::resume_before(deadline)`;
+and U8's `Job` (create with kill-on-close and no breakaway, `assign` a suspended child and
+confirm membership, `terminate`, `active_processes`), `current_process_in_job`,
+`stdin_is_pipe`, and `random_nonce`.
+It denies `unsafe_op_in_unsafe_fn`, gives every `unsafe` block one call and a
 `SAFETY` comment, and owns every handle it opens. The `loadout` crate keeps
 `unsafe_code = "forbid"`. Nothing else goes in that crate: it is not a general Windows wrapper.
 
@@ -109,8 +112,11 @@ src/
   agents/                 mod.rs (materialize, checks), table.rs (adapters), collide.rs
                           (destination collisions), doctor.rs               [built, U5]
   mcp/                    server shapes, env syntax, JSON/JSONC/TOML key merge [built: U6]
-  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries),
-                          process.rs (subprocesses)                         [built, U7]
+  programs/               mod.rs (API), manager.rs (per-manager table), detect.rs (queries)
+                                                                            [built, U7]
+  process/                mod.rs (API, Containment, Cancel), query.rs (U7's bounded queries and
+                          installs, moved from programs), background.rs (supervisor, handshake,
+                          bounded log)                                      [core: U8]
   sync/                   git clone/fetch, background service               [U8]
   release/                self-update                                       [U9]
 ```
@@ -120,7 +126,8 @@ Which subject may import which:
 ```
 platform, diagnostic, id       -> (none)
 reserved                       -> context, platform
-context                        -> platform
+context                        -> platform, process
+process                        -> (none)
 machine                        -> platform, context, id
 manifest                       -> platform, machine, context (path syntax), diagnostic, id, reserved
 resolve                        -> manifest, machine, context, reserved, platform, diagnostic
@@ -128,7 +135,7 @@ template                       -> manifest (Loadout, Variable, Guard, source_gua
 mcp                            -> manifest, resolve, reserved, context
 source                         -> manifest (git_metadata_guarded), reserved, plan (types), context
 agents                         -> manifest, resolve, mcp, reserved, source, plan (types), context, diagnostic, platform
-programs                       -> manifest, resolve, machine, context, diagnostic
+programs                       -> manifest, resolve, machine, context, process, diagnostic
 state                          -> context, plan (types), reserved, mcp
 plan                           -> manifest, machine, resolve, template, agents, programs, source, state, reserved, context, diagnostic, platform
 apply                          -> plan, state, programs, context, diagnostic
@@ -1659,7 +1666,10 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
      wrapper `process-wrap` sees shares that child.
   2. If anything fails before loadout holds the job (handle duplication, `process-wrap`'s
      no-handle branch, creating or assigning the job), the query never ran, so it started
-     nothing. Loadout kills its one process (checked) and reaps it. The setup deadline bounds
+     nothing. Loadout kills its one process (checked) and reaps it, through its own retained
+     handle (no job is assumed yet). Only a positively exited process is not killed: a first
+     observation that fails still leads to the kill and the reap, and the observation, kill
+     and reap errors are all kept, in that order. The setup deadline bounds
      `process-wrap`'s wait on that process (the innermost wrapper's `wait` polls only up to it)
      and loadout's own disposal together. The result is the spawn error, or `Cleanup` with the
      spawn error as its cause.
