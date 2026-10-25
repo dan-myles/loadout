@@ -199,13 +199,16 @@ fn a_missing_template_variable_stops_the_plan_with_nothing_written() {
 fn a_source_that_is_a_protected_file_is_refused_before_it_is_read() {
     let machine = machine(&[]);
     let secret = "SENTINEL-AUTH-BYTES";
-    write(&machine.home, ".codex/auth.json", secret);
+    // The checkout holds the protected file but not the target: with the whole home as the
+    // checkout, every `~/` target would overlap it and be refused before its source.
+    let checkout = machine.home.join(".codex");
+    write(&checkout, "auth.json", secret);
     write(
-        &machine.home,
+        &checkout,
         "loadout.toml",
-        &format!("{HEADER}[files.leak]\nsource = \".codex/auth.json\"\ntarget = \"~/leak\"\n"),
+        &format!("{HEADER}[files.leak]\nsource = \"auth.json\"\ntarget = \"~/leak\"\n"),
     );
-    let Err(plan::Error::Invalid(diagnostics)) = build_from(&machine, &machine.home) else {
+    let Err(plan::Error::Invalid(diagnostics)) = build_from(&machine, &checkout) else {
         panic!("a source that is an auth store must be refused");
     };
     let text: Vec<String> = diagnostics.iter().map(ToString::to_string).collect();
