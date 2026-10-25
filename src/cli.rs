@@ -68,6 +68,11 @@ pub fn main() -> ExitCode {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<Exit> {
+    if let Command::Update(args) = &cli.command
+        && args.recorded()
+    {
+        return update::run_recorded(args);
+    }
     let context = Context::from_env()?;
     match cli.command {
         Command::Doctor(args) => doctor::run(&args, &context),

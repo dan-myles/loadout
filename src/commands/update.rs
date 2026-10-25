@@ -38,9 +38,37 @@ pub struct Args {
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     match (args.background, args.worker) {
         (false, _) => foreground(args, context),
-        (true, false) => supervisor(args, context),
-        (true, true) => worker(args, context),
+        (true, false) => supervisor(args, Some(context)),
+        (true, true) => worker(args, Some(context)),
     }
+}
+
+impl Args {
+    /// The scheduled job's route: `--background --service FILE`, whose `Context` comes from
+    /// that file alone.
+    pub fn recorded(&self) -> bool {
+        self.background && self.service.is_some()
+    }
+}
+
+/// `loadout update --background --service FILE` (supervisor or worker), run without resolving
+/// the scheduler's own environment: the record is authoritative, so a variable there that
+/// `Context` would reject (a relative `LOADOUT_STATE_DIR`, say) can't stop the job. The worker
+/// still checks its handshake before anything else.
+pub fn run_recorded(args: &Args) -> anyhow::Result<Exit> {
+    if args.worker {
+        worker(args, None)
+    } else {
+        supervisor(args, None)
+    }
+}
+
+/// The run's `Context`: the recorded one with `--service`, else the caller's.
+fn chosen(loaded: Option<&Context>, ambient: Option<&Context>) -> anyhow::Result<Context> {
+    loaded
+        .or(ambient)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("a background run needs --service or a usable environment"))
 }
 
 fn foreground(args: &Args, context: &Context) -> anyhow::Result<Exit> {
@@ -84,14 +112,12 @@ fn foreground(args: &Args, context: &Context) -> anyhow::Result<Exit> {
 
 /// The scheduled job's process: starts the worker supervised and records how it ended. With
 /// `--service`, everything comes from that file, not from the scheduler's environment.
-fn supervisor(args: &Args, ambient: &Context) -> anyhow::Result<Exit> {
+fn supervisor(args: &Args, ambient: Option<&Context>) -> anyhow::Result<Exit> {
     let loaded = match &args.service {
         Some(path) => Some(service::load(path)?),
         None => None,
     };
-    let context = loaded
-        .as_ref()
-        .map_or_else(|| ambient.clone(), |(_, context)| context.clone());
+    let context = chosen(loaded.as_ref().map(|(_, context)| context), ambient)?;
     let exe = std::env::current_exe().context("cannot find loadout's own executable")?;
     let worker = Worker {
         exe: &exe,
@@ -106,13 +132,13 @@ fn supervisor(args: &Args, ambient: &Context) -> anyhow::Result<Exit> {
 
 /// The supervised worker: checks its startup first, then runs the update with no prompt,
 /// force, or elevation, and records what it did in `last-run.json`.
-fn worker(args: &Args, ambient: &Context) -> anyhow::Result<Exit> {
+fn worker(args: &Args, ambient: Option<&Context>) -> anyhow::Result<Exit> {
     let supervised = process::handshake()?;
-    let context = match &args.service {
-        Some(path) => service::load(path)?.1,
-        None => ambient.clone(),
-    }
-    .supervised(supervised);
+    let loaded = match &args.service {
+        Some(path) => Some(service::load(path)?.1),
+        None => None,
+    };
+    let context = chosen(loaded.as_ref(), ambient)?.supervised(supervised);
     let mut record = LastRun::new(sync::now(), RunResult::Failed, 1);
     record.supervisor.clone_from(&args.run);
     let result = background_update(&context, &mut record);

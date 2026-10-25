@@ -322,6 +322,52 @@ fn a_background_run_is_supervised_applies_and_leaves_its_records() {
     assert!(text(&status).contains("background"), "{}", text(&status));
 }
 
+/// The scheduled job's route takes its `Context` from the service record alone: ambient
+/// overrides that `Context` would reject (relative paths) don't stop it, and it applies to the
+/// recorded home and state.
+#[test]
+fn a_recorded_service_run_ignores_an_unusable_ambient_environment() {
+    let machine = Machine::new(LOADOUT);
+    machine.clone();
+    machine.push("second\n");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let state = machine.state.clone().into_os_string();
+    let var = |name: &str| match name {
+        "LOADOUT_STATE_DIR" => Some(state.clone()),
+        "PATH" => Some(path.clone()),
+        _ => None,
+    };
+    let context =
+        Context::resolve(Os::current().unwrap(), var, Some(machine.home.clone())).unwrap();
+    assert!(!context.isolated);
+    let exe = fs::canonicalize(env!("CARGO_BIN_EXE_loadout")).unwrap();
+    let recorded = loadout::sync::service::Recorded::new(&context, &exe, 60, var).unwrap();
+    let service = state::write_private(
+        &context,
+        state::Private::Service,
+        toml::to_string(&recorded).unwrap().as_bytes(),
+    )
+    .unwrap();
+
+    let output = machine
+        .command(&[
+            "update",
+            "--background",
+            "--service",
+            service.to_str().unwrap(),
+        ])
+        .env("LOADOUT_HOME", "relative-home")
+        .env("LOADOUT_STATE_DIR", "relative-state")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(machine.notes().as_deref(), Some("second\n"));
+    let supervisor = machine.record("supervisor.json");
+    let run = machine.record("last-run.json");
+    assert_eq!(run["result"], "applied", "{run}");
+    assert_eq!(run["supervisor"], supervisor["run"], "{run}");
+}
+
 #[test]
 fn a_blocked_background_run_is_recorded_and_makes_status_unhealthy() {
     let machine = Machine::new(LOADOUT);
