@@ -368,6 +368,23 @@ fn a_recorded_service_run_ignores_an_unusable_ambient_environment() {
     assert_eq!(run["supervisor"], supervisor["run"], "{run}");
 }
 
+/// A background run that finds another run holding the lock does nothing, exits 1, and is
+/// recorded as locked, not as a failure.
+#[test]
+fn a_background_run_that_finds_the_lock_held_is_recorded_as_locked() {
+    let machine = Machine::new(LOADOUT);
+    machine.clone();
+    machine.push("second\n");
+    let held = state::lock(&machine.context()).unwrap();
+    let output = machine.run(&["update", "--background"]);
+    drop(held);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let run = machine.record("last-run.json");
+    assert_eq!(run["result"], "locked", "{run}");
+    assert_eq!(run["exit"], 1, "{run}");
+    assert!(machine.notes().is_none(), "nothing may be applied");
+}
+
 #[test]
 fn a_blocked_background_run_is_recorded_and_makes_status_unhealthy() {
     let machine = Machine::new(LOADOUT);

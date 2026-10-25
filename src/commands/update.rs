@@ -147,7 +147,6 @@ fn worker(args: &Args, ambient: Option<&Context>) -> anyhow::Result<Exit> {
         Ok(exit) => record.exit = exit.code(),
         Err(error) => {
             record.exit = 1;
-            record.result = RunResult::Failed;
             record.message.get_or_insert_with(|| format!("{error:#}"));
         }
     }
