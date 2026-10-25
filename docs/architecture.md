@@ -1791,9 +1791,11 @@ Automatic updates are required, so they are on by default.
   `LOADOUT_HOME` isolation (exit 4), because every scheduler acts on the real user.
   - `service install` reads the interval from the resolved `[update]` of loadout's clone, and
     refuses (exit 4) when it sets `auto = false`. It records `<state>/service.toml`: the
-    executable, the interval, the home, config and state dirs, and only `PATH`, `PATHEXT`, the XDG
-    and `LOADOUT_STATE_DIR` variables, and the agent dir variables. A run refuses a record whose
-    rebuilt dirs differ, or that isn't the `service.toml` of the state dir it names.
+    executable, the interval, every resolved destination (home, config, XDG config and data, state,
+    agent dir overrides), and only `PATH`, `PATHEXT`, the XDG and `LOADOUT_STATE_DIR` variables,
+    and the agent dir variables. A variable or path that isn't valid UTF-8 can't be recorded
+    exactly, so `install` refuses it before writing anything. A run refuses a record whose rebuilt
+    destinations differ, or that isn't the `service.toml` of the state dir it names.
   - Arguments are quoted per scheduler: systemd `ExecStart` double quotes with `\`, `"`, `%%` and
     `$$` escaped; plist `<string>` elements, XML-escaped, never joined; Task `<Arguments>` quoted for
     `CommandLineToArgvW`, then XML-escaped. A path with a control character or invalid UTF-8 is

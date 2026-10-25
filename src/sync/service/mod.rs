@@ -114,7 +114,12 @@ pub struct Recorded {
     pub installed: u64,
     pub home: PathBuf,
     pub config: PathBuf,
+    pub xdg_config: PathBuf,
+    pub xdg_data: PathBuf,
     pub state: PathBuf,
+    /// The agent dir overrides `Context` resolved, by variable name.
+    #[serde(default)]
+    pub agent_dirs: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -137,16 +142,69 @@ impl Recorded {
             path: path.to_path_buf(),
             what,
         };
-        if context.home != self.home {
-            return Err(moved("home dir"));
-        }
-        if context.config != self.config {
-            return Err(moved("config dir"));
-        }
-        if context.state != self.state {
-            return Err(moved("state dir"));
+        let agent_dirs: BTreeMap<String, PathBuf> = context
+            .agent_dirs
+            .iter()
+            .map(|(name, dir)| ((*name).to_owned(), dir.clone()))
+            .collect();
+        for (what, same) in [
+            ("home dir", context.home == self.home),
+            ("config dir", context.config == self.config),
+            ("XDG config dir", context.xdg_config == self.xdg_config),
+            ("XDG data dir", context.xdg_data == self.xdg_data),
+            ("state dir", context.state == self.state),
+            ("agent dir overrides", agent_dirs == self.agent_dirs),
+            ("isolation", !context.isolated),
+        ] {
+            if !same {
+                return Err(moved(what));
+            }
         }
         Ok(context)
+    }
+
+    /// What `install` records for `context`, running `exe` every `interval_minutes`, with the
+    /// variables `var` gives. Every path must be text a scheduler file and `service.toml` can
+    /// carry, and rebuilding the `Context` from the record must land on every one of
+    /// `context`'s destinations; otherwise it is refused, before anything is written.
+    pub fn new(
+        context: &Context,
+        exe: &Path,
+        interval_minutes: u32,
+        var: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Recorded, Error> {
+        let recorded = Recorded {
+            version: VERSION,
+            exe: exe.to_path_buf(),
+            interval_minutes,
+            installed: super::now(),
+            home: context.home.clone(),
+            config: context.config.clone(),
+            xdg_config: context.xdg_config.clone(),
+            xdg_data: context.xdg_data.clone(),
+            state: context.state.clone(),
+            agent_dirs: context
+                .agent_dirs
+                .iter()
+                .map(|(name, dir)| ((*name).to_owned(), dir.clone()))
+                .collect(),
+            env: captured(var)?,
+        };
+        for path in [
+            &recorded.exe,
+            &recorded.home,
+            &recorded.config,
+            &recorded.xdg_config,
+            &recorded.xdg_data,
+            &recorded.state,
+        ]
+        .into_iter()
+        .chain(recorded.agent_dirs.values())
+        {
+            safe(path)?;
+        }
+        recorded.context(context.os, &Private::Service.path(context))?;
+        Ok(recorded)
     }
 
     /// The variables a background worker is started with, on top of the scheduler's.
@@ -233,16 +291,7 @@ pub fn install(context: &Context, interval_minutes: u32) -> Result<Installed, Er
     if context.os == Os::Linux {
         systemd::session(context)?;
     }
-    let recorded = Recorded {
-        version: VERSION,
-        exe: exe.clone(),
-        interval_minutes,
-        installed: super::now(),
-        home: context.home.clone(),
-        config: context.config.clone(),
-        state: context.state.clone(),
-        env: captured(&mut warnings),
-    };
+    let recorded = Recorded::new(context, &exe, interval_minutes, |name| env::var_os(name))?;
     let text = toml::to_string(&recorded).map_err(|error| Error::Invalid {
         path: service.clone(),
         message: error.to_string(),
@@ -574,23 +623,22 @@ pub(crate) fn safe(path: &Path) -> Result<&str, Error> {
     Ok(text)
 }
 
-/// The variables in `CAPTURED` and `context::AGENT_DIR_VARS` that are set, non-empty and valid
-/// UTF-8 in this process.
-fn captured(warnings: &mut Vec<String>) -> BTreeMap<String, String> {
+/// The variables in `CAPTURED` and `context::AGENT_DIR_VARS` that are set and non-empty. One
+/// that isn't valid UTF-8 can't be recorded exactly, and dropping it would send a background run
+/// to another destination or search path, so it is refused.
+fn captured(var: impl Fn(&str) -> Option<OsString>) -> Result<BTreeMap<String, String>, Error> {
     CAPTURED
         .iter()
         .chain(context::AGENT_DIR_VARS.iter())
         .filter_map(|name| {
-            let value = env::var_os(name).filter(|value| !value.is_empty())?;
-            match value.into_string() {
-                Ok(value) => Some(((*name).to_owned(), value)),
-                Err(_) => {
-                    warnings.push(format!(
-                        "{name} is not valid UTF-8, so the background job won't have it"
-                    ));
-                    None
-                }
-            }
+            let value = var(name).filter(|value| !value.is_empty())?;
+            Some(match value.into_string() {
+                Ok(value) => Ok(((*name).to_owned(), value)),
+                Err(value) => Err(Error::UnsafePath {
+                    path: PathBuf::from(value),
+                    reason: "(an environment variable the background job needs) is not valid UTF-8",
+                }),
+            })
         })
         .collect()
 }
@@ -738,7 +786,10 @@ mod tests {
             installed: 1,
             home: PathBuf::from("/home/u"),
             config: PathBuf::from("/home/u/.config"),
+            xdg_config: PathBuf::from("/home/u/.config"),
+            xdg_data: PathBuf::from("/home/u/.local/share"),
             state: state.to_path_buf(),
+            agent_dirs: BTreeMap::new(),
             env: BTreeMap::from([("LOADOUT_STATE_DIR".to_owned(), state.display().to_string())]),
         }
     }
@@ -777,6 +828,75 @@ mod tests {
             "{error}"
         );
         assert!(error.is_unhealthy());
+    }
+
+    /// A destination override that changes where a run writes must survive the record exactly:
+    /// an agent dir the record lacks, or one in the record the environment no longer gives,
+    /// is refused as a different environment.
+    #[cfg(unix)]
+    #[test]
+    fn every_resolved_destination_must_survive_the_record() {
+        let state = PathBuf::from("/srv/loadout-state");
+        let mut record = recorded(&state);
+        record
+            .env
+            .insert("CODEX_HOME".to_owned(), "/srv/codex".to_owned());
+        let error = record
+            .context(Os::Linux, Path::new("service.toml"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Moved {
+                    what: "agent dir overrides",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        record
+            .agent_dirs
+            .insert("CODEX_HOME".to_owned(), PathBuf::from("/srv/codex"));
+        let context = record
+            .context(Os::Linux, Path::new("service.toml"))
+            .unwrap();
+        assert_eq!(
+            context.agent_dir("CODEX_HOME"),
+            Some(Path::new("/srv/codex"))
+        );
+
+        record.env.remove("CODEX_HOME");
+        assert!(
+            record
+                .context(Os::Linux, Path::new("service.toml"))
+                .is_err()
+        );
+        record.agent_dirs.clear();
+        record.xdg_data = PathBuf::from("/elsewhere");
+        assert!(matches!(
+            record.context(Os::Linux, Path::new("service.toml")),
+            Err(Error::Moved {
+                what: "XDG data dir",
+                ..
+            })
+        ));
+    }
+
+    /// An override that isn't valid UTF-8 can't be recorded exactly, so recording refuses
+    /// rather than dropping it (which would point the background run elsewhere).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_override_is_refused_rather_than_dropped() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(b"/srv/co\xffdex".to_vec());
+        let error = captured(|name| (name == "CODEX_HOME").then(|| bad.clone())).unwrap_err();
+        assert!(error.is_unhealthy(), "{error}");
+        let fine =
+            captured(|name| (name == "CODEX_HOME").then(|| OsString::from("/srv/codex"))).unwrap();
+        assert_eq!(
+            fine.get("CODEX_HOME").map(String::as_str),
+            Some("/srv/codex")
+        );
     }
 
     #[test]
@@ -1069,19 +1189,11 @@ mod tests {
     #[cfg(unix)]
     fn record_for(fakes: &Fakes, exe: &Path) -> Recorded {
         let context = &fakes.context;
-        let recorded = Recorded {
-            version: VERSION,
-            exe: exe.to_path_buf(),
-            interval_minutes: 60,
-            installed: 1,
-            home: context.home.clone(),
-            config: context.config.clone(),
-            state: context.state.clone(),
-            env: BTreeMap::from([(
-                STATE_OVERRIDE.to_owned(),
-                context.state.to_str().unwrap().to_owned(),
-            )]),
-        };
+        let state = context.state.clone().into_os_string();
+        let recorded = Recorded::new(context, exe, 60, |name| {
+            (name == STATE_OVERRIDE).then(|| state.clone())
+        })
+        .unwrap();
         state::write_private(
             context,
             Private::Service,
