@@ -199,7 +199,9 @@ Neither script installs git; each names the per-OS command instead.
 10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
     shell profiles or `PATH`.
 11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
-    remaining arguments. The URL must not start with `-`.
+    remaining arguments. The URL must not start with `-`. The script's own message shows the URL
+    with any userinfo as `***`, as loadout does, and never the init arguments; `init` itself
+    refuses a URL carrying a password before showing anything.
     - `install.sh` passes `"$@"`.
     - `install.ps1` encodes each `-InitArgs` element as exactly one argument, using the
       `CommandLineToArgvW` / MSVC / Rust rules: quotes, backslashes before a quote or at the end,

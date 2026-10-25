@@ -539,6 +539,25 @@ class InstallShTest(unittest.TestCase):
             ["init", url, "--name", "box one", "", "--no-service"],
         )
 
+    def test_progress_never_shows_url_credentials_or_init_arguments(self):
+        secret = "SENTINEL-SECRET-7f3a"
+        for url, shown in (
+            (f"https://me:{secret}@example.invalid/me/loadout.git", "https://***@example.invalid/me/loadout.git"),
+            (f"https://{secret}@example.invalid/me/loadout.git", "https://***@example.invalid/me/loadout.git"),
+            ("git@github.com:me/loadout.git", "git@github.com:me/loadout.git"),
+        ):
+            with self.subTest(url=url):
+                shutil.rmtree(self.home / ".local", ignore_errors=True)
+                result = self.install(url, "--name", f"box-{secret}")
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertNotIn(secret, result.stdout + result.stderr)
+                self.assertIn(f"init {shown} and the init arguments you gave", result.stderr)
+                self.assertEqual(
+                    self.init_args.read_text().split("\n")[:-1],
+                    ["init", url, "--name", f"box-{secret}"],
+                    "init still gets exactly what was given",
+                )
+
     def test_usage_errors_exit_2_before_any_download(self):
         for args in (
             ("--", "-x"),

@@ -245,6 +245,23 @@ lock_install() {
   esac
 }
 
+# The loadout URL as loadout itself shows it: the userinfo of a scheme:// URL, which can be a token,
+# becomes ***. An scp-like user@host:path keeps its SSH user name.
+shown_url() {
+  case $1 in
+    *://*)
+      scheme=${1%%://*}
+      rest=${1#*://}
+      authority=${rest%%/*}
+      case $authority in
+        *@*) printf '%s://***@%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}" ;;
+        *) printf '%s' "$1" ;;
+      esac
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 # The sha256 of the binary and of the record, or `absent`, as one line.
 install_state() {
   for path in "$dest" "$record"; do
@@ -372,6 +389,7 @@ esac
 if [ -n "$loadout_url" ]; then
   cleanup
   trap - EXIT
-  say "running $dest init $loadout_url $*"
+  # The init arguments aren't shown: they are the user's own, and could hold anything.
+  say "running $dest init $(shown_url "$loadout_url")${1+ and the init arguments you gave}"
   exec "$dest" init "$loadout_url" "$@"
 fi

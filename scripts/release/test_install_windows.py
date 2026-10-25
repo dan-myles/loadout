@@ -664,7 +664,8 @@ class InstallPs1WrapperTest(unittest.TestCase):
         digest = hashlib.sha256((folder / cls.asset).read_bytes()).hexdigest()
         (folder / f"{cls.asset}.sha256").write_bytes(f"{digest}  {cls.asset}\n".encode("ascii"))
 
-    def run_installer(self, shell, command, init_args, child_exit, extra_env=None):
+    def run_installer(self, shell, command, init_args, child_exit, extra_env=None,
+                      url="https://example.invalid/me/loadout.git"):
         case = Path(tempfile.mkdtemp(dir=str(self.root)))
         (case / "args.json").write_text(json.dumps(init_args), encoding="utf-8")
         received = case / "received.txt"
@@ -672,7 +673,7 @@ class InstallPs1WrapperTest(unittest.TestCase):
             os.environ,
             LOCALAPPDATA=str(case / "LocalAppData"),
             LT_BASE=self.base,
-            LT_URL="https://example.invalid/me/loadout.git",
+            LT_URL=url,
             LT_ARGS=str(case / "args.json"),
             LT_INSTALLER=str(SCRIPT),
             LT_RECEIVED=str(received),
@@ -708,6 +709,23 @@ class InstallPs1WrapperTest(unittest.TestCase):
                             received.read_text(encoding="utf-8").split("\n")[:-1],
                             ["init", "https://example.invalid/me/loadout.git", "--name", "box one", ""],
                         )
+
+    def test_progress_never_shows_url_credentials_or_init_arguments(self):
+        secret = "SENTINEL-SECRET-7f3a"
+        for shell in SHELLS:
+            for url, shown in (
+                (f"https://me:{secret}@example.invalid/me/loadout.git", "https://***@example.invalid/me/loadout.git"),
+                (f"https://{secret}@example.invalid/me/loadout.git", "https://***@example.invalid/me/loadout.git"),
+                ("git@github.com:me/loadout.git", "git@github.com:me/loadout.git"),
+            ):
+                with self.subTest(shell=shell, url=url):
+                    completed, received, installed = self.run_installer(
+                        shell, ["-File", str(self.root / "wrapper.ps1")], [f"box-{secret}"], 0, {"LT_MODE": "file"}, url=url)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertNotIn(secret, completed.stdout + completed.stderr)
+                    self.assertIn(f"init {shown} and the init arguments you gave", completed.stderr)
+                    self.assertEqual(received.read_text(encoding="utf-8").split("\n")[:-1],
+                                     ["init", url, f"box-{secret}"])
 
     def test_init_start_failure_completes_with_1_not_a_stale_success(self):
         too_long = ["x" * 40000]

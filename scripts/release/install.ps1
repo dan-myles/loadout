@@ -267,6 +267,19 @@ function Open-InstallLock([string]$Dir) {
     }
 }
 
+# The loadout URL as loadout itself shows it: the userinfo of a scheme:// URL, which can be a token,
+# becomes ***. An scp-like user@host:path keeps its SSH user name.
+function Get-ShownUrl([string]$Url) {
+    $scheme = $Url.IndexOf('://')
+    if ($scheme -lt 0) { return $Url }
+    $rest = $Url.Substring($scheme + 3)
+    $slash = $rest.IndexOf('/')
+    $authority = if ($slash -ge 0) { $rest.Substring(0, $slash) } else { $rest }
+    $at = $authority.LastIndexOf('@')
+    if ($at -lt 0) { return $Url }
+    $Url.Substring(0, $scheme + 3) + '***' + $rest.Substring($at)
+}
+
 # The sha256 of each path, or 'absent', as one line.
 function Get-InstallState([string[]]$Paths) {
     ($Paths | ForEach-Object { if (Test-Path -LiteralPath $_) { Get-Sha256 $_ } else { 'absent' } }) -join ' '
@@ -540,7 +553,9 @@ if (-not $LoadoutUrl) {
     return
 }
 
-Say "running $installed init $LoadoutUrl $($InitArgs -join ' ')"
+# The init arguments aren't shown: they are the user's own, and could hold anything.
+$more = if ($InitArgs.Count) { ' and the init arguments you gave' } else { '' }
+Say "running $installed init $(Get-ShownUrl $LoadoutUrl)$more"
 try {
     $initExit = Invoke-Native $installed (@('init', $LoadoutUrl) + $InitArgs)
 } catch {

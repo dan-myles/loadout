@@ -35,10 +35,17 @@ fn machine_name(value: &str) -> Result<String, String> {
 /// machine's name and the loadout's URL, applies it, and installs the background update service
 /// unless the loadout's `[update] auto` is false or `--no-service` is given.
 ///
-/// Every check that can refuse runs before anything is written. The state lock is held from
-/// the clone through the apply. A private loadout clones with the user's own Git credentials or
-/// SSH keys; loadout stores no token.
+/// The existing setup, a conflicting `--name`, and a URL carrying a password are refused before
+/// anything is written; a clone, machine-file, apply or service failure can still come after the
+/// clone. The state lock is held from the clone through the apply. A private loadout clones with
+/// the user's own Git credentials or SSH keys; loadout stores no token, and shows the URL only
+/// with its userinfo hidden.
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
+    if machine::has_password(&args.url) {
+        anyhow::bail!(
+            "the URL carries a password; loadout stores no credential, so give git a credential helper or an SSH key instead"
+        );
+    }
     let checkout = sync::checkout(context);
     if checkout.exists() {
         anyhow::bail!(
@@ -63,7 +70,11 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     }
 
     let lock = state::lock(context)?;
-    println!("cloning {} into {}", args.url, checkout.display());
+    println!(
+        "cloning {} into {}",
+        sync::redact(&args.url),
+        checkout.display()
+    );
     sync::clone(&args.url, context, &lock)?;
 
     let name = match (&args.name, saved) {

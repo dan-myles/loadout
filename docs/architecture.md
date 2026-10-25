@@ -1760,6 +1760,9 @@ Automatic updates are required, so they are on by default.
     loadout doesn't list is noted: it gets the global and OS layers only.
   - `machine::save` writes `name` and `remote` atomically (0600 on Unix), and refuses a remote with a
     password.
+  - A URL carrying a password is refused before anything is shown or written, and the URL is only
+    ever shown through `sync::redact`, with its userinfo as `***`. The install scripts show it the
+    same way and never echo the init arguments.
   - The service is installed with `sync::service::install(context, interval)` unless `--no-service`,
     the resolved `[update] auto` is false, or the loadout is invalid. Its warnings are printed, and
     an unhealthy refusal exits 4.

@@ -121,7 +121,7 @@ pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), Error> {
 }
 
 /// Whether a URL's authority names a password, as in `https://user:token@host/repo`.
-fn has_password(remote: &str) -> bool {
+pub(crate) fn has_password(remote: &str) -> bool {
     remote
         .split_once("://")
         .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
