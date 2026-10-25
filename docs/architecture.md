@@ -399,12 +399,20 @@ U1 (built) adds the checks that need a machine. `resolve` runs them for one mach
 **Reserved destinations, two ways.** Validate's synthetic machines carry no `Context`, so they
 read nothing from the host. Every final target is a literal that some layer declared, and
 `check_literal` already checked each literal under all three `{config}` meanings, so a synthetic
-re-check would add nothing. The runtime check needs a real `Context` and the active checkout, so
-it is `resolve::check_targets(resolved, context, loadout)`. It runs `reserved::check_path` on
-every expanded file target (`Write`) and every enabled custom agent path for `context.os`
-(`WriteInto`, `Write`, `KeyMerge`), and it errors when a target has no valid path on that OS. U4
-calls it after `resolve` and before observing anything. It doesn't replace the per-read,
-per-backup, and per-write checks in section 6.
+re-check would add nothing. The runtime check needs a real `Context` and the active checkout.
+`resolve::check_targets(resolved, context, loadout)` is a public form of it: it runs
+`reserved::check_path` on every expanded file target (`Write`) and every enabled custom agent
+path for `context.os` (`WriteInto`, `Write`, `KeyMerge`), and it errors when a target has no
+valid path on that OS. Tests call it, but no command does, and it is not on U4's host pipeline.
+That pipeline checks each destination as `plan::build` produces it (section 11), so it checks
+the destinations it would write rather than every declared custom-agent path. A user-file target
+with no valid path on this OS is an error, and one that `reserved::check_path(Write)` refuses
+becomes an unsupported action. `agents::materialize` checks each skill folder and instructions
+file an agent would receive with `Write`, and each MCP file with `KeyMerge`, and a refusal is
+again an unsupported action. `state::observe` then repeats the reserved check before it reads
+any target (`Write` for a path, `KeyMerge` for an entry), and `plan::compare` turns that refusal
+into an unsupported or blocked action. None of this replaces the per-read, per-backup, and
+per-write checks in section 6.
 
 `check_all` resolves every listed machine, every unlisted machine name that a `when.machine`
 uses, and one other unlisted machine. Each runs on macOS, Linux, and Windows, on both
