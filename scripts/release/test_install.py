@@ -1,6 +1,7 @@
 import hashlib
 import http.server
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -250,6 +251,40 @@ class InstallShTest(unittest.TestCase):
             record = tomllib.load(handle)
         self.assertEqual(record["schema"], 1)
         self.assertEqual(record["binary"], os.path.realpath(self.dest))
+        self.assertEqual(record["binary_sha256"], sha256(fake_loadout()))
+        self.assertEqual(record["archive_sha256"], sha256(self.archive))
+
+    def test_hashes_and_paths_round_trip_under_quotes_and_backslashes(self):
+        # Record values are TOML basic strings that only escape backslash and double quote, which
+        # JSON decodes the same way, so this checks every value without needing tomllib. The staged
+        # binary, the destination and the download all live under such paths: given a name with a
+        # backslash, sha256sum and shasum prefix the digest with one.
+        downloads = self.tmp / 'tm"p\\dir'
+        downloads.mkdir()
+        home = self.tmp / 'we"ird\\home'
+        home.mkdir()
+        self.home = home
+        self.install_ok(home=home, TMPDIR=str(downloads))
+        record = {key: json.loads(value) for key, value in self.read_record().items() if key != "schema"}
+        self.assertEqual(record["binary"], os.path.realpath(self.dest))
+        self.assertEqual(record["binary_sha256"], sha256(fake_loadout()))
+        self.assertEqual(record["archive_sha256"], sha256(self.archive))
+        self.assertEqual(record["source"], f"{self.base}/{ASSET}")
+        self.assertEqual(record["version"], "1.2.3")
+
+        # The next install reads that record back as its own and upgrades in place.
+        self.publish(fake_loadout("1.2.4"))
+        self.install_ok(home=home, TMPDIR=str(downloads))
+        self.assertEqual(self.dest.read_bytes(), fake_loadout("1.2.4"))
+        self.assertEqual(json.loads(self.read_record()["binary_sha256"]), sha256(fake_loadout("1.2.4")))
+
+    def test_a_checksum_tool_printing_anything_but_a_digest_installs_nothing(self):
+        self.write_exe(self.fakebin / "sha256sum", "#!/bin/sh\ncat >/dev/null\nprintf '%s  -\\n' '\\0123'\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not hash", result.stderr)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.record.exists())
 
     def test_record_names_the_canonical_binary_path(self):
         real_home = self.tmp / "real-home"
