@@ -4,7 +4,7 @@
 //! limit and the control-group kill are only a backstop behind loadout's own supervisor. The
 //! timer counts the interval from the end of each run, so runs never overlap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::context::Context;
 
@@ -173,21 +173,97 @@ pub(super) fn linger(context: &Context) -> Option<bool> {
     }
 }
 
-/// How the unit files differ from the ones `install` would write for this record, if they do.
+/// How the units differ from the ones `install` would write for this record, if they do: first
+/// the files on disk, then (outside isolation) the units systemd has loaded, since matching files
+/// prove nothing about a job loaded before they were written. A unit file that can't be read,
+/// or a systemd that can't be asked, is an error, never a match.
 pub(super) fn differs(
     context: &Context,
     exe: &str,
     service: &str,
     interval_minutes: u32,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let expected = [
         (SERVICE, service_unit(exe, service)),
         (TIMER, timer_unit(interval_minutes)),
     ];
-    expected.into_iter().find_map(|(name, text)| {
-        let actual = super::definition(&dir(context).join(name))?;
-        (actual != text).then(|| super::differs_from_record(name))
-    })
+    let mut present = true;
+    for (name, text) in expected {
+        match super::definition(&dir(context).join(name))? {
+            Some(actual) if actual != text => return Ok(Some(super::differs_from_record(name))),
+            Some(_) => {}
+            None => present = false,
+        }
+    }
+    if !present || context.isolated {
+        return Ok(None);
+    }
+    loaded(context)
+}
+
+/// Whether systemd runs the units on disk: each loaded from its file in loadout's unit folder,
+/// with no drop-in that could change it, and not changed on disk since systemd loaded it.
+fn loaded(context: &Context) -> Result<Option<String>, String> {
+    let args = [
+        "--user",
+        "show",
+        "--property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload",
+        SERVICE,
+        TIMER,
+    ];
+    let answer = query(context, "systemctl", &args).map_err(|error| error.to_string())?;
+    if !answer.success() {
+        return Err(failed("systemctl", &args, &answer).to_string());
+    }
+    let units: Vec<&str> = answer.stdout.trim().split("\n\n").collect();
+    let [service, timer] = units.as_slice() else {
+        return Err(format!(
+            "`systemctl {}` didn't describe both units: {}",
+            args.join(" "),
+            answer.stdout.trim()
+        ));
+    };
+    for (name, shown) in [(SERVICE, service), (TIMER, timer)] {
+        let property = |key: &str| {
+            shown
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        };
+        let (Some(state), Some(fragment), Some(drop_ins), Some(reload)) = (
+            property("LoadState"),
+            property("FragmentPath"),
+            property("DropInPaths"),
+            property("NeedDaemonReload"),
+        ) else {
+            return Err(format!(
+                "`systemctl {}` didn't describe {name}",
+                args.join(" ")
+            ));
+        };
+        let file = dir(context).join(name);
+        let from_file = Path::new(fragment) == file
+            || std::fs::canonicalize(fragment).is_ok_and(|fragment| {
+                std::fs::canonicalize(&file).is_ok_and(|file| file == fragment)
+            });
+        let why = if state != "loaded" {
+            format!("systemd has {name} {state}")
+        } else if !from_file {
+            format!(
+                "systemd loaded {name} from {fragment}, not {}",
+                file.display()
+            )
+        } else if !drop_ins.is_empty() {
+            format!("systemd runs {name} with drop-ins that can change it: {drop_ins}")
+        } else if reload != "no" {
+            format!("{name} changed on disk since systemd loaded it, so it runs the old one")
+        } else {
+            continue;
+        };
+        return Ok(Some(format!(
+            "{why}; the job systemd runs may not be this record's"
+        )));
+    }
+    Ok(None)
 }
 
 pub(super) fn registered(context: &Context) -> Scheduler {
