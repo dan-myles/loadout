@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::context::Context;
 
-use super::{Error, Scheduler, query, remove, required, write};
+use super::{Error, Scheduler, failed, query, remove, required, write};
 
 const SERVICE: &str = "loadout-update.service";
 const TIMER: &str = "loadout-update.timer";
@@ -108,20 +108,29 @@ pub(super) fn install(
     Ok(())
 }
 
+/// Disables the timer and removes both units. With neither unit file there, nothing was
+/// installed and nothing is asked. Otherwise every step must succeed before the files go: a
+/// failure (no user session included) leaves the files, and `service.toml`, in place.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
-    let present = files(context)
-        .iter()
-        .any(|path| std::fs::symlink_metadata(path).is_ok());
-    if present {
-        let disabled = query(context, "systemctl", &["--user", "disable", "--now", TIMER])?;
-        if !disabled.success() && disabled.stderr.contains("Failed to connect") {
-            return Err(Error::NoUserSession(disabled.stderr.trim().to_owned()));
-        }
-        for path in files(context) {
-            remove(&path)?;
-        }
-        required(context, "systemctl", &["--user", "daemon-reload"])?;
+    let exists = |path: &PathBuf| std::fs::symlink_metadata(path).is_ok();
+    let [service, timer] = [dir(context).join(SERVICE), dir(context).join(TIMER)];
+    if !exists(&service) && !exists(&timer) {
+        return Ok(());
     }
+    if exists(&timer) {
+        let args = ["--user", "disable", "--now", TIMER];
+        let disabled = query(context, "systemctl", &args)?;
+        if !disabled.success() {
+            if disabled.stderr.contains("Failed to connect") {
+                return Err(Error::NoUserSession(disabled.stderr.trim().to_owned()));
+            }
+            return Err(failed("systemctl", &args, &disabled));
+        }
+    }
+    for path in [&service, &timer] {
+        remove(path)?;
+    }
+    required(context, "systemctl", &["--user", "daemon-reload"])?;
     Ok(())
 }
 

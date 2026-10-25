@@ -4,7 +4,7 @@
 //! launcher beside `loadout.exe`, so no console window opens at each run; the launcher runs the
 //! same supervisor as `loadout update --background`.
 
-use super::{Error, LAUNCHER, Scheduler, query, required, xml};
+use super::{Error, LAUNCHER, Scheduler, failed, query, required, xml};
 use crate::context::Context;
 use crate::state::{self, Private};
 
@@ -120,12 +120,29 @@ pub(super) fn install(
     created.map(|_| ())
 }
 
+/// Ends and deletes the task. `/Query` must find it, or say it doesn't exist (`cannot find`);
+/// any other failure is an error, and so is a failed `/Delete`, leaving `service.toml` in place.
+/// `/End` only stops a run that is going; a task that isn't running can't be ended, so its
+/// answer doesn't decide anything.
+///
+/// The not-found text is English; on a Windows that answers in another language, a missing task
+/// is reported as an error with schtasks' own words rather than assumed gone.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
-    if query(context, "schtasks", &["/Query", "/TN", NAME])?.success() {
-        query(context, "schtasks", &["/End", "/TN", NAME])?;
-        required(context, "schtasks", &["/Delete", "/TN", NAME, "/F"])?;
+    let args = ["/Query", "/TN", NAME];
+    let found = query(context, "schtasks", &args)?;
+    if !found.success() {
+        if not_found(&found) {
+            return Ok(());
+        }
+        return Err(failed("schtasks", &args, &found));
     }
+    query(context, "schtasks", &["/End", "/TN", NAME])?;
+    required(context, "schtasks", &["/Delete", "/TN", NAME, "/F"])?;
     Ok(())
+}
+
+fn not_found(answer: &crate::process::Captured) -> bool {
+    answer.stderr.contains("cannot find") || answer.stdout.contains("cannot find")
 }
 
 pub(super) fn registered(context: &Context) -> Scheduler {

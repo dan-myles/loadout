@@ -527,7 +527,7 @@ fn captured(warnings: &mut Vec<String>) -> BTreeMap<String, String> {
 
 /// Runs a scheduler command (bounded, like a manager query) and returns what it printed.
 fn query(context: &Context, program: &str, args: &[&str]) -> Result<Captured, Error> {
-    let path = context::which(program).ok_or_else(|| Error::Scheduler {
+    let path = locate(program).ok_or_else(|| Error::Scheduler {
         command: program.to_owned(),
         detail: "it is not on PATH".to_owned(),
     })?;
@@ -544,10 +544,50 @@ fn required(context: &Context, program: &str, args: &[&str]) -> Result<Captured,
     if captured.success() {
         Ok(captured)
     } else {
-        Err(Error::Scheduler {
-            command: format!("{program} {}", args.join(" ")),
-            detail: format!("{}: {}", captured.status(), captured.stderr.trim()),
-        })
+        Err(failed(program, args, &captured))
+    }
+}
+
+/// A scheduler command that answered with a failure, with what it said.
+fn failed(program: &str, args: &[&str], captured: &Captured) -> Error {
+    let said = [captured.stderr.trim(), captured.stdout.trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::Scheduler {
+        command: format!("{program} {}", args.join(" ")),
+        detail: format!("{}: {said}", captured.status()),
+    }
+}
+
+/// Where a scheduler command is: on PATH, or in a test, the fake the test put in its place.
+fn locate(program: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = fake::tool(program) {
+        return Some(path);
+    }
+    context::which(program)
+}
+
+/// Test-only stand-ins for `systemctl`, `launchctl` and `schtasks`, per thread, so no test ever
+/// asks the host's scheduler anything.
+#[cfg(test)]
+pub(super) mod fake {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static TOOLS: RefCell<BTreeMap<String, PathBuf>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    pub(super) fn set(program: &str, path: PathBuf) {
+        TOOLS.with(|tools| tools.borrow_mut().insert(program.to_owned(), path));
+    }
+
+    pub(super) fn tool(program: &str) -> Option<PathBuf> {
+        TOOLS.with(|tools| tools.borrow().get(program).cloned())
     }
 }
 
@@ -743,6 +783,210 @@ mod tests {
             2,
             "only the target and the planted link remain: {names:?}"
         );
+    }
+
+    /// A scratch home and state dir with a non-isolated `Context` for `os`, and fake scheduler
+    /// commands that log their arguments; nothing on the host is asked.
+    #[cfg(unix)]
+    struct Fakes {
+        dir: tempfile::TempDir,
+        context: Context,
+    }
+
+    #[cfg(unix)]
+    impl Fakes {
+        fn new(os: Os) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let state = dir.path().join("state").into_os_string();
+            let context = Context::resolve(
+                os,
+                |name| (name == STATE_OVERRIDE).then(|| state.clone()),
+                Some(home),
+            )
+            .unwrap();
+            assert!(!context.isolated);
+            Self { dir, context }
+        }
+
+        /// Puts a fake `program` in place: it logs its arguments, then runs `body`.
+        fn tool(&self, program: &str, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.dir.path().join(program);
+            let log = self.dir.path().join(format!("{program}.log"));
+            fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            fake::set(program, path);
+        }
+
+        fn calls(&self, program: &str) -> String {
+            fs::read_to_string(self.dir.path().join(format!("{program}.log"))).unwrap_or_default()
+        }
+
+        fn plant(&self, path: &Path) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "planted").unwrap();
+        }
+
+        fn record(&self) {
+            state::write_private(&self.context, Private::Service, b"version = 1\n").unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_uninstall_removes_nothing_until_systemd_agrees() {
+        let fakes = Fakes::new(Os::Linux);
+        fakes.tool("systemctl", "exit 0");
+        systemd::uninstall(&fakes.context).unwrap();
+        assert_eq!(
+            fakes.calls("systemctl"),
+            "",
+            "nothing installed: nothing asked"
+        );
+
+        let units = systemd::files(&fakes.context);
+        for unit in &units {
+            fakes.plant(unit);
+        }
+        fakes.tool(
+            "systemctl",
+            "case \"$*\" in *disable*) echo 'Failed to disable unit: Access denied' >&2; exit 1;; esac",
+        );
+        let error = systemd::uninstall(&fakes.context).unwrap_err();
+        assert!(matches!(error, Error::Scheduler { .. }), "{error}");
+        assert!(error.to_string().contains("Access denied"), "{error}");
+        assert!(units.iter().all(|unit| unit.exists()), "the units stay");
+
+        fakes.tool(
+            "systemctl",
+            "case \"$*\" in *disable*) echo 'Failed to connect to bus: No medium found' >&2; exit 1;; esac",
+        );
+        assert!(matches!(
+            systemd::uninstall(&fakes.context),
+            Err(Error::NoUserSession(_))
+        ));
+        assert!(units.iter().all(|unit| unit.exists()));
+
+        fakes.tool("systemctl", "exit 0");
+        systemd::uninstall(&fakes.context).unwrap();
+        assert!(units.iter().all(|unit| !unit.exists()));
+        let calls = fakes.calls("systemctl");
+        assert!(
+            calls.contains("--user disable --now loadout-update.timer"),
+            "{calls}"
+        );
+        assert!(calls.contains("--user daemon-reload"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_uninstall_tells_an_unloaded_agent_from_a_failure() {
+        let fakes = Fakes::new(Os::Macos);
+        fakes.tool("launchctl", "exit 0");
+        launchd::uninstall(&fakes.context).unwrap();
+        assert_eq!(
+            fakes.calls("launchctl"),
+            "",
+            "nothing installed: nothing asked"
+        );
+
+        let plist = launchd::file(&fakes.context);
+        fakes.plant(&plist);
+        fakes.tool(
+            "launchctl",
+            "echo 'Boot-out failed: 5: Input/output error' >&2; exit 5",
+        );
+        let error = launchd::uninstall(&fakes.context).unwrap_err();
+        assert!(error.to_string().contains("Input/output error"), "{error}");
+        assert!(plist.exists(), "the plist stays");
+
+        fakes.tool(
+            "launchctl",
+            "echo 'Boot-out failed: 3: No such process' >&2; exit 3",
+        );
+        launchd::uninstall(&fakes.context).unwrap();
+        assert!(!plist.exists(), "an unloaded agent's plist is removed");
+
+        fakes.plant(&plist);
+        fakes.tool("launchctl", "exit 0");
+        launchd::uninstall(&fakes.context).unwrap();
+        assert!(!plist.exists());
+        assert!(
+            fakes.calls("launchctl").contains("bootout gui/"),
+            "{}",
+            fakes.calls("launchctl")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schtasks_uninstall_tells_a_missing_task_from_a_failure() {
+        let fakes = Fakes::new(Os::Windows);
+        fakes.tool(
+            "schtasks",
+            "echo 'ERROR: The system cannot find the file specified.' >&2; exit 1",
+        );
+        schtasks::uninstall(&fakes.context).unwrap();
+        assert!(!fakes.calls("schtasks").contains("/Delete"));
+
+        fakes.tool("schtasks", "echo 'ERROR: Access is denied.' >&2; exit 1");
+        let error = schtasks::uninstall(&fakes.context).unwrap_err();
+        assert!(error.to_string().contains("Access is denied"), "{error}");
+
+        fakes.tool(
+            "schtasks",
+            "case \"$1\" in /Delete) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
+        );
+        assert!(schtasks::uninstall(&fakes.context).is_err());
+
+        fakes.tool("schtasks", "exit 0");
+        schtasks::uninstall(&fakes.context).unwrap();
+        assert!(
+            fakes
+                .calls("schtasks")
+                .contains("/Delete /TN Loadout Update /F")
+        );
+    }
+
+    /// `service.toml` and the scheduler files stay until the scheduler's removal succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_uninstall_keeps_the_service_record() {
+        let os = Os::current().unwrap();
+        let fakes = Fakes::new(os);
+        fakes.record();
+        let record = Private::Service.path(&fakes.context);
+        let planted: Vec<PathBuf> = match os {
+            Os::Linux => systemd::files(&fakes.context),
+            Os::Macos => vec![launchd::file(&fakes.context)],
+            Os::Windows => Vec::new(),
+        };
+        for path in &planted {
+            fakes.plant(path);
+        }
+        fakes.tool("systemctl", "echo 'Access denied' >&2; exit 1");
+        fakes.tool(
+            "launchctl",
+            "echo 'Boot-out failed: 5: Input/output error' >&2; exit 5",
+        );
+        assert!(uninstall(&fakes.context).is_err());
+        assert!(
+            record.exists(),
+            "service.toml stays while the job may still be registered"
+        );
+        assert!(planted.iter().all(|path| path.exists()));
+
+        fakes.tool("systemctl", "exit 0");
+        fakes.tool("launchctl", "exit 0");
+        uninstall(&fakes.context).unwrap();
+        assert!(!record.exists());
+        assert!(planted.iter().all(|path| !path.exists()));
     }
 
     #[test]

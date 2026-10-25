@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::Context;
 
-use super::{Error, Scheduler, query, remove, required, write, xml};
+use super::{Error, Scheduler, failed, query, remove, required, write, xml};
 
 const LABEL: &str = "dev.loadout.update";
 
@@ -91,23 +91,37 @@ pub(super) fn install(
     Ok(())
 }
 
+/// Unloads the agent and removes its plist. With neither the plist nor `service.toml` there,
+/// nothing was installed and nothing is asked. `bootout` must succeed, or say the agent isn't
+/// loaded (`No such process`, 3; `Could not find specified service`, 113); any other answer is
+/// an error, and the plist and `service.toml` stay.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     let path = file(context);
-    if std::fs::symlink_metadata(&path).is_ok() {
-        let owned = super::Private::Service.path(context);
-        let domain = if std::fs::symlink_metadata(&owned).is_ok() {
-            domain(&owned)?
-        } else {
-            domain(&path)?
-        };
-        query(
-            context,
-            "launchctl",
-            &["bootout", &format!("{domain}/{LABEL}")],
-        )?;
-        remove(&path)?;
+    let owned = super::Private::Service.path(context);
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    if !exists(&path) && !exists(&owned) {
+        return Ok(());
     }
+    let domain = if exists(&owned) {
+        domain(&owned)?
+    } else {
+        domain(&path)?
+    };
+    let job = format!("{domain}/{LABEL}");
+    let args = ["bootout", job.as_str()];
+    let answer = query(context, "launchctl", &args)?;
+    if !answer.success() && !not_loaded(&answer) {
+        return Err(failed("launchctl", &args, &answer));
+    }
+    remove(&path)?;
     Ok(())
+}
+
+/// `launchctl bootout`'s answer for an agent that isn't loaded.
+fn not_loaded(answer: &crate::process::Captured) -> bool {
+    matches!(answer.code, Some(3 | 113))
+        || answer.stderr.contains("No such process")
+        || answer.stderr.contains("Could not find specified service")
 }
 
 pub(super) fn registered(context: &Context, owned: &Path) -> Scheduler {
