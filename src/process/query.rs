@@ -46,6 +46,27 @@ pub(crate) struct Captured {
     pub(crate) stderr: String,
 }
 
+/// A query's exit code and both streams exactly as the query wrote them, for an answer that
+/// isn't UTF-8 text (Task Scheduler's task XML).
+#[derive(Debug)]
+pub(crate) struct Output {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl From<Output> for Captured {
+    /// The text every manager query is read as: each stream as UTF-8, with anything else
+    /// replaced.
+    fn from(output: Output) -> Self {
+        Self {
+            code: output.code,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+}
+
 impl Captured {
     pub(crate) fn success(&self) -> bool {
         self.code == Some(0)
@@ -169,19 +190,28 @@ fn command(invocation: &Invocation) -> Command {
 /// Runs one query. In the foreground (`OwnGroup`) it is exactly U7's bounded query. In a
 /// supervised background worker (`Inherited`) a cancelled run starts no query, every failure
 /// cancels the run, and on Unix the query stays in the supervisor's group (see
-/// `run_inherited_query`).
+/// `run_inherited_output`).
 pub(crate) fn query(
     invocation: &Invocation,
     containment: &Containment,
 ) -> Result<Captured, QueryError> {
+    query_output(invocation, containment).map(Captured::from)
+}
+
+/// `query`, with the streams as the exact bytes the query wrote: the same bounds, cleanup, and
+/// cancellation, and no decoding.
+pub(crate) fn query_output(
+    invocation: &Invocation,
+    containment: &Containment,
+) -> Result<Output, QueryError> {
     let Containment::Inherited(supervised) = containment else {
-        return run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
+        return run_query_output(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
     };
     if supervised.cancel().is_cancelled() {
         return Err(QueryError::Cancelled);
     }
     #[cfg(unix)]
-    let result = run_inherited_query(
+    let result = run_inherited_output(
         invocation,
         QUERY_DEADLINE,
         QUERY_OUTPUT_CAP,
@@ -190,7 +220,7 @@ pub(crate) fn query(
     // Windows: the query's own job nests inside the supervisor's kill-on-close job, so ending
     // that job ends this one too.
     #[cfg(windows)]
-    let result = run_query(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
+    let result = run_query_output(invocation, QUERY_DEADLINE, QUERY_OUTPUT_CAP);
     if result.is_err() {
         supervised.cancel().cancel();
     }
@@ -200,12 +230,12 @@ pub(crate) fn query(
 /// Runs a query in a process tree loadout can stop as a whole: on Unix a process group whose id
 /// a loadout-owned anchor holds, on Windows a job object. Every outcome, success included, ends
 /// with `settle`, and only a settled query's buffers are read.
-fn run_query(
+fn run_query_output(
     invocation: &Invocation,
     deadline: Duration,
     cap: usize,
-) -> Result<Captured, QueryError> {
-    run_query_with(
+) -> Result<Output, QueryError> {
+    run_query_output_with(
         invocation,
         deadline,
         cap,
@@ -214,6 +244,18 @@ fn run_query(
     )
 }
 
+/// `run_query_output`, read as text, for the tests written against it.
+#[cfg(test)]
+fn run_query(
+    invocation: &Invocation,
+    deadline: Duration,
+    cap: usize,
+) -> Result<Captured, QueryError> {
+    run_query_output(invocation, deadline, cap).map(Captured::from)
+}
+
+/// `run_query_output_with`, read as text, for the tests written against it.
+#[cfg(test)]
 fn run_query_with(
     invocation: &Invocation,
     deadline: Duration,
@@ -221,6 +263,16 @@ fn run_query_with(
     grace: Duration,
     trace: &mut Trace,
 ) -> Result<Captured, QueryError> {
+    run_query_output_with(invocation, deadline, cap, grace, trace).map(Captured::from)
+}
+
+fn run_query_output_with(
+    invocation: &Invocation,
+    deadline: Duration,
+    cap: usize,
+    grace: Duration,
+    trace: &mut Trace,
+) -> Result<Output, QueryError> {
     // One setup deadline, set before anything is spawned, bounds the cleanup of every setup
     // failure, with no renewed budget. Only a query that fully started gets its own deadline and
     // then its own settle.
@@ -253,10 +305,10 @@ fn run_query_with(
         });
     }
     let code = outcome?;
-    Ok(Captured {
+    Ok(Output {
         code,
-        stdout: validated(&stdout, "stdout", cap)?,
-        stderr: validated(&stderr, "stderr", cap)?,
+        stdout: settled(&stdout, "stdout", cap)?,
+        stderr: settled(&stderr, "stderr", cap)?,
     })
 }
 
@@ -293,12 +345,12 @@ fn watch(
 /// descendant still holding the output, or a query that can't be stopped and reaped, is a
 /// `Cleanup` error, so the run is cancelled rather than credited.
 #[cfg(unix)]
-fn run_inherited_query(
+fn run_inherited_output(
     invocation: &Invocation,
     deadline: Duration,
     cap: usize,
     grace: Duration,
-) -> Result<Captured, QueryError> {
+) -> Result<Output, QueryError> {
     let setup = Instant::now() + grace;
     let mut child = command(invocation).spawn().map_err(QueryError::Spawn)?;
     let (stdout, stdout_started) = query_reader(child.stdout.take(), cap, "stdout");
@@ -318,11 +370,22 @@ fn run_inherited_query(
         });
     }
     let code = outcome?;
-    Ok(Captured {
+    Ok(Output {
         code,
-        stdout: validated(&stdout, "stdout", cap)?,
-        stderr: validated(&stderr, "stderr", cap)?,
+        stdout: settled(&stdout, "stdout", cap)?,
+        stderr: settled(&stderr, "stderr", cap)?,
     })
+}
+
+/// `run_inherited_output`, read as text, for the tests written against it.
+#[cfg(all(test, unix))]
+fn run_inherited_query(
+    invocation: &Invocation,
+    deadline: Duration,
+    cap: usize,
+    grace: Duration,
+) -> Result<Captured, QueryError> {
+    run_inherited_output(invocation, deadline, cap, grace).map(Captured::from)
 }
 
 /// Stops an inherited query: SIGKILL to its own pid only while it is unreaped (so the pid is
@@ -1262,11 +1325,11 @@ fn note(trace: &mut Trace, event: Event) {
 
 /// A settled stream's final state, read under one lock: an overflow first, then a read error,
 /// then the bytes. The reader marks itself done only after its last write, so this is final.
-fn validated(
+fn settled(
     buffer: &Mutex<Buffer>,
     stream: &'static str,
     cap: usize,
-) -> Result<String, QueryError> {
+) -> Result<Vec<u8>, QueryError> {
     let mut buffer = lock(buffer);
     if buffer.overflowed {
         return Err(QueryError::Oversized { stream, cap });
@@ -1274,7 +1337,17 @@ fn validated(
     if let Some(error) = buffer.error.take() {
         return Err(QueryError::Read(error));
     }
-    Ok(String::from_utf8_lossy(&std::mem::take(&mut buffer.bytes)).into_owned())
+    Ok(std::mem::take(&mut buffer.bytes))
+}
+
+/// `settled`, read as text as `Captured` reads it, for the tests written against it.
+#[cfg(test)]
+fn validated(
+    buffer: &Mutex<Buffer>,
+    stream: &'static str,
+    cap: usize,
+) -> Result<String, QueryError> {
+    settled(buffer, stream, cap).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Runs an install in loadout's own process group, so `sudo` can still prompt on the terminal

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use background::{Ended, Error, LOG_CAP, Limits, Log, Outcome, Refused, handshake, supervise};
-pub(crate) use query::{Captured, QueryError, install, query};
+pub(crate) use query::{Captured, Output, QueryError, install, query, query_output};
 
 /// The environment variable that carries a worker's half of the handshake nonce. It is removed
 /// from every query and install the worker starts.
