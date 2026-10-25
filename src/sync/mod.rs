@@ -169,7 +169,7 @@ fn clone_into(git: &Git<'_>, url: &str, temp: &Path, destination: &Path) -> Resu
             "origin".into(),
             "--".into(),
             url.into(),
-            temp.as_os_str().to_owned(),
+            git.path(temp)?.into_os_string(),
         ],
     )?;
     let branch = git.read(temp, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
