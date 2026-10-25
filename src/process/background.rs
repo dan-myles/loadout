@@ -519,13 +519,15 @@ fn watch(
             Ok(None) => {}
             Err(error) => return Ended::Lost(format!("cannot wait for the worker: {error}")),
         }
+        // The soft deadline is checked first: a poll that wakes late, past both deadlines, still
+        // asks the worker to stop before the run is ended.
         let now = Instant::now();
-        if now >= hard {
-            return Ended::TimedOut { cancelled };
-        }
         if !cancelled && now >= soft {
             cancelled = true;
             let _ = send(control, CANCEL);
+        }
+        if now >= hard {
+            return Ended::TimedOut { cancelled };
         }
         thread::sleep(POLL);
     }
@@ -1221,6 +1223,21 @@ mod tests {
         };
         let mut control = None;
         let ended = watch(|| Ok(None), &mut control, Instant::now(), limits);
+        assert_eq!(ended, Ended::TimedOut { cancelled: true });
+    }
+
+    #[test]
+    fn a_first_poll_past_both_deadlines_still_cancels_before_it_ends_the_watch() {
+        let limits = Limits {
+            soft: Duration::from_millis(50),
+            hard: Duration::from_millis(200),
+            settle: Duration::from_secs(1),
+        };
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock reaches a second back");
+        let mut control = None;
+        let ended = watch(|| Ok(None), &mut control, started, limits);
         assert_eq!(ended, Ended::TimedOut { cancelled: true });
     }
 
