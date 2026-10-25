@@ -638,7 +638,7 @@ mod unix {
         let launcher = fixture.launcher();
         let outside = fixture.dir.path().join("elsewhere.exe");
         fs::write(&outside, b"someone else's").unwrap();
-        let cases: Vec<(&str, Box<dyn Fn()>)> = vec![
+        let cases: Vec<(&str, Box<dyn Fn() + '_>)> = vec![
             (
                 "foreign file",
                 Box::new(|| fs::write(&launcher, b"someone else's launcher").unwrap()),

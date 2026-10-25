@@ -485,12 +485,12 @@ mod tests {
         fn huge_gnu_and_pax_metadata_is_refused_from_its_header_alone() {
             for kind in EXTENSIONS {
                 for size in [BINARY_LIMIT + 1, 1 << 40] {
-                    let (error, read) = refused_after(header(BINARY, kind, size));
+                    let (error, consumed) = refused_after(header(BINARY, kind, size));
                     assert!(
                         error.contains("larger than any loadout release"),
                         "{kind:?} {size}: {error}"
                     );
-                    assert_eq!(read, 512, "{kind:?} {size}: only its header is read");
+                    assert_eq!(consumed, 512, "{kind:?} {size}: only its header is read");
                 }
             }
         }
@@ -498,12 +498,12 @@ mod tests {
         #[test]
         fn small_or_truncated_gnu_and_pax_metadata_is_refused_unread() {
             for kind in EXTENSIONS {
-                let (error, read) = refused_after(header(BINARY, kind, 30));
+                let (error, consumed) = refused_after(header(BINARY, kind, 30));
                 assert!(
                     error.contains("a release holds only regular files"),
                     "{kind:?}: {error}"
                 );
-                assert_eq!(read, 512, "{kind:?}: only its header is read");
+                assert_eq!(consumed, 512, "{kind:?}: only its header is read");
 
                 // Declares 1000 bytes and ends after 100: still refused from the header.
                 let mut truncated = header(BINARY, kind, 1000);
@@ -519,10 +519,10 @@ mod tests {
         #[test]
         fn compressed_metadata_far_larger_than_the_limits_is_refused() {
             // A small gzip whose first entry claims 2 GiB of long name, with 8 MiB of it present.
-            let mut tar = header(BINARY, tar::EntryType::GNULongName, 2 << 30);
-            tar.resize(tar.len() + (8 << 20), b'a');
-            let compressed = gzip(&tar);
-            assert!(compressed.len() < tar.len() / 100);
+            let mut stream = header(BINARY, tar::EntryType::GNULongName, 2 << 30);
+            stream.resize(stream.len() + (8 << 20), b'a');
+            let compressed = gzip(&stream);
+            assert!(compressed.len() < stream.len() / 100);
             let error = read(&compressed, TARGET).unwrap_err();
             assert!(error.contains("larger than any loadout release"), "{error}");
 
@@ -543,13 +543,13 @@ mod tests {
 
         #[test]
         fn every_entry_is_held_to_the_size_limit_and_read_exactly() {
-            let (error, read) = refused_after(header(
+            let (error, consumed) = refused_after(header(
                 "loadout-x86_64-unknown-linux-musl/README.md",
                 tar::EntryType::Regular,
                 BINARY_LIMIT + 1,
             ));
             assert!(error.contains("larger than any loadout release"), "{error}");
-            assert_eq!(read, 512);
+            assert_eq!(consumed, 512);
 
             // A binary whose content ends before its declared size.
             let mut short = header(BINARY, tar::EntryType::Regular, 100);
