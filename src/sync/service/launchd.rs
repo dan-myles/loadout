@@ -91,23 +91,35 @@ pub(super) fn install(
     Ok(())
 }
 
-/// Unloads the agent and removes its plist. With neither the plist nor `service.toml` there,
-/// nothing was installed and nothing is asked. `bootout` must succeed, or say the agent isn't
+/// Unloads the agent and removes its plist. `bootout` must succeed, or say the agent isn't
 /// loaded (`No such process`, 3; `Could not find specified service`, 113); any other answer is
 /// an error, and the plist and `service.toml` stay.
+///
+/// With neither the plist nor `service.toml` there, launchd is still asked (`print`) whether it
+/// has the agent loaded, since its files may have been removed by hand; not loaded is nothing to
+/// remove.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     let path = file(context);
     let owned = super::Private::Service.path(context);
     let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
-    if !exists(&path) && !exists(&owned) {
-        return Ok(());
-    }
     let domain = if exists(&owned) {
         domain(&owned)?
-    } else {
+    } else if exists(&path) {
         domain(&path)?
+    } else {
+        domain(&context.home)?
     };
     let job = format!("{domain}/{LABEL}");
+    if !exists(&path) && !exists(&owned) {
+        let args = ["print", job.as_str()];
+        let printed = query(context, "launchctl", &args)?;
+        if !printed.success() {
+            if not_loaded(&printed) {
+                return Ok(());
+            }
+            return Err(failed("launchctl", &args, &printed));
+        }
+    }
     let args = ["bootout", job.as_str()];
     let answer = query(context, "launchctl", &args)?;
     if !answer.success() && !not_loaded(&answer) {

@@ -121,9 +121,8 @@ pub(super) fn install(
 }
 
 /// Ends and deletes the task. `/Query` must find it, or say it doesn't exist (`cannot find`);
-/// any other failure is an error, and so is a failed `/Delete`, leaving `service.toml` in place.
-/// `/End` only stops a run that is going; a task that isn't running can't be ended, so its
-/// answer doesn't decide anything.
+/// any other failure is an error, and so is a failed `/End` (other than "not running") or
+/// `/Delete`, leaving `service.toml` in place.
 ///
 /// The not-found text is English; on a Windows that answers in another language, a missing task
 /// is reported as an error with schtasks' own words rather than assumed gone.
@@ -136,9 +135,18 @@ pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
         }
         return Err(failed("schtasks", &args, &found));
     }
-    query(context, "schtasks", &["/End", "/TN", NAME])?;
+    let end = ["/End", "/TN", NAME];
+    let ended = query(context, "schtasks", &end)?;
+    if !ended.success() && !not_running(&ended) {
+        return Err(failed("schtasks", &end, &ended));
+    }
     required(context, "schtasks", &["/Delete", "/TN", NAME, "/F"])?;
     Ok(())
+}
+
+fn not_running(answer: &crate::process::Captured) -> bool {
+    let said = format!("{} {}", answer.stdout, answer.stderr);
+    said.contains("not running") || said.contains("no running instance")
 }
 
 fn not_found(answer: &crate::process::Captured) -> bool {

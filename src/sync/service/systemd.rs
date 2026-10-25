@@ -108,13 +108,29 @@ pub(super) fn install(
     Ok(())
 }
 
-/// Disables the timer and removes both units. With neither unit file there, nothing was
-/// installed and nothing is asked. Otherwise every step must succeed before the files go: a
+/// Disables the timer and removes both units. Every step must succeed before the files go: a
 /// failure (no user session included) leaves the files, and `service.toml`, in place.
+///
+/// With neither unit file there, systemd is still asked whether it has the timer loaded (from
+/// an install whose files were removed by hand): `not-found`, or no user manager to ask, is
+/// nothing to remove; a loaded timer is stopped and systemd reloaded.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     let exists = |path: &PathBuf| std::fs::symlink_metadata(path).is_ok();
     let [service, timer] = [dir(context).join(SERVICE), dir(context).join(TIMER)];
     if !exists(&service) && !exists(&timer) {
+        let args = ["--user", "show", "--property=LoadState", "--value", TIMER];
+        let shown = query(context, "systemctl", &args)?;
+        if !shown.success() {
+            if shown.stderr.contains("Failed to connect") {
+                return Ok(());
+            }
+            return Err(failed("systemctl", &args, &shown));
+        }
+        if shown.stdout.trim() == "not-found" {
+            return Ok(());
+        }
+        required(context, "systemctl", &["--user", "stop", TIMER])?;
+        required(context, "systemctl", &["--user", "daemon-reload"])?;
         return Ok(());
     }
     if exists(&timer) {

@@ -842,13 +842,25 @@ mod tests {
     #[test]
     fn systemd_uninstall_removes_nothing_until_systemd_agrees() {
         let fakes = Fakes::new(Os::Linux);
-        fakes.tool("systemctl", "exit 0");
+        fakes.tool("systemctl", "echo not-found");
         systemd::uninstall(&fakes.context).unwrap();
-        assert_eq!(
-            fakes.calls("systemctl"),
-            "",
-            "nothing installed: nothing asked"
+        let calls = fakes.calls("systemctl");
+        assert!(calls.contains("show --property=LoadState"), "{calls}");
+        assert!(
+            !calls.contains("stop"),
+            "nothing registered: nothing stopped: {calls}"
         );
+
+        fakes.tool("systemctl", "echo loaded");
+        systemd::uninstall(&fakes.context).unwrap();
+        let calls = fakes.calls("systemctl");
+        assert!(
+            calls.contains("--user stop loadout-update.timer"),
+            "a timer still loaded without its files is stopped: {calls}"
+        );
+
+        fakes.tool("systemctl", "echo 'Access denied' >&2; exit 1");
+        assert!(systemd::uninstall(&fakes.context).is_err());
 
         let units = systemd::files(&fakes.context);
         for unit in &units {
@@ -888,13 +900,27 @@ mod tests {
     #[test]
     fn launchd_uninstall_tells_an_unloaded_agent_from_a_failure() {
         let fakes = Fakes::new(Os::Macos);
+        fakes.tool(
+            "launchctl",
+            "echo 'Could not find service \"dev.loadout.update\"' >&2; exit 113",
+        );
+        launchd::uninstall(&fakes.context).unwrap();
+        let calls = fakes.calls("launchctl");
+        assert!(calls.contains("print gui/"), "{calls}");
+        assert!(
+            !calls.contains("bootout"),
+            "nothing loaded: nothing booted out: {calls}"
+        );
+
         fakes.tool("launchctl", "exit 0");
         launchd::uninstall(&fakes.context).unwrap();
-        assert_eq!(
-            fakes.calls("launchctl"),
-            "",
-            "nothing installed: nothing asked"
+        assert!(
+            fakes.calls("launchctl").contains("bootout gui/"),
+            "an agent still loaded without its plist is booted out"
         );
+
+        fakes.tool("launchctl", "echo 'Operation not permitted' >&2; exit 1");
+        assert!(launchd::uninstall(&fakes.context).is_err());
 
         let plist = launchd::file(&fakes.context);
         fakes.plant(&plist);
@@ -944,6 +970,21 @@ mod tests {
             "case \"$1\" in /Delete) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
         );
         assert!(schtasks::uninstall(&fakes.context).is_err());
+
+        fakes.tool(
+            "schtasks",
+            "case \"$1\" in /End) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
+        );
+        assert!(
+            schtasks::uninstall(&fakes.context).is_err(),
+            "a failed /End is a failure"
+        );
+
+        fakes.tool(
+            "schtasks",
+            "case \"$1\" in /End) echo 'ERROR: The task is not running.' >&2; exit 1;; esac",
+        );
+        schtasks::uninstall(&fakes.context).unwrap();
 
         fakes.tool("schtasks", "exit 0");
         schtasks::uninstall(&fakes.context).unwrap();
