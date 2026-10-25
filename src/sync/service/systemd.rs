@@ -160,7 +160,7 @@ pub(super) fn linger(context: &Context) -> Option<bool> {
         let answer = query(
             context,
             "loginctl",
-            &["show-user", &uid, "--property=Linger", "--value"],
+            &["show-user", uid.as_str(), "--property=Linger", "--value"],
         )
         .ok()?;
         match (answer.success(), answer.stdout.trim()) {
