@@ -9,8 +9,15 @@
 //! or no record. The record binds each binary's hash, so that state fails closed: self-update and
 //! both install scripts treat the binary as unmanaged and refuse to replace it until the user
 //! reinstalls (see `docs/releasing.md`).
+//!
+//! Writers are serialized by [`lock`]: install.sh, install.ps1 and self-update each hold the
+//! install folder's lock from their last check of the installed files until publication and
+//! their cleanup are done. A writer that doesn't take it (a hand copy, another tool, or an
+//! install script older than the lock) is not serialized, so its change can still race one
+//! publication; the hash binding then makes the mismatch fail closed only if the record and the
+//! binaries end up disagreeing.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +43,77 @@ impl Drop for Staged {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+/// The install folder's lock file. It stays in place: removing a lock file another writer may
+/// already have open would let two writers hold "the" lock at once.
+pub(super) const LOCK_FILE: &str = ".loadout.install.lock";
+
+/// The install folder's lock, held until dropped.
+#[derive(Debug)]
+pub(super) struct Lock {
+    _file: File,
+}
+
+#[derive(Debug)]
+pub(super) enum LockError {
+    /// Another install or self-update holds it right now.
+    Busy,
+    Failed(io::Error),
+}
+
+/// Takes the install folder's lock without waiting. On Unix that is `flock(2)` on
+/// [`LOCK_FILE`], as install.sh takes it with flock or perl; on Windows it is the file opened
+/// unshared, as install.ps1 opens it, so whichever writer is second can't open it at all.
+pub(super) fn lock(dir: &Path) -> Result<Lock, LockError> {
+    let path = dir.join(LOCK_FILE);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+        return Err(LockError::Failed(io::Error::other(format!(
+            "{} is a link or not a regular file",
+            path.display()
+        ))));
+    }
+    let file = open_lock(&path)?;
+    Ok(Lock { _file: file })
+}
+
+#[cfg(unix)]
+fn open_lock(path: &Path) -> Result<File, LockError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(LockError::Failed)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(LockError::Busy),
+        Err(fs::TryLockError::Error(error)) => Err(LockError::Failed(error)),
+    }
+}
+
+#[cfg(windows)]
+fn open_lock(path: &Path) -> Result<File, LockError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// ERROR_SHARING_VIOLATION: another writer has the file open.
+    const SHARING_VIOLATION: i32 = 32;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(SHARING_VIOLATION) {
+                LockError::Busy
+            } else {
+                LockError::Failed(error)
+            }
+        })
 }
 
 fn nonce() -> String {

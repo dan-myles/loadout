@@ -30,6 +30,12 @@ fn only_skips_are_skipped() {
         }
         .skipped()
     );
+    assert!(
+        Error::Busy {
+            dir: PathBuf::new()
+        }
+        .skipped()
+    );
 }
 
 #[test]
@@ -51,7 +57,7 @@ mod unix {
     use std::io::{BufRead, BufReader, Write as _};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use super::*;
 
@@ -60,11 +66,21 @@ mod unix {
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
     type Routes = Arc<Mutex<BTreeMap<String, (u16, Vec<(String, String)>, Vec<u8>)>>>;
+    type Pauses = Arc<Mutex<BTreeMap<String, Pause>>>;
 
-    /// A loopback HTTP server answering from a route table; anything else is a 404.
+    /// Holds the next response for one path: the server reports the request on `arrived`, then
+    /// answers only once the test sends on `resume`.
+    struct Pause {
+        arrived: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    /// A loopback HTTP server answering from a route table; anything else is a 404. Each request
+    /// is answered on its own thread, so one held response doesn't hold up the others.
     struct Server {
         base: String,
         routes: Routes,
+        pauses: Pauses,
     }
 
     impl Server {
@@ -72,39 +88,39 @@ mod unix {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let routes: Routes = Arc::default();
-            let served = Arc::clone(&routes);
+            let pauses: Pauses = Arc::default();
+            let (served, held) = (Arc::clone(&routes), Arc::clone(&pauses));
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { continue };
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request = String::new();
-                    if reader.read_line(&mut request).is_err() {
-                        continue;
-                    }
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
-                        line.clear();
-                    }
-                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                    let (status, headers, body) = served
-                        .lock()
-                        .unwrap()
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or((404, Vec::new(), b"not found".to_vec()));
-                    let mut head = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        body.len()
-                    );
-                    for (name, value) in headers {
-                        head.push_str(&format!("{name}: {value}\r\n"));
-                    }
-                    head.push_str("\r\n");
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&body);
+                    let Ok(stream) = stream else { continue };
+                    let (served, held) = (Arc::clone(&served), Arc::clone(&held));
+                    std::thread::spawn(move || answer(stream, &served, &held));
                 }
             });
-            Server { base, routes }
+            Server {
+                base,
+                routes,
+                pauses,
+            }
+        }
+
+        /// Holds the next request for `path` until the returned sender is used; the receiver
+        /// reports that the request arrived.
+        fn pause(&self, path: &str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (arrived, arrival) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            self.pauses.lock().unwrap().insert(
+                path.to_owned(),
+                Pause {
+                    arrived,
+                    resume: resumed,
+                },
+            );
+            (arrival, resume)
+        }
+
+        fn asset_path(tag: &str) -> String {
+            format!("/{REPOSITORY}/releases/download/{tag}/{ASSET}")
         }
 
         fn route(&self, path: &str, status: u16, headers: &[(&str, &str)], body: &[u8]) {
@@ -137,11 +153,44 @@ mod unix {
                 &[("Location", &location)],
                 b"",
             );
-            let asset = format!("/{REPOSITORY}/releases/download/{tag}/{ASSET}");
+            let asset = Server::asset_path(tag);
             self.route(&asset, 200, &[], archive);
             let sidecar = sidecar.unwrap_or_else(|| format!("{}  {ASSET}\n", sha256(archive)));
             self.route(&format!("{asset}.sha256"), 200, &[], sidecar.as_bytes());
         }
+    }
+
+    fn answer(mut stream: std::net::TcpStream, routes: &Routes, pauses: &Pauses) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        if reader.read_line(&mut request).is_err() {
+            return;
+        }
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+            line.clear();
+        }
+        let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+        let pause = pauses.lock().unwrap().remove(&path);
+        if let Some(pause) = pause {
+            let _ = pause.arrived.send(());
+            let _ = pause.resume.recv();
+        }
+        let (status, headers, body) = routes.lock().unwrap().get(&path).cloned().unwrap_or((
+            404,
+            Vec::new(),
+            b"not found".to_vec(),
+        ));
+        let mut head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&body);
     }
 
     fn script(version: &str) -> Vec<u8> {
@@ -224,6 +273,16 @@ mod unix {
                     (entry.file_name().into_string().unwrap(), content)
                 })
                 .collect()
+        }
+
+        /// What another writer, such as install.sh, leaves after installing `version`: done as
+        /// they do it, under the install folder's lock.
+        fn complete_install(&self, version: &str) {
+            let _lock = publish::lock(self.dir.path()).unwrap();
+            fs::write(&self.exe, script(version)).unwrap();
+            self.write_record(|text| {
+                text.replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+            });
         }
 
         fn launcher(&self) -> PathBuf {
@@ -319,7 +378,7 @@ mod unix {
         assert_eq!(record.binary_sha256, sha256(&new_binary));
         assert_eq!(
             fixture.snapshot().keys().cloned().collect::<Vec<_>>(),
-            ["loadout", "loadout.install.toml"]
+            [".loadout.install.lock", "loadout", "loadout.install.toml"]
         );
         assert!(installed(&fixture.exe, false, TARGET, &Version::new(1, 2, 0)).is_ok());
     }
@@ -358,11 +417,10 @@ mod unix {
             let release = release_for(&server, &fixture).unwrap().unwrap();
             let error = install(&release).unwrap_err();
             assert!(matches!(error, Error::Verify { .. }), "{name}: {error}");
-            assert_eq!(
-                fixture.snapshot(),
-                before,
-                "{name} must leave the install untouched"
-            );
+            // A binary's version is checked under the install lock, whose file then stays.
+            let mut after = fixture.snapshot();
+            after.remove(publish::LOCK_FILE);
+            assert_eq!(after, before, "{name} must leave the install untouched");
         }
     }
 
@@ -375,6 +433,124 @@ mod unix {
         fs::write(&fixture.exe, b"edited by hand").unwrap();
         let before = fixture.snapshot();
         assert!(matches!(install(&release), Err(Error::Changed { .. })));
+        assert_eq!(fixture.snapshot(), before);
+    }
+
+    #[test]
+    fn a_release_found_before_a_newer_install_finished_never_replaces_it() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        server.publish("v1.2.0", &release_archive(&script("1.2.0")), None);
+        let release = release_for(&server, &fixture).unwrap().unwrap();
+        let (arrived, resume) = server.pause(&Server::asset_path("v1.2.0"));
+        let stale = std::thread::spawn(move || install(&release));
+        arrived.recv().unwrap();
+        fixture.complete_install("1.3.0");
+        let newer = fixture.snapshot();
+        resume.send(()).unwrap();
+
+        let error = stale.join().unwrap().unwrap_err();
+        assert!(matches!(error, Error::Changed { .. }), "{error}");
+        assert_eq!(
+            fixture.snapshot(),
+            newer,
+            "the newer install stays, and nothing this run staged is left"
+        );
+        assert!(installed(&fixture.exe, false, TARGET, &Version::new(1, 3, 0)).is_ok());
+    }
+
+    #[test]
+    fn a_binary_or_record_changed_during_the_download_is_not_replaced() {
+        let cases: Vec<(&str, Box<dyn Fn(&Installed)>)> = vec![
+            (
+                "binary edited by hand",
+                Box::new(|fixture| fs::write(&fixture.exe, b"edited by hand").unwrap()),
+            ),
+            (
+                "record no longer valid",
+                Box::new(|fixture| {
+                    fixture.write_record(|text| text.replace("schema = 1", "schema = 9"));
+                }),
+            ),
+            (
+                "record removed",
+                Box::new(|fixture| fs::remove_file(fixture.record_path()).unwrap()),
+            ),
+        ];
+        for (name, change) in cases {
+            let server = Server::start();
+            let fixture = Installed::new();
+            server.publish("v1.2.0", &release_archive(&script("1.2.0")), None);
+            let release = release_for(&server, &fixture).unwrap().unwrap();
+            let (arrived, resume) = server.pause(&Server::asset_path("v1.2.0"));
+            let running = std::thread::spawn(move || install(&release));
+            arrived.recv().unwrap();
+            change(&fixture);
+            let before = fixture.snapshot();
+            resume.send(()).unwrap();
+            let error = running.join().unwrap().unwrap_err();
+            assert!(matches!(error, Error::Changed { .. }), "{name}: {error}");
+            let mut after = fixture.snapshot();
+            after.remove(publish::LOCK_FILE);
+            assert_eq!(after, before, "{name} must be left as it is");
+        }
+    }
+
+    #[test]
+    fn of_two_self_updates_for_one_release_only_the_first_to_publish_does() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        let new_binary = script("1.2.0");
+        server.publish("v1.2.0", &release_archive(&new_binary), None);
+        let first = release_for(&server, &fixture).unwrap().unwrap();
+        let second = release_for(&server, &fixture).unwrap().unwrap();
+        let (arrived, resume) = server.pause(&Server::asset_path("v1.2.0"));
+        let slow = std::thread::spawn(move || install(&second));
+        arrived.recv().unwrap();
+        install(&first).unwrap();
+        assert_eq!(fs::read(&fixture.exe).unwrap(), new_binary);
+        let published = fixture.snapshot();
+        resume.send(()).unwrap();
+
+        let error = slow.join().unwrap().unwrap_err();
+        assert!(matches!(error, Error::Changed { .. }), "{error}");
+        assert_eq!(fixture.snapshot(), published);
+    }
+
+    #[test]
+    fn a_held_install_lock_makes_self_update_replace_nothing() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        server.publish("v1.2.0", &release_archive(&script("1.2.0")), None);
+        let release = release_for(&server, &fixture).unwrap().unwrap();
+        let held = publish::lock(fixture.dir.path()).unwrap();
+        let before = fixture.snapshot();
+
+        let error = install(&release).unwrap_err();
+        assert!(
+            matches!(error, Error::Busy { .. }) && error.skipped(),
+            "{error}"
+        );
+        assert_eq!(fixture.snapshot(), before);
+
+        drop(held);
+        install(&release).unwrap();
+        assert_eq!(fs::read(&fixture.exe).unwrap(), script("1.2.0"));
+    }
+
+    #[test]
+    fn a_linked_lock_file_is_refused_and_left_alone() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        server.publish("v1.2.0", &release_archive(&script("1.2.0")), None);
+        let release = release_for(&server, &fixture).unwrap().unwrap();
+        let elsewhere = fixture.dir.path().join("elsewhere");
+        fs::write(&elsewhere, b"not a lock").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fixture.dir.path().join(publish::LOCK_FILE))
+            .unwrap();
+        let before = fixture.snapshot();
+        let error = install(&release).unwrap_err();
+        assert!(matches!(error, Error::Io { action: "lock", .. }), "{error}");
         assert_eq!(fixture.snapshot(), before);
     }
 

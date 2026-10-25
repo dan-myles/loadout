@@ -496,6 +496,13 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        # A hook runs once, before its path is answered, so a test can act while a download waits.
+        hook = getattr(self.server, "hooks", {}).pop(self.path, None)
+        if hook:
+            hook()
+        super().do_GET()
+
 
 class FixtureServer:
     # Serves a directory on loopback from its own daemon thread. It doesn't use serve_forever or
@@ -505,6 +512,7 @@ class FixtureServer:
 
     def __init__(self, directory):
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(directory)))
+        self.httpd.hooks = {}
         try:
             self.httpd.timeout = self.POLL
             self.httpd.socket.settimeout(self.POLL)
@@ -621,6 +629,7 @@ class InstallPs1WrapperTest(unittest.TestCase):
         cls.addClassCleanup(server.close)
         server.start()
         cls.addClassCleanup(stop_fixture_server, server)
+        cls.server = server
         cls.base = server.base
 
     @classmethod
@@ -745,7 +754,7 @@ class InstallPs1WrapperTest(unittest.TestCase):
                 self.assertEqual(record["schema"], "2")
                 self.assertEqual(record["background_sha256"], f'"{hashlib.sha256(self.launcher_bytes).hexdigest()}"')
                 self.assertEqual(sorted(path.name for path in folder.iterdir()),
-                                 ["loadout-background.exe", "loadout.exe", "loadout.install.toml"])
+                                 [".loadout.install.lock", "loadout-background.exe", "loadout.exe", "loadout.install.toml"])
 
     def test_a_schema_1_install_upgrades_to_schema_2(self):
         for shell in SHELLS:
@@ -786,6 +795,47 @@ class InstallPs1WrapperTest(unittest.TestCase):
                 self.assertIn("another installer may own it", completed.stderr)
                 self.assertEqual((folder / "loadout-background.exe").read_bytes(), b"someone else's")
                 self.assertFalse((folder / "loadout.exe").exists())
+
+    def test_a_held_install_lock_changes_nothing(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                folder = local / "Programs" / "loadout"
+                folder.mkdir(parents=True)
+                # Python opens the file shared; install.ps1 and loadout open it unshared, so they
+                # can't while it is open here.
+                with open(folder / ".loadout.install.lock", "a"):
+                    completed = self.install_only(shell, self.base, local)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertIn("another install or loadout self-update is changing", completed.stderr)
+                self.assertEqual(sorted(path.name for path in folder.iterdir()), [".loadout.install.lock"])
+
+    def test_an_install_that_finished_during_the_download_is_never_overwritten(self):
+        main, launcher = b"MZ newer main", b"MZ newer launcher"
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                folder = local / "Programs" / "loadout"
+                folder.mkdir(parents=True)
+                record = record_text(
+                    str(folder / "loadout.exe"), hashlib.sha256(main).hexdigest(),
+                    background=(str(folder / "loadout-background.exe"), hashlib.sha256(launcher).hexdigest()),
+                ).replace(TARGET, self.target).encode("utf-8")
+
+                def finish_newer_install():
+                    (folder / "loadout.exe").write_bytes(main)
+                    (folder / "loadout-background.exe").write_bytes(launcher)
+                    (folder / "loadout.install.toml").write_bytes(record)
+
+                self.server.httpd.hooks[f"/{self.asset}"] = finish_newer_install
+                completed = self.install_only(shell, self.base, local)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertIn("changed while this install was downloading", completed.stderr)
+                self.assertEqual((folder / "loadout.exe").read_bytes(), main)
+                self.assertEqual((folder / "loadout-background.exe").read_bytes(), launcher)
+                self.assertEqual((folder / "loadout.install.toml").read_bytes(), record)
+                self.assertEqual(sorted(path.name for path in folder.iterdir()),
+                                 [".loadout.install.lock", "loadout-background.exe", "loadout.exe", "loadout.install.toml"])
 
     def test_direct_file_invocation_forwards_a_nonzero_child_exit(self):
         for shell in SHELLS:

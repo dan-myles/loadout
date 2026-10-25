@@ -16,11 +16,22 @@ try:
 except ImportError:
     tomllib = None
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 SCRIPT = Path(__file__).with_name("install.sh")
 TIMEOUT = 120
 TARGET = "x86_64-unknown-linux-musl"
 PREFIX = f"loadout-{TARGET}"
 ASSET = f"{PREFIX}.tar.gz"
+LOCK = ".loadout.install.lock"
+# Every command install.sh runs, for a PATH that leaves some of them out.
+TOOLS = (
+    "cat", "chmod", "cmp", "curl", "flock", "git", "grep", "gzip", "iconv", "mkdir", "mktemp", "mv",
+    "perl", "rm", "sed", "sha256sum", "shasum", "tail", "tar", "tr", "wc",
+)
 FAKE_UNAME = """#!/bin/sh
 case $1 in
   -s) echo "${FAKE_OS:-Linux}" ;;
@@ -74,6 +85,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # A hook runs once, before its path is answered, so a test can act while a download waits.
+        hook = self.server.hooks.pop(self.path, None)
+        if hook:
+            hook()
         location = self.server.redirects.get(self.path)
         if location:
             self.send_response(302)
@@ -103,6 +118,7 @@ class InstallShTest(unittest.TestCase):
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, directory=str(self.served)))
         server.redirects = {}
+        server.hooks = {}
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -120,6 +136,27 @@ class InstallShTest(unittest.TestCase):
     @property
     def record(self):
         return self.bin_dir / "loadout.install.toml"
+
+    @property
+    def lock(self):
+        return self.bin_dir / LOCK
+
+    def hold_lock(self):
+        # flock(2), as loadout self-update and the installer itself take it.
+        handle = open(self.lock, "a")
+        self.addCleanup(handle.close)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+
+    def path_without(self, *missing):
+        tools = self.tmp / ("tools-without-" + "-".join(missing))
+        tools.mkdir()
+        for name in TOOLS:
+            found = shutil.which(name)
+            if name not in missing and found:
+                (tools / name).symlink_to(found)
+        self.write_exe(tools / "uname", FAKE_UNAME)
+        return str(tools)
 
     def write_exe(self, path, text):
         path.write_text(text)
@@ -159,7 +196,12 @@ class InstallShTest(unittest.TestCase):
     def snapshot(self):
         if not self.bin_dir.exists():
             return None
-        return {p.name: (p.is_symlink(), None if p.is_symlink() else p.read_bytes()) for p in self.bin_dir.iterdir()}
+        def content(path):
+            if path.is_symlink():
+                return None
+            return "folder" if path.is_dir() else path.read_bytes()
+
+        return {p.name: (p.is_symlink(), content(p)) for p in self.bin_dir.iterdir()}
 
     def assert_refused(self, result, message, before):
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -178,7 +220,8 @@ class InstallShTest(unittest.TestCase):
         self.install_ok()
         self.assertEqual(self.dest.read_bytes(), fake_loadout())
         self.assertTrue(os.access(self.dest, os.X_OK))
-        self.assertEqual(sorted(p.name for p in self.bin_dir.iterdir()), ["loadout", "loadout.install.toml"])
+        self.assertEqual(sorted(p.name for p in self.bin_dir.iterdir()), [LOCK, "loadout", "loadout.install.toml"])
+        self.assertEqual(self.lock.read_bytes(), b"")
         lines = self.record.read_text(encoding="utf-8").splitlines()
         self.assertTrue(lines[0].startswith("# loadout install record."))
         self.assertEqual(
@@ -314,8 +357,83 @@ class InstallShTest(unittest.TestCase):
             self.assertEqual((self.bin_dir / name).read_bytes(), data, name)
         self.assertEqual(
             sorted(p.name for p in self.bin_dir.iterdir()),
-            sorted(list(sentinels) + ["loadout", "loadout.install.toml"]),
+            sorted(list(sentinels) + [LOCK, "loadout", "loadout.install.toml"]),
         )
+
+    @unittest.skipIf(fcntl is None, "needs fcntl")
+    def test_a_held_install_lock_changes_nothing(self):
+        self.install_ok()
+        self.publish(fake_loadout("1.2.4"))
+        before = self.snapshot()
+        handle = self.hold_lock()
+        self.assert_refused(self.install(), "another install or loadout self-update is changing", before)
+        handle.close()
+        self.install_ok()
+        self.assertEqual(self.dest.read_bytes(), fake_loadout("1.2.4"))
+
+    @unittest.skipIf(fcntl is None, "needs fcntl")
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_without_flock_the_lock_is_taken_with_perl(self):
+        path = self.path_without("flock")
+        self.install_ok(path=path)
+        self.publish(fake_loadout("1.2.4"))
+        before = self.snapshot()
+        handle = self.hold_lock()
+        self.assert_refused(self.install(path=path), "another install or loadout self-update is changing", before)
+        handle.close()
+        self.install_ok(path=path)
+        self.assertEqual(self.dest.read_bytes(), fake_loadout("1.2.4"))
+
+    def test_without_flock_or_perl_nothing_is_installed(self):
+        result = self.install(path=self.path_without("flock", "perl"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("flock or perl is required", result.stderr)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.record.exists())
+
+    def test_a_linked_or_folder_lock_file_is_refused(self):
+        other = self.tmp / "other-file"
+        other.write_text("someone else's")
+        for name, make in (("symlink", lambda: self.lock.symlink_to(other)), ("folder", lambda: self.lock.mkdir())):
+            with self.subTest(name):
+                shutil.rmtree(self.home / ".local", ignore_errors=True)
+                self.bin_dir.mkdir(parents=True)
+                make()
+                before = self.snapshot()
+                self.assert_refused(self.install(), "can't be locked", before)
+                self.assertEqual(other.read_text(), "someone else's")
+
+    @unittest.skipIf(fcntl is None, "needs fcntl")
+    def test_an_install_that_finished_during_the_download_is_never_overwritten(self):
+        self.install_ok()
+        self.publish(fake_loadout("1.2.4"))
+        newer = fake_loadout("1.2.5")
+
+        def finish_newer_install():
+            # What another install leaves, written under the lock as it would be.
+            with open(self.lock, "a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                text = self.record.read_text()
+                self.dest.write_bytes(newer)
+                self.record.write_text(
+                    text.replace(sha256(fake_loadout()), sha256(newer)).replace('version = "1.2.3"', 'version = "1.2.5"')
+                )
+
+        self.server.hooks[f"/{ASSET}"] = finish_newer_install
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changed while this install was downloading", result.stderr)
+        self.assertEqual(self.dest.read_bytes(), newer)
+        self.assertEqual(self.read_record()["version"], '"1.2.5"')
+        self.assertEqual(sorted(p.name for p in self.bin_dir.iterdir()), [LOCK, "loadout", "loadout.install.toml"])
+
+    def test_a_binary_edited_during_the_download_is_left_alone(self):
+        self.install_ok()
+        self.publish(fake_loadout("1.2.4"))
+        self.server.hooks[f"/{ASSET}"] = lambda: self.dest.write_bytes(b"edited by hand")
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.dest.read_bytes(), b"edited by hand")
 
     def test_sidecar_must_be_exactly_one_line(self):
         archive_sha = sha256(self.archive)

@@ -118,8 +118,9 @@ curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/rele
 ```
 
 Prerequisites:
-- `install.sh` needs `git`, `curl`, `tar`, `cmp`, and `sha256sum` or `shasum`. It needs `iconv`
-  only when the home path or an existing install record isn't plain ASCII.
+- `install.sh` needs `git`, `curl`, `tar`, `cmp`, `sha256sum` or `shasum`, and `flock` or `perl` (to
+  lock the install folder; Linux has `flock`, macOS has `perl`). It needs `iconv` only when the home
+  path or an existing install record isn't plain ASCII.
 - `install.ps1` needs `git`, plus Windows PowerShell 5.1 on .NET Framework 4.7.2 or later, or
   PowerShell 7.
 
@@ -130,7 +131,7 @@ Neither script installs git; each names the per-OS command instead.
 1. **Target.** On macOS and Linux, `uname -s`/`uname -m` pick it, and a shell running under Rosetta
    gets the aarch64 build. On Windows, the registry's native `PROCESSOR_ARCHITECTURE` picks it, so
    x64 PowerShell emulated on ARM64 gets the ARM64 build. Any other OS or CPU is refused.
-2. **Destination check, before downloading** (repeated just before installing).
+2. **Destination check, before downloading** (repeated under the install lock, step 7).
    - A destination that is a symlink, junction, or folder is refused, and so is a record that is one.
    - An existing binary is replaced only if the install record next to it matches (see below).
    - With no binary there, a leftover record is simply overwritten.
@@ -170,22 +171,30 @@ Neither script installs git; each names the per-OS command instead.
 6. **Version check.** The extracted binary must print `loadout <version>` from `--version`. With a
    requested tag, `v<version>` must equal it exactly, case-sensitively. On Windows,
    `loadout-background.exe --version` must then print exactly `loadout-background <version>`.
-7. **Staging.** Each staging file is created exclusively, under a fresh unique name in the
+7. **Lock and final check.** The script takes the install folder's lock, `.loadout.install.lock`,
+   without waiting, and holds it until the record is in place and its own staging files are gone.
+   `install.sh` takes `flock(2)` on the file through `flock` or else `perl`, on file descriptor 9;
+   `install.ps1` opens it unshared. Loadout self-update takes the same lock the same way. If another
+   writer holds it, nothing changes and the script says so. Under the lock the destination check
+   runs again, and the binaries and record must also still be exactly what the first check saw
+   (their sha256, or absent): an install that finished during this one's download is never
+   overwritten. The lock file stays in place.
+8. **Staging.** Each staging file is created exclusively, under a fresh unique name in the
    destination directory: `mktemp` for `.loadout.new.XXXXXX` and `.loadout.install.toml.new.XXXXXX`,
    or a GUID name opened with `CreateNew`.
    - The script deletes only names it created and hasn't yet published.
    - Other files, including other runs' staging files, are never overwritten or deleted.
    - No backup file is kept.
-8. **Publishing.** The binary is published first, with a same-directory rename (`mv -f`). Then the
+9. **Publishing.** The binary is published first, with a same-directory rename (`mv -f`). Then the
    record is published the same way. Every failure before the first rename leaves the previous
    binary and record untouched.
    - On Windows the launcher goes first, then `loadout.exe`. Each existing binary, which may be
      running, is first moved aside to `.<name>.old.<guid>`, and if a later move fails every
      completed move is undone in reverse. Then the record is replaced (`File.Replace`, no backup).
    - Aside copies that are still running are removed by the next install or self-update.
-9. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
-   shell profiles or `PATH`.
-10. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
+10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
+    shell profiles or `PATH`.
+11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
     remaining arguments. The URL must not start with `-`.
     - `install.sh` passes `"$@"`.
     - `install.ps1` encodes each `-InitArgs` element as exactly one argument, using the
@@ -198,10 +207,13 @@ Neither script installs git; each names the per-OS command instead.
       Windows allows), the script reports the error and completes with exit code 1. It never leaves
       an earlier `$LASTEXITCODE` standing.
 
-Concurrent runs aren't serialized. Each publishes a complete binary and record, so the last rename
-wins. A record left describing the other run's binary fails its hash. Self-update, and the next run
-of either installer, then refuse to replace that binary. Recovery is manual: remove the binary and
-the record, then install again. There is no automatic adopt or force option.
+Writers that take the lock are serialized: of two installs or self-updates that both downloaded,
+the second to take the lock finds the files changed and replaces nothing. A writer that doesn't
+take it (a hand copy, another tool, or a copy of either script from before the lock) is not
+serialized, so it can still race one publication. If that leaves a record describing another
+binary, the hash fails, and self-update and both installers refuse to replace that binary until the
+user removes the binary and the record and installs again. There is no automatic adopt or force
+option.
 
 When the script runs as an in-memory script block, it never calls `exit`, so the console stays
 open; it sets `$LASTEXITCODE` instead. Run with `-File`, it exits with the code. It decides which
@@ -276,9 +288,14 @@ exactly the rule above, with no token:
 - **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
   the exact sidecar and a matching hash.
 - **Archive.** It reads the expected binaries from memory, checking each name, type and size.
-- **Staging.** It stages each binary with `create_new`, and requires its exact `--version` line.
+- **Lock.** It takes the install folder's lock as the scripts do, without waiting; a held lock is
+  reported (`Busy`) and nothing changes.
+- **Staging.** Under the lock it stages each binary with `create_new`, and requires its exact
+  `--version` line.
+- **Final check.** Still under the lock, the binaries and record must be exactly the ones it checked
+  when it found the release. Otherwise it replaces nothing (`Changed`).
 - **Publishing.** It publishes the binaries as above, then rewrites the record in the same schema
-  rules.
+  rules, and releases the lock after its own cleanup.
 
 Anything else, such as `cargo install`, a package manager, a hand copy, or a `LOADOUT_HOME`
 isolated run, is never replaced. `doctor` reports which case applies (`cli install`).

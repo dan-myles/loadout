@@ -1784,11 +1784,12 @@ Automatic updates are required, so they are on by default.
   reports how the CLI was installed. As built in `src/release/`:
   - **Calling it.** After its apply, `update` calls `release::latest(context)`, then
     `release::install(&release)` on `Some`.
-  - **Newer only.** `Some` means a strictly newer stable release; `None` means up to date, so
-    nothing is ever downgraded. The release tag comes from the `releases/latest` redirect.
+  - **Newer only.** `Some` means a release strictly newer than the running CLI; `None` means none
+    is offered. The release tag comes from the `releases/latest` redirect.
   - **Skips.** `Error::skipped()` covers LOADOUT_HOME isolation, a binary without a matching
-    install record, and no published release. Those are reported, not failures. Every other error
-    fails the self-update.
+    install record, no published release, and another install or self-update holding the install
+    folder's lock (`Busy`). Those are reported, not failures. Every other error fails the
+    self-update.
   - **Managed binaries.** A binary counts as managed only when its install record
     (`docs/releasing.md`, schema 1 or 2) parses exactly and binds this platform's installer, the
     build's target, the canonical running executable, its current SHA-256 and the running version.
@@ -1796,11 +1797,18 @@ Automatic updates are required, so they are on by default.
   - **Replacing it.**
     - The archive and sidecar come over HTTPS only (max 5 redirects, size limits). The sidecar must
       be the exact line, and the hash must match.
-    - The expected binaries are read from memory after name, type and size checks, and each is
-      staged with `create_new` beside its destination.
-    - Each staged binary must print exactly `loadout <version>` or `loadout-background <version>`.
-    - Then the binaries are published and the record last. On Windows, running executables are
-      moved aside and every completed move is undone if a later one fails.
+    - The expected binaries are read from memory after name, type and size checks.
+    - Then it takes the install folder's lock, `.loadout.install.lock`, which install.sh and
+      install.ps1 take too (flock on Unix, an unshared open on Windows), without waiting. Under it,
+      each binary is staged with `create_new` beside its destination and must print exactly
+      `loadout <version>` or `loadout-background <version>`.
+    - Still under the lock, the binaries and record must be exactly the ones `latest` checked, so a
+      release found before another install or self-update finished never replaces that install.
+      Then the binaries are published and the record last. On Windows, running executables are
+      moved aside and every completed move is undone if a later one fails. The lock is held until
+      publication, any undo and this run's own cleanup are done.
+    - A writer that doesn't take the lock (a hand copy, another tool, or an install script from
+      before the lock) is not serialized with this, so its change can still race one publication.
     - A Windows schema-1 install is upgraded to schema 2 with the launcher.
     - Interrupted publication is not atomic across files and fails closed: a binary that no longer
       matches its record is unmanaged until it is reinstalled.
@@ -2011,7 +2019,7 @@ pub fn latest(context: &Context) -> Result<Option<Release>, release::Error>;   /
 pub fn install(release: &Release) -> Result<(), release::Error>;              // re-verifies provenance; captured Containment for --version checks
 pub fn checks(context: &Context) -> Vec<Check>;                              // doctor: how the CLI was installed
 pub enum Error { Isolated, Unmanaged { reason }, NoRelease, Download { detail }, Verify { detail }, Changed { detail }, Io { .. }, Publish { detail, restored } }
-impl Error { pub fn skipped(&self) -> bool; }                                // Isolated | Unmanaged | NoRelease: report, don't fail
+impl Error { pub fn skipped(&self) -> bool; }                                // Isolated | Unmanaged | NoRelease | Busy: report, don't fail
 // machine (U9 addition)
 pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), machine::Error>; // atomic, 0600 on Unix; refuses links, invalid names, password remotes
 ```

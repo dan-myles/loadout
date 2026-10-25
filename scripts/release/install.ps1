@@ -252,6 +252,26 @@ function Assert-Destination([string]$Dest, [string]$Background, [string]$Record,
     }
 }
 
+# install.sh, install.ps1 and loadout self-update each hold this lock from their last check of the
+# installed files until the record is in place, so none overwrites what another just installed. On
+# Windows it is the file opened unshared, as loadout opens it; the file itself stays.
+function Open-InstallLock([string]$Dir) {
+    $path = Join-Path $Dir '.loadout.install.lock'
+    if ((Test-Path -LiteralPath $path -PathType Container) -or (Test-Reparse $path)) {
+        throw "$path is a link or a folder, so this install can't be locked. It was left alone"
+    }
+    try {
+        [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch {
+        throw "another install or loadout self-update is changing $Dir right now, so nothing was replaced. Try again when it is done ($($_.Exception.Message))"
+    }
+}
+
+# The sha256 of each path, or 'absent', as one line.
+function Get-InstallState([string[]]$Paths) {
+    ($Paths | ForEach-Object { if (Test-Path -LiteralPath $_) { Get-Sha256 $_ } else { 'absent' } }) -join ' '
+}
+
 function New-StagedFile($Owned, [string]$Directory, [string]$Prefix, [byte[]]$Bytes) {
     $path = Join-Path $Directory ($Prefix + [Guid]::NewGuid().ToString('N'))
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -395,6 +415,7 @@ function Install-Loadout {
     [void](ConvertTo-TomlString $dest)
     [void](ConvertTo-TomlString $background)
     Assert-Destination $dest $background $record $target
+    $seen = Get-InstallState @($dest, $background, $record)
 
     $asset = "loadout-$target.zip"
     if ($BaseUrl) {
@@ -409,6 +430,7 @@ function Install-Loadout {
     $owned = New-Object Collections.Generic.List[string]
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('loadout-install-' + [Guid]::NewGuid().ToString('N'))
     $client = $null
+    $lock = $null
     $tmpOwned = $false
     try {
         [void](New-Item -ItemType Directory -Path $tmp)
@@ -452,7 +474,12 @@ function Install-Loadout {
         }
 
         [void](New-Item -ItemType Directory -Path $dir -Force)
+        # Another install may have finished while this one downloaded, so check again under the lock.
+        $lock = Open-InstallLock $dir
         Assert-Destination $dest $background $record $target
+        if ((Get-InstallState @($dest, $background, $record)) -cne $seen) {
+            throw "$dir changed while this install was downloading, so nothing was replaced. Run the installer again"
+        }
         Remove-AsideBinaries $dir
 
         $staged = New-StagedFile $owned $dir '.loadout.exe.new.' ([IO.File]::ReadAllBytes($new))
@@ -494,6 +521,8 @@ function Install-Loadout {
     } finally {
         if ($client) { $client.Dispose() }
         foreach ($path in @($owned)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        # Released only once this run's staging files are gone.
+        if ($lock) { $lock.Dispose() }
         if ($tmpOwned) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

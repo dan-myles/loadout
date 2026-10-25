@@ -220,6 +220,38 @@ check_destination() {
   fi
 }
 
+# install.sh, install.ps1 and loadout self-update each hold this lock from their last check of the
+# installed files until the record is in place, so none overwrites what another just installed. It is
+# flock(2) on the file, through flock(1) or else perl, held on fd 9; the file itself stays.
+lock_install() {
+  lock=$1/.loadout.install.lock
+  if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -f "$lock" ]; }; then
+    die "$lock is a symlink or not a regular file, so this install can't be locked. It was left alone"
+  fi
+  true >>"$lock" 2>/dev/null || die "could not create $lock"
+  exec 9>>"$lock"
+  locked=0
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || locked=$?
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MFcntl=:flock -e 'open(my $fh, ">&=", 9) or exit 2; flock($fh, LOCK_EX | LOCK_NB) or exit 1' || locked=$?
+  else
+    die "flock or perl is required to lock $1 against another install running at the same time"
+  fi
+  case $locked in
+    0) ;;
+    1) die "another install or loadout self-update is changing $1 right now, so nothing was replaced. Try again when it is done" ;;
+    *) die "could not lock $lock" ;;
+  esac
+}
+
+# The sha256 of the binary and of the record, or `absent`, as one line.
+install_state() {
+  for path in "$dest" "$record"; do
+    if [ -e "$path" ]; then printf '%s ' "$(sha256_of "$path")"; else printf 'absent '; fi
+  done
+}
+
 # Exactly one regular loadout-<target>/loadout, and no entry outside loadout-<target>/ or nested in it.
 check_listing() {
   binaries=0
@@ -241,8 +273,10 @@ check_listing() {
 case $HOME in /*) ;; *) die "HOME must be an absolute path" ;; esac
 check_text "$HOME" "HOME ($HOME)"
 bin_dir=$HOME/.local/bin
+seen='absent absent '
 if [ -d "$bin_dir" ]; then
   check_destination "$bin_dir"
+  seen=$(install_state)
 fi
 
 asset=loadout-$target.tar.gz
@@ -299,6 +333,11 @@ fi
 
 mkdir -p "$bin_dir" || die "could not create $bin_dir"
 check_destination "$bin_dir"
+# Another install may have finished while this one downloaded, so check again under the lock.
+lock_install "$canon_dir"
+check_destination "$bin_dir"
+[ "$(install_state)" = "$seen" ] ||
+  die "$dest or $record changed while this install was downloading, so nothing was replaced. Run the installer again"
 
 staged=$(mktemp "$canon_dir/.loadout.new.XXXXXX") || die "could not create a staging file in $canon_dir"
 cat "$new" >"$staged" && chmod 755 "$staged" || die "could not write $staged"
@@ -322,6 +361,7 @@ staged=
 mv -f "$staged_record" "$record" ||
   die "installed $dest but could not write $record, so self-update will not replace this binary"
 staged_record=
+exec 9>&-
 say "installed loadout $installed_version ($target) to $dest"
 
 case ":${PATH:-}:" in

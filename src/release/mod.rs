@@ -49,6 +49,11 @@ pub enum Error {
         "the installed CLI changed after loadout checked it, so nothing was replaced: {detail}"
     )]
     Changed { detail: String },
+    #[error(
+        "another install or self-update is changing {} right now, so this one replaced nothing",
+        dir.display()
+    )]
+    Busy { dir: PathBuf },
     #[error("cannot {action} {}: {source}", path.display())]
     Io {
         action: &'static str,
@@ -61,12 +66,12 @@ pub enum Error {
 }
 
 impl Error {
-    /// Nothing was or will be replaced, by design. `update` reports these and carries on;
-    /// every other error is a failed self-update (exit 1).
+    /// Nothing was or will be replaced, by design or because another writer is busy with it.
+    /// `update` reports these and carries on; every other error is a failed self-update (exit 1).
     pub fn skipped(&self) -> bool {
         matches!(
             self,
-            Error::Isolated | Error::Unmanaged { .. } | Error::NoRelease
+            Error::Isolated | Error::Unmanaged { .. } | Error::NoRelease | Error::Busy { .. }
         )
     }
 }
@@ -110,8 +115,8 @@ struct Install {
 }
 
 /// Whether a strictly newer release than the running CLI is published. `Ok(None)` means the
-/// running CLI is the newest release (or newer), so nothing is ever downgraded. Reads nothing
-/// but the running binary, its record, and one HTTPS redirect.
+/// running CLI is the newest release (or newer), so none is offered. Reads nothing but the
+/// running binary, its record, and one HTTPS redirect.
 pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
     let install = managed(context)?;
     let target = target().ok_or_else(not_a_release_build)?;
@@ -124,12 +129,20 @@ pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
     )
 }
 
-/// Replaces the installed binaries with `release`'s, then rewrites the record. The running
-/// binary must still be the one [`latest`] checked. The archive and its `.sha256` sidecar are
-/// downloaded over HTTPS only, the sidecar must be exact and match, every binary is read from
-/// memory, staged next to its destination, and must report the release's version before
-/// anything is replaced. Interrupted publication fails closed (see `publish`).
+/// Replaces the installed binaries with `release`'s, then rewrites the record. The archive and
+/// its `.sha256` sidecar are downloaded over HTTPS only, the sidecar must be exact and match,
+/// and every binary is read from memory. Then, holding the install folder's lock, each binary is
+/// staged next to its destination and must report the release's version, and the installed
+/// binaries and record must still be exactly the ones [`latest`] checked, before anything is
+/// replaced. So a release found before another install or self-update finished never overwrites
+/// that newer install. Interrupted publication fails closed (see `publish`).
 pub fn install(release: &Release) -> Result<(), Error> {
+    unchanged(release)?;
+    replace(release)
+}
+
+/// The installed binaries and record are still the ones `release` was found for.
+fn unchanged(release: &Release) -> Result<(), Error> {
     let now = installed(
         &release.install.exe,
         cfg!(windows),
@@ -142,7 +155,7 @@ pub fn install(release: &Release) -> Result<(), Error> {
             detail: "its install record changed".to_owned(),
         });
     }
-    replace(release)
+    Ok(())
 }
 
 /// Doctor: how the CLI was installed, and so whether self-update may replace it.
@@ -457,6 +470,18 @@ fn replace(release: &Release) -> Result<(), Error> {
             source,
         }
     };
+    // Held until this function returns, so through staging, the final check, publication, any
+    // undo, and the removal of every file this run staged (those are dropped before it).
+    let _lock = publish::lock(&install.dir).map_err(|error| match error {
+        publish::LockError::Busy => Error::Busy {
+            dir: install.dir.clone(),
+        },
+        publish::LockError::Failed(source) => Error::Io {
+            action: "lock",
+            path: install.dir.join(publish::LOCK_FILE),
+            source,
+        },
+    })?;
     let suffix = if windows { ".exe" } else { "" };
     let mut staged = Vec::new();
     for binary in &binaries {
@@ -486,6 +511,10 @@ fn replace(release: &Release) -> Result<(), Error> {
     let record_path = install.dir.join(record::FILE);
     let staged_record = publish::stage(&install.dir, record::FILE, "", text.as_bytes(), false)
         .map_err(io_error("stage", &record_path))?;
+
+    // The last check, under the lock: every writer that takes it has finished, so the files are
+    // the ones this run replaces, not a newer install that completed during the download.
+    unchanged(release)?;
 
     // The launcher goes first on Windows: until the record names it, a run that starts in
     // between finds a launcher of the same release next to whichever main binary is in place.
