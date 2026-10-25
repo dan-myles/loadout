@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(unix)]
 const RECORD_HEADER: &str = "# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.";
 
 #[test]
@@ -66,6 +67,12 @@ mod unix {
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
     type Routes = Arc<Mutex<BTreeMap<String, (u16, Vec<(String, String)>, Vec<u8>)>>>;
+    /// A change a test makes to an installed fixture.
+    type FixtureChange = Box<dyn Fn(&Installed)>;
+    /// An edit a test makes to install record text.
+    type RecordEdit = Box<dyn Fn(String) -> String>;
+    /// Something a test puts at the launcher path, borrowing the test's paths.
+    type LauncherSetup<'a> = Box<dyn Fn() + 'a>;
     type Pauses = Arc<Mutex<BTreeMap<String, Pause>>>;
 
     /// Holds the next response for one path: the server reports the request on `arrived`, then
@@ -186,7 +193,10 @@ mod unix {
             body.len()
         );
         for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
+            head.push_str(&name);
+            head.push_str(": ");
+            head.push_str(&value);
+            head.push_str("\r\n");
         }
         head.push_str("\r\n");
         let _ = stream.write_all(head.as_bytes());
@@ -206,7 +216,7 @@ mod unix {
         folder.set_mode(0o755);
         folder.set_size(0);
         builder
-            .append_data(&mut folder, format!("loadout-{TARGET}"), std::io::empty())
+            .append_data(&mut folder, format!("loadout-{TARGET}"), io::empty())
             .unwrap();
         let mut file = tar::Header::new_ustar();
         file.set_entry_type(tar::EntryType::Regular);
@@ -291,21 +301,21 @@ mod unix {
 
         /// The record install.ps1 writes: schema 1, or schema 2 naming `background` and its hash.
         fn write_windows_record(&self, background: Option<(&Path, &str)>) {
-            let mut text = format!(
+            let launcher = background.map_or_else(String::new, |(path, sha)| {
+                format!(
+                    "background = \"{}\"\nbackground_sha256 = \"{sha}\"\n",
+                    path.display()
+                )
+            });
+            let text = format!(
                 "{RECORD_HEADER}\nschema = {}\ninstaller = \"install.ps1\"\nrepository = \"{REPOSITORY}\"\n\
                  source = \"https://example.invalid/loadout-{WINDOWS_TARGET}.zip\"\ntarget = \"{WINDOWS_TARGET}\"\n\
-                 version = \"1.0.0\"\narchive_sha256 = \"{}\"\nbinary = \"{}\"\nbinary_sha256 = \"{}\"\n",
+                 version = \"1.0.0\"\narchive_sha256 = \"{}\"\nbinary = \"{}\"\nbinary_sha256 = \"{}\"\n{launcher}",
                 if background.is_some() { 2 } else { 1 },
                 "a".repeat(64),
                 self.exe.display(),
                 sha256(&fs::read(&self.exe).unwrap()),
             );
-            if let Some((path, sha)) = background {
-                text.push_str(&format!(
-                    "background = \"{}\"\nbackground_sha256 = \"{sha}\"\n",
-                    path.display()
-                ));
-            }
             fs::write(self.record_path(), text).unwrap();
         }
 
@@ -461,7 +471,7 @@ mod unix {
 
     #[test]
     fn a_binary_or_record_changed_during_the_download_is_not_replaced() {
-        let cases: Vec<(&str, Box<dyn Fn(&Installed)>)> = vec![
+        let cases: Vec<(&str, FixtureChange)> = vec![
             (
                 "binary edited by hand",
                 Box::new(|fixture| fs::write(&fixture.exe, b"edited by hand").unwrap()),
@@ -558,7 +568,7 @@ mod unix {
     fn provenance_must_bind_installer_target_path_hash_and_version() {
         let fixture = Installed::new();
         assert!(fixture.install().is_ok());
-        let cases: Vec<(&str, Box<dyn Fn(String) -> String>)> = vec![
+        let cases: Vec<(&str, RecordEdit)> = vec![
             (
                 "other installer",
                 Box::new(|text| text.replace("\"install.sh\"", "\"install.ps1\"")),
@@ -638,7 +648,7 @@ mod unix {
         let launcher = fixture.launcher();
         let outside = fixture.dir.path().join("elsewhere.exe");
         fs::write(&outside, b"someone else's").unwrap();
-        let cases: Vec<(&str, Box<dyn Fn() + '_>)> = vec![
+        let cases: Vec<(&str, LauncherSetup<'_>)> = vec![
             (
                 "foreign file",
                 Box::new(|| fs::write(&launcher, b"someone else's launcher").unwrap()),

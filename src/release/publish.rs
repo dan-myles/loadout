@@ -17,6 +17,7 @@
 //! publication; the hash binding then makes the mismatch fail closed only if the record and the
 //! binaries end up disagreeing.
 
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -98,7 +99,7 @@ fn open_lock(path: &Path) -> Result<File, LockError> {
 #[cfg(windows)]
 fn open_lock(path: &Path) -> Result<File, LockError> {
     use std::os::windows::fs::OpenOptionsExt;
-    /// ERROR_SHARING_VIOLATION: another writer has the file open.
+    /// `ERROR_SHARING_VIOLATION`: another writer has the file open.
     const SHARING_VIOLATION: i32 = 32;
     OpenOptions::new()
         .read(true)
@@ -152,7 +153,11 @@ pub(super) fn stage(
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        #[cfg(unix)]
         set_mode(&staged.path, executable)?;
+        // Windows has no mode bits; the `.exe` suffix is what makes a staged binary runnable.
+        #[cfg(not(unix))]
+        let _ = executable;
         return Ok(staged);
     }
     Err(io::Error::new(
@@ -168,11 +173,6 @@ fn set_mode(path: &Path, executable: bool) -> io::Result<()> {
         path,
         fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
     )
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _executable: bool) -> io::Result<()> {
-    Ok(())
 }
 
 /// How a publication went wrong, and whether the previous files are back in place.
@@ -431,7 +431,7 @@ fn settle_asides(dir: &Path, done: &[Move], delete: fn(&Path) -> io::Result<()>)
     }
     let mut text = String::new();
     for (name, sha256) in &running {
-        text.push_str(&format!("{name} {sha256}\n"));
+        let _ = writeln!(text, "{name} {sha256}");
     }
     if let Ok(mut staged) = stage(dir, ASIDES_FILE, "", text.as_bytes(), false)
         && fs::rename(&staged.path, &path).is_ok()
@@ -476,7 +476,7 @@ fn read_asides(dir: &Path) -> Option<Vec<(String, String)>> {
 #[cfg(unix)]
 fn sync_dir(file: &Path) {
     if let Some(dir) = file.parent()
-        && let Ok(dir) = fs::File::open(dir)
+        && let Ok(dir) = File::open(dir)
     {
         let _ = dir.sync_all();
     }

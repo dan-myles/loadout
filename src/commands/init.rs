@@ -12,8 +12,12 @@ use crate::sync;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// The loadout Git repository, such as https://github.com/you/loadout.git or git@github.com:you/loadout.git
-    #[arg(value_name = "URL")]
+    // The help text is given directly, not as a doc comment: it is the exact text `--help` prints,
+    // and its example URLs are plain text there, not Markdown.
+    #[arg(
+        value_name = "URL",
+        help = "The loadout Git repository, such as https://github.com/you/loadout.git or git@github.com:you/loadout.git"
+    )]
     pub url: String,
     /// This machine's name in the loadout [default: the saved name, else one made from the hostname]
     #[arg(long, value_name = "NAME", value_parser = machine_name)]
