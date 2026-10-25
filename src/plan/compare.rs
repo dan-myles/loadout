@@ -560,8 +560,10 @@ enum Refusal {
 }
 
 /// A target loadout must not read or replace. A reserved destination is unsupported for a
-/// declared item (architecture section 6) and blocks a removal; a special file or an entry this
-/// build's state can't read blocks either. Anything else is a runtime error.
+/// declared item (architecture section 6) and blocks a removal, and a special file blocks
+/// either. Then state's own classifier decides: a fact about the machine, such as an MCP config
+/// loadout won't edit or a server name taken by a value loadout doesn't own, is blocked.
+/// Anything else, such as an I/O fault or a broken entry contract, is a runtime error.
 fn refused(
     item: ItemRef,
     target: Target,
@@ -571,12 +573,10 @@ fn refused(
     let reason = failure.to_string();
     let change = match (failure, refusal) {
         (state::Error::Reserved { .. }, Refusal::Desired) => Change::Unsupported(reason),
-        (
-            state::Error::Reserved { .. }
-            | state::Error::Special { .. }
-            | state::Error::EntryNeedsMcp { .. },
-            _,
-        ) => Change::Blocked(reason),
+        (state::Error::Reserved { .. } | state::Error::Special { .. }, _) => {
+            Change::Blocked(reason)
+        }
+        _ if failure.is_blocked() => Change::Blocked(reason),
         _ => {
             return Err(Error::Runtime(anyhow::anyhow!(
                 "cannot observe {}: {reason}",
@@ -778,6 +778,94 @@ mod tests {
         assert!(refused(item, path(), &io, Refusal::Desired).is_err());
     }
 
+    /// What a real entry observation can report is the machine's problem (blocked, exit 4) or
+    /// loadout's (runtime, exit 1), as state's own `is_blocked` says, after the reserved and
+    /// special arms. A special file is blocked by R1 although state's classifier doesn't list it.
+    #[test]
+    fn a_real_entry_refusal_is_blocked_when_it_is_the_machine_and_a_runtime_error_otherwise() {
+        let item = ItemRef {
+            kind: ItemKind::Mcp,
+            id: "docs".to_owned(),
+            agent: Some("claude".to_owned()),
+        };
+        let target = entry("docs");
+        let document = PathBuf::from("/h/.claude.json");
+        let mcp = |source: crate::mcp::Error| state::Error::Mcp {
+            target: state::label(&target),
+            source,
+        };
+        let machine_faults = [
+            state::Error::NotADocument {
+                path: document.clone(),
+            },
+            state::Error::UnownedEntry {
+                target: state::label(&target),
+            },
+            mcp(crate::mcp::Error::Parse {
+                format: McpFormat::Json,
+                message: "expected a value".to_owned(),
+            }),
+            mcp(crate::mcp::Error::Duplicate {
+                pointer: "/mcpServers".to_owned(),
+                key: "docs".to_owned(),
+            }),
+            mcp(crate::mcp::Error::NotAFile {
+                path: document.clone(),
+            }),
+            mcp(crate::mcp::Error::Lock {
+                path: PathBuf::from("/h/.grok/.config-init.lock"),
+                message: "Grok holds it".to_owned(),
+            }),
+        ];
+        for failure in &machine_faults {
+            assert!(failure.is_blocked(), "{failure}");
+            for refusal in [Refusal::Desired, Refusal::Removal] {
+                let action = refused(item.clone(), target.clone(), failure, refusal).unwrap();
+                assert_eq!(action.change, Change::Blocked(failure.to_string()), "{failure}");
+                assert_eq!(action.prior, Observed::Absent);
+                assert!(action.content.is_none());
+            }
+        }
+
+        let special = state::Error::Special {
+            path: document.clone(),
+        };
+        assert!(!special.is_blocked(), "only R1's own arm blocks a special file");
+        for refusal in [Refusal::Desired, Refusal::Removal] {
+            let action = refused(item.clone(), target.clone(), &special, refusal).unwrap();
+            assert_eq!(action.change, Change::Blocked(special.to_string()));
+        }
+
+        let loadout_faults = [
+            mcp(crate::mcp::Error::Pointer {
+                pointer: "mcpServers".to_owned(),
+            }),
+            mcp(crate::mcp::Error::ShapeFormat {
+                shape: McpShape::CodexToml,
+                format: McpFormat::Json,
+            }),
+            mcp(crate::mcp::Error::Io {
+                path: document.clone(),
+                source: std::io::Error::other("disk"),
+            }),
+            state::Error::Io {
+                action: "read",
+                path: document.clone(),
+                source: std::io::Error::other("disk"),
+            },
+            state::Error::NotUtf8 { path: document },
+        ];
+        for failure in &loadout_faults {
+            assert!(!failure.is_blocked(), "{failure}");
+            for refusal in [Refusal::Desired, Refusal::Removal] {
+                assert!(
+                    refused(item.clone(), target.clone(), failure, refusal).is_err(),
+                    "a programming, contract, or I/O fault is never a blocked action: {failure}"
+                );
+            }
+        }
+    }
+
     struct Machine {
         _dir: tempfile::TempDir,
         home: PathBuf,
@@ -916,7 +1004,10 @@ mod tests {
             assert!(problems.is_empty(), "{problems:?}");
             assert_eq!(actions.len(), 1, "no separate removal: {actions:#?}");
             assert_eq!(actions[0].target, declared);
-            assert!(kept_then_migrated(&actions[0]), "{actions:#?}");
+            assert!(
+                only_migrated(&actions[0], &owned, &declared),
+                "{actions:#?}"
+            );
             assert!(actions[0].content.is_none());
             super::super::Plan { actions }.check().unwrap();
             assert_eq!(
@@ -1199,19 +1290,31 @@ mod tests {
         matches!(&action.change, Change::Blocked(reason) if reason.contains("doesn't convert"))
     }
 
-    /// The first refusal (on this base, the interim entry refusal) stays, and the migration
-    /// reason follows it rather than replacing it.
-    fn kept_then_migrated(action: &Action) -> bool {
-        let Change::Blocked(reason) = &action.change else {
-            return false;
-        };
-        matches!(
-            (reason.find(ENTRY_REFUSAL), reason.find("doesn't convert")),
-            (Some(first), Some(then)) if first < then
-        )
+    /// A real entry observation refuses nothing here (an absent document plans a create), so
+    /// the migration of `owned` to `declared` is the action's whole refusal: no other reason
+    /// comes before it or after it.
+    fn only_migrated(action: &Action, owned: &Target, declared: &Target) -> bool {
+        action.change == Change::Blocked(migration_reason(owned, declared))
     }
 
-    const ENTRY_REFUSAL: &str = "needs the mcp module";
+    /// The migration is the action's first refusal; a relation found later may follow it.
+    #[cfg(unix)]
+    fn migrated_first(action: &Action, owned: &Target, declared: &Target) -> bool {
+        matches!(&action.change, Change::Blocked(reason) if reason.starts_with(&migration_reason(owned, declared)))
+    }
+
+    /// The retained OLD contract of `old` is the action's whole refusal: `old` and the action's
+    /// target are one document, which `old`'s format forbids writing another way.
+    fn only_guarded_by(action: &Action, old: &Target) -> bool {
+        let how = relation_text(&Verdict::Conflict { case: None }).unwrap();
+        action.change
+            == Change::Blocked(format!(
+                "loadout still owns {} as {}, which no declaration writes here; {} and that key {how}",
+                state::label(old),
+                contract(old),
+                state::label(&action.target)
+            ))
+    }
 
     /// Cursor and Pi read `my_docs` as different names, but the document stores one key
     /// `my_docs`, so an owned key reached through a link under the other shape is a migration in
@@ -1256,13 +1359,13 @@ mod tests {
                         let (actions, problems) = compared(&machine, order, &state);
                         assert!(problems.is_empty(), "{problems:?}");
                         assert!(
-                            kept_then_migrated(of(&actions, &declared)),
+                            only_migrated(of(&actions, &declared), &owned, &declared),
                             "{:?}",
                             reasons(&actions)
                         );
                         assert!(
-                            kept_then_migrated(of(&actions, &owned)),
-                            "{:?}",
+                            only_migrated(of(&actions, &owned), &owned, &declared),
+                            "the old record's removal is refused by the migration alone: {:?}",
                             reasons(&actions)
                         );
                         assert!(of(&actions, &owned).content.is_none());
@@ -1351,7 +1454,7 @@ mod tests {
                             "no removal for the still-declared record: {actions:#?}"
                         );
                         assert!(
-                            kept_then_migrated(of(&actions, &other)),
+                            only_migrated(of(&actions, &other), &owned, &other),
                             "{:?}",
                             reasons(&actions)
                         );
@@ -1492,8 +1595,8 @@ mod tests {
             let blocked = of(&actions, &incompatible);
             assert!(guarded_by_old(blocked), "{:?}", reasons(&actions));
             assert!(
-                matches!(&blocked.change, Change::Blocked(reason) if reason.contains(ENTRY_REFUSAL) && reason.find(ENTRY_REFUSAL) < reason.find("still owns")),
-                "the first refusal stays first: {:?}",
+                only_guarded_by(blocked, &owned),
+                "the old owner's guard is the whole refusal, not a mask: {:?}",
                 reasons(&actions)
             );
             assert!(blocked.content.is_none());
@@ -1649,21 +1752,26 @@ mod tests {
             "docs",
             McpShape::PiJson,
         );
-        let state = owning(&machine, &[cursor, claude]);
+        let state = owning(&machine, &[cursor.clone(), claude.clone()]);
         let (actions, problems) = compared(&machine, vec![desired(declared.clone())], &state);
         assert!(problems.is_empty(), "{problems:?}");
         let Change::Blocked(reason) = &of(&actions, &declared).change else {
             panic!("{actions:#?}");
         };
         assert!(
-            reason.contains(ENTRY_REFUSAL),
-            "the first refusal stays: {reason}"
+            reason.starts_with("loadout owns "),
+            "nothing refuses the real entry before its migrations: {reason}"
         );
         assert_eq!(reason.matches("as json cursor-json").count(), 1, "{reason}");
         assert_eq!(reason.matches("as json claude-json").count(), 1, "{reason}");
+        let (by_cursor, by_claude) = (
+            migration_reason(&cursor, &declared),
+            migration_reason(&claude, &declared),
+        );
         assert!(
-            reason.find(ENTRY_REFUSAL) < reason.find("doesn't convert"),
-            "{reason}"
+            *reason == format!("{by_cursor}; {by_claude}")
+                || *reason == format!("{by_claude}; {by_cursor}"),
+            "exactly the two migrations, each once, and nothing else: {reason}"
         );
         super::super::Plan { actions }.check().unwrap();
     }
@@ -1740,13 +1848,13 @@ mod tests {
                 "one migration action and the sibling, no removal: {actions:#?}"
             );
             assert!(
-                kept_then_migrated(of(&actions, &declared_docs)),
+                only_migrated(of(&actions, &declared_docs), &owned_docs, &declared_docs),
                 "{:?}",
                 reasons(&actions)
             );
             assert!(
-                matches!(&of(&actions, &jsonc_sibling).change, Change::Blocked(reason) if reason.contains(ENTRY_REFUSAL) && reason.contains("still owns") && reason.contains("json cursor-json")),
-                "{:?}",
+                only_guarded_by(of(&actions, &jsonc_sibling), &owned_docs),
+                "the old json contract alone blocks the jsonc sibling: {:?}",
                 reasons(&actions)
             );
             super::super::Plan { actions }.check().unwrap();
@@ -1881,18 +1989,18 @@ mod tests {
         );
         assert!(problems.is_empty(), "{problems:?}");
         assert!(
-            kept_then_migrated(of(&actions, &declared)),
+            only_migrated(of(&actions, &declared), &owned, &declared),
             "{:?}",
             reasons(&actions)
         );
         assert!(
-            kept_then_migrated(of(&actions, &owned)),
-            "{:?}",
+            migrated_first(of(&actions, &owned), &owned, &declared),
+            "the old removal's migration comes first; its conflict with the jsonc sibling may follow: {:?}",
             reasons(&actions)
         );
         assert!(
-            matches!(&of(&actions, &sibling).change, Change::Blocked(reason) if reason.contains(ENTRY_REFUSAL) && reason.contains("still owns")),
-            "{:?}",
+            only_guarded_by(of(&actions, &sibling), &owned),
+            "the retained old contract alone blocks the sibling: {:?}",
             reasons(&actions)
         );
         super::super::Plan { actions }.check().unwrap();

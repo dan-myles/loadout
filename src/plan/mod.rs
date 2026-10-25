@@ -260,6 +260,8 @@ pub fn build(
     steps: Option<Steps>,
     options: Options,
 ) -> Result<Built, Error> {
+    #[cfg(test)]
+    observe::reached(observe::Stage::Gate);
     interrupted(context)?;
     let (loadout, mut warnings) =
         Loadout::load_guarded(checkout, context).map_err(Error::Invalid)?;
@@ -279,7 +281,11 @@ pub fn build(
     let mut problems = Diagnostics::default();
     let sources =
         Sources::new(context, &root).map_err(|message| Error::Invalid(one("", message)))?;
+    #[cfg(test)]
+    observe::reached(observe::Stage::Files);
     let mut produced = files::produce(&resolved, &facts, context, &root, &sources, &mut problems);
+    #[cfg(test)]
+    observe::reached(observe::Stage::Agents);
     match agents::materialize(&resolved, context, &root) {
         Ok((desired, unsupported)) => {
             produced.desired.extend(desired);
@@ -293,16 +299,20 @@ pub fn build(
 
     let steps = match steps {
         Some(steps) if steps.fits(&resolved.programs, &facts, context) => steps,
-        _ => Steps {
-            steps: programs::steps(&resolved.programs, &facts, context)
-                .map_err(program_error)?
-                .into_iter()
-                .map(|step| (step.program.clone(), step))
-                .collect(),
-            programs: resolved.programs.clone(),
-            facts: facts.clone(),
-            context: context.clone(),
-        },
+        _ => {
+            #[cfg(test)]
+            observe::reached(observe::Stage::Query);
+            Steps {
+                steps: programs::steps(&resolved.programs, &facts, context)
+                    .map_err(program_error)?
+                    .into_iter()
+                    .map(|step| (step.program.clone(), step))
+                    .collect(),
+                programs: resolved.programs.clone(),
+                facts: facts.clone(),
+                context: context.clone(),
+            }
+        }
     };
 
     let mut actions = compare::actions(produced, state, context, &root, &mut problems)?;
@@ -350,6 +360,39 @@ fn interrupted(context: &Context) -> Result<(), Error> {
             run.error.as_deref().unwrap_or("unknown error")
         ))),
         _ => Ok(()),
+    }
+}
+
+/// Which stages of `build` a test build reached, in order, on the current thread. Only unit
+/// tests in this crate see it, and it doesn't exist outside a test build, so production never
+/// branches on it. A stage is recorded as `build` reaches the call, before the call runs.
+#[cfg(test)]
+pub(crate) mod observe {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        /// The interrupted-run gate, before anything else `build` reads.
+        Gate,
+        /// The user-file, skill, and instructions producer, which reads the loadout's sources.
+        Files,
+        /// The agent producer, which materializes skills, instructions, and MCP servers.
+        Agents,
+        /// `programs::steps`, which asks the package managers (none under isolation).
+        Query,
+    }
+
+    thread_local! {
+        static STAGES: RefCell<Vec<Stage>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn reached(stage: Stage) {
+        STAGES.with(|stages| stages.borrow_mut().push(stage));
+    }
+
+    /// The stages reached on this thread since the last call, which starts the record again.
+    pub(crate) fn take() -> Vec<Stage> {
+        STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
     }
 }
 

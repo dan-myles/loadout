@@ -373,8 +373,10 @@ fn an_unowned_mcp_server_that_differs_is_blocked_and_its_file_is_never_touched()
     assert_eq!(fs::read_to_string(&claude).unwrap(), original);
 }
 
+/// An unowned server that already holds exactly the declared value is adopted: the plan says
+/// so, applying it records ownership without writing, and the shared document, with its
+/// unrelated auth field, keeps every byte.
 #[test]
-#[ignore = "needs the U3 entry transaction: state::observe of an MCP entry (u3-entry-integration)"]
 fn an_unowned_mcp_server_that_already_matches_is_adopted() {
     let machine = machine(&[(
         "loadout.toml",
@@ -384,11 +386,8 @@ fn an_unowned_mcp_server_that_already_matches_is_adopted() {
         ),
     )]);
     let claude = machine.home.join(".claude.json");
-    fs::write(
-        &claude,
-        "{\"mcpServers\":{\"docs\":{\"type\":\"stdio\",\"command\":\"docs-server\",\"args\":[],\"env\":{}}}}",
-    )
-    .unwrap();
+    let original = "{\"oauthAccount\":{\"id\":\"SENTINEL\"},\"mcpServers\":{\"docs\":{\"type\":\"stdio\",\"command\":\"docs-server\",\"args\":[],\"env\":{}}}}";
+    fs::write(&claude, original).unwrap();
     let built = build(&machine).unwrap();
     let docs = built
         .plan
@@ -397,6 +396,43 @@ fn an_unowned_mcp_server_that_already_matches_is_adopted() {
         .find(|action| matches!(&action.target, Target::Entry { key, .. } if key == "docs"))
         .unwrap();
     assert_eq!(docs.change, Change::Adopt);
+    assert!(
+        matches!(docs.prior, Observed::Present { .. }),
+        "{docs:?}"
+    );
+    let target = docs.target.clone();
+
+    let report = loadout::apply::run(
+        &machine.context,
+        &machine.loadout,
+        loadout::apply::Options {
+            force: false,
+            elevated: false,
+            mode: loadout::apply::Mode::Interactive,
+        },
+    )
+    .unwrap();
+    let adopted = report
+        .outcomes
+        .iter()
+        .find(|(action, _)| action.target == target)
+        .unwrap();
+    assert_eq!(adopted.1, loadout::apply::Outcome::Adopted, "{report:#?}");
+    assert!(!report.failed() && !report.unhealthy(), "{report:#?}");
+    assert_eq!(
+        fs::read_to_string(&claude).unwrap(),
+        original,
+        "adopting writes nothing"
+    );
+    let records = State::load(&machine.context).unwrap();
+    let record = records.record(&target).expect("the key is now owned");
+    assert_eq!(
+        Observed::Present {
+            sha256: record.sha256.clone()
+        },
+        docs.prior,
+        "the record is the hash that was observed"
+    );
 }
 
 #[test]
@@ -442,8 +478,8 @@ fn distinct_mcp_keys_in_one_document_are_separate_destinations() {
 /// normalized forms, but of desired items only, so the refused `docs` never meets `search`
 /// there. Loadout owns `docs` there as `json cursor-json`: nothing writes it now, but the
 /// record stays, and so does what it owns, so `search` is blocked rather than putting a second
-/// format into that document. Without the record nothing is owned, and only the interim entry
-/// refusal applies.
+/// format into that document, and that guard is its whole refusal. Without the record nothing
+/// is owned, and the real entry observation of the absent document plans a create.
 #[cfg(unix)]
 #[test]
 fn an_owned_key_refused_for_its_agent_keeps_guarding_its_document_through_a_link() {
@@ -503,19 +539,32 @@ fn an_owned_key_refused_for_its_agent_keeps_guarding_its_document_through_a_link
             .iter()
             .find(|action| matches!(&action.target, Target::Entry { key, .. } if key == "search"))
             .expect("search has an entry action");
-        let Change::Blocked(reason) = &search.change else {
-            panic!("an entry is never written on this base: {search:?}");
-        };
-        assert!(search.content.is_none());
-        assert_eq!(
-            reason.contains("still owns") && reason.contains("as json cursor-json"),
-            owned,
-            "{reason}"
-        );
-        assert!(
-            reason.contains("needs the mcp module"),
-            "the first refusal stays: {reason}"
-        );
+        if owned {
+            let Change::Blocked(reason) = &search.change else {
+                panic!("the old owner's document is guarded: {search:?}");
+            };
+            assert!(search.content.is_none());
+            assert!(
+                reason.contains("still owns") && reason.contains("as json cursor-json"),
+                "{reason}"
+            );
+            assert_eq!(
+                *reason,
+                format!(
+                    "loadout still owns {} as json cursor-json, which no declaration writes here; {} and that key are one destination: the same file, one inside the other, one MCP key inside the other, or one file in two formats",
+                    state::label(&docs),
+                    state::label(&search.target)
+                ),
+                "the old owner's guard is the whole refusal, with no other reason before or after it"
+            );
+        } else {
+            assert_eq!(
+                search.change,
+                Change::Create,
+                "nothing is owned, so the absent document gets the key"
+            );
+            assert!(search.content.is_some());
+        }
         assert!(!actions.iter().any(|action| action.change == Change::Remove));
         built.plan.check().unwrap();
         let records = State::load(&machine.context).unwrap();

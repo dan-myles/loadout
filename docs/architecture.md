@@ -1056,10 +1056,11 @@ delegated defaults.
     - A place that can't be resolved blocks that writer, and blocks every removal, since none can be shown to stay clear of it. A retained ownership whose place can't be resolved protects nothing beyond that: writers at other places can't be related to it.
     - No hard link, bind mount, or link changed after the plan is covered.
 
-    `observe` errors map like this:
+    `observe` errors map like this. An MCP entry is observed by U3's real entry transaction, so an absent document plans a `create`:
     - `Reserved` is `unsupported` for a declared target and `blocked` for a removal.
-    - `Special`, and on a base without the entry transaction `EntryNeedsMcp`, is `blocked`.
-    - Anything else is exit 1.
+    - `Special` is `blocked` (R1), though state's own classifier doesn't list it.
+    - Then `state::Error::is_blocked` decides: a fact about the machine (an MCP config loadout won't edit, a folder in its place, Grok holding its lock, or a server name taken by a value loadout doesn't own) is `blocked`, exit 4.
+    - Anything else, such as an I/O fault or a broken pointer or shape contract, is exit 1.
   - **Programs.** `Installed` becomes `unchanged` with prior `Installed`. `Missing` becomes `install`, or `blocked` when it needs `--elevated` the run lacks, with its real `Target::Program`. `Unsupported` and `Blocked` steps have no package, so they get `Target::None`. Two programs that pick one manager and package on this machine are exit 3.
   - **Case check** (Linux and macOS, where a folder can be either way). Two destinations whose written or resolved paths differ only by case (or one inside the other) are asked about at each component where their spellings differ. The nearest existing folder decides, read-only: a child with an ASCII letter is statted under both spellings.
     - Same `(dev, ino)`: insensitive.
@@ -1085,12 +1086,13 @@ delegated defaults.
     - After each path write, the target is read back, and anything other than what was written is `mismatch` (exit 4). This catches a file system that drops execute bits, which no read-only plan can see.
     - Every begun run is finished **before** any program install, so killing a hung installer never interrupts a journal. If finishing fails, the first failure stays reported, no program is installed, and the exit is 1.
     - In background mode, `replace` and drift are skipped and nothing is elevated.
-    - Exits: 1 for a failed action or finish, 3 invalid, 4 when anything is blocked, skipped, or mismatched, else 0. Unsupported actions alone exit 0, and they are always listed.
-  - **Pending integrations, named rather than stubbed:**
-    - `Run::finish_with_lock(self, &mut State) -> (Lock, Result<(), state::Error>)` (U3) keeps the lock through the installs, and is called as agreed.
+    - **Cancellation.** Only a supervised background run, whose `Context.containment` is inherited, can be cancelled; the foreground's `OwnGroup` never is. No command starts a supervised worker yet; that is a separate unit. Before the run begins, before each journaled action, and before each install, a cancelled run starts no new work and reports the rest as `skipped`. A run that has begun is still finished through `finish_with_lock`, so its journal is complete and its lock comes back. `Report.cancelled` is a runtime field, never saved, and makes the exit 4 even with nothing to do. A failed action or finish still makes it 1, and a failed manager query is still a runtime error (1), though U8 also sets the flag then. Each check comes just before its step, so a cancellation that arrives while a step runs doesn't stop that step; U8's own refusal still guards a query or installer started after the check.
+    - Exits: 1 for a failed action or finish, 3 invalid, 4 when anything is blocked, skipped, or mismatched or the run was cancelled, else 0. Unsupported actions alone exit 0, and they are always listed.
+  - **Integrated from U3 and U8** (source composition, not yet built or run):
+    - `Run::finish_with_lock(self, &mut State) -> (Lock, Result<(), state::Error>)` (U3) hands the lock back on success and on failure; apply holds it through the installs and the report.
     - `Lock::check(&self, &Context) -> Result<(), state::Error>` (U3) is the read-only association check `run_under_lock` calls first. It returns `WrongLock` for another state dir.
-    - The MCP entry transaction (U3) replaces the interim `EntryNeedsMcp` refusal.
-    - `Options.cancel: Option<process::Cancel>` (U8) adds a check before each journaled action and each install.
+    - MCP entries are U3's real transactions, observed and mapped as above.
+    - Cancellation is U8's `Context.containment`, read through `is_cancelled()`. There is no `Options.cancel`.
 - **MCP entries (built, U3).** An MCP server is a `Target::Entry { file, format, pointer, key,
   shape }`: one key in an agent's shared config, owned per key. State owns the transaction and
   imports `mcp`; `mcp` never imports state. `state::Error::EntryNeedsMcp`, the interim refusal, is
@@ -1801,10 +1803,12 @@ pub fn name(context: &Context) -> Result<Name, machine::Error>;
 pub struct Context {
     pub os: Os, pub home: PathBuf, pub isolated: bool, pub config: PathBuf, pub xdg_config: PathBuf, pub xdg_data: PathBuf,
     pub state: PathBuf, pub agent_dirs: BTreeMap<&'static str, PathBuf>,
+    pub containment: process::Containment,     // OwnGroup (foreground) unless supervised (U8)
 }
 impl Context {
     pub fn from_env() -> Result<Self, context::Error>;
     pub fn resolve(os: Os, var: impl Fn(&str) -> Option<OsString>, default_home: Option<PathBuf>) -> Result<Self, context::Error>;
+    pub fn supervised(self, by: Arc<process::Supervised>) -> Self;   // after a successful process::handshake (U8)
     pub fn expand(&self, path: &str) -> Option<PathBuf>;       // None for unclean paths, and Windows-unsafe parts on Windows
     pub fn agent_dir(&self, var: &str) -> Option<&Path>;        // always None under isolation
     pub fn machine_file(&self) -> PathBuf;
@@ -1938,12 +1942,12 @@ pub enum Mode { Interactive, Background }   // Background: never replace, force,
 pub struct Options { pub force: bool, pub elevated: bool, pub mode: Mode }
 pub fn run(context: &Context, checkout: &Path, options: Options) -> Result<Report, apply::Error>;            // preflight, lock, run_under_lock
 pub fn run_under_lock(context: &Context, checkout: &Path, lock: state::Lock, options: Options) -> Result<Report, apply::Error>;
-pub struct Report { pub checkout, pub machine, pub run: Option<String>, pub outcomes: Vec<(Action, Outcome)>, pub warnings, pub finish_error: Option<String> }
-impl Report { pub fn failed(&self) -> bool /* exit 1 */; pub fn unhealthy(&self) -> bool /* exit 4 */; }
+pub struct Report { pub checkout, pub machine, pub run: Option<String>, pub outcomes: Vec<(Action, Outcome)>, pub warnings, pub finish_error: Option<String>, pub cancelled: bool /* runtime only */ }
+impl Report { pub fn failed(&self) -> bool /* exit 1 */; pub fn unhealthy(&self) -> bool /* exit 4, also when cancelled */; }
 pub enum Error { Plan(plan::Error), State(state::Error) }
-// Pending integrations: Run::finish_with_lock (U3) keeps the lock through program installs; Lock::check (U3) is
-// run_under_lock's first call on every route; Options.cancel (U8 process::Cancel) with checks before each
-// journaled action and each install.
+// Run::finish_with_lock (U3) keeps the lock through program installs; Lock::check (U3) is run_under_lock's first
+// call on every route; context.containment.is_cancelled() (U8) is checked before the run begins, each journaled
+// action, and each install.
 
 // sync (U8)
 pub fn clone(url: &str, context: &Context) -> Result<(), sync::Error>;

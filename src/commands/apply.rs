@@ -67,6 +67,9 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     if let Some(run) = &report.run {
         println!("run {run}; `loadout rollback {run}` undoes it");
     }
+    if report.cancelled {
+        println!("cancelled: {}", apply::CANCELLED);
+    }
     if let Some(error) = &report.finish_error {
         eprintln!("error: loadout couldn't save its ownership records: {error}");
     }
