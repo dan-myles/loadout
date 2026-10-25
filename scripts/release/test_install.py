@@ -278,6 +278,80 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(self.dest.read_bytes(), fake_loadout("1.2.4"))
         self.assertEqual(json.loads(self.read_record()["binary_sha256"]), sha256(fake_loadout("1.2.4")))
 
+    def failing_sha256sum(self, digest=None, after=None):
+        """Wraps the real sha256sum. For input whose digest is `digest` (any input when None), once
+        the file `after` exists (at once when None), it prints that valid digest, then exits 1."""
+        self.write_exe(
+            self.fakebin / "sha256sum",
+            '#!/bin/sh\n'
+            'out=$("$REAL_SHA256SUM") || exit $?\n'
+            'case $out in "${FAIL_DIGEST:-${out%% *}}  "*)\n'
+            '  if [ -z "$FAIL_AFTER" ] || [ -e "$FAIL_AFTER" ]; then printf \'%s\\n\' "$out"; exit 1; fi ;;\n'
+            'esac\n'
+            'printf \'%s\\n\' "$out"\n',
+        )
+        return dict(REAL_SHA256SUM=shutil.which("sha256sum"), FAIL_DIGEST=digest or "", FAIL_AFTER=str(after or ""))
+
+    @unittest.skipUnless(shutil.which("sha256sum"), "wraps the real sha256sum")
+    def test_a_checksum_tool_that_fails_after_printing_a_digest_installs_nothing(self):
+        result = self.install(**self.failing_sha256sum())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not hash", result.stderr)
+        self.assertIn("sha256sum failed", result.stderr)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.record.exists())
+
+    @unittest.skipUnless(shutil.which("sha256sum"), "wraps the real sha256sum")
+    def test_a_hash_failure_on_the_installed_files_is_an_error_that_changes_nothing(self):
+        marker = self.tmp / "download-started"
+        cases = {
+            "installed binary, first check": ("binary", None),
+            "record, state before the download": ("record", None),
+            "record, final state under the lock": ("record", marker),
+        }
+        for name, (which, after) in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(self.home / ".local", ignore_errors=True)
+                if marker.exists():
+                    marker.unlink()
+                (self.fakebin / "sha256sum").unlink(missing_ok=True)
+                self.publish()
+                self.install_ok()
+                before = self.snapshot()
+                target = sha256((self.dest if which == "binary" else self.record).read_bytes())
+                self.publish(fake_loadout("1.2.4"))
+                self.server.hooks[f"/{ASSET}"] = lambda: marker.touch()
+                result = self.install(**self.failing_sha256sum(target, after))
+                self.server.hooks.pop(f"/{ASSET}", None)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("could not hash", result.stderr)
+                self.assertNotIn("was not installed by this installer", result.stderr)
+                self.assertNotIn("changed while this install was downloading", result.stderr)
+                self.assertEqual(self.snapshot(), before, "nothing is published")
+                if after:
+                    self.assertTrue(marker.exists(), "the failure came after the download began")
+
+        # The same wrapper aimed at nothing it hashes is transparent: the upgrade goes through.
+        (self.fakebin / "sha256sum").unlink()
+        result = self.install(**self.failing_sha256sum("f" * 64))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.dest.read_bytes(), fake_loadout("1.2.4"))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read any file")
+    def test_an_unreadable_installed_binary_is_an_error_not_unmanaged(self):
+        self.install_ok()
+        before = self.snapshot()
+        self.publish(fake_loadout("1.2.4"))
+        self.dest.chmod(0o000)
+        try:
+            result = self.install()
+        finally:
+            self.dest.chmod(0o755)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not hash", result.stderr)
+        self.assertNotIn("was not installed by this installer", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
     def test_a_checksum_tool_printing_anything_but_a_digest_installs_nothing(self):
         self.write_exe(self.fakebin / "sha256sum", "#!/bin/sh\ncat >/dev/null\nprintf '%s  -\\n' '\\0123'\n")
         result = self.install()

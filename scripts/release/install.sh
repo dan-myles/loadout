@@ -152,14 +152,29 @@ else
   die "sha256sum or shasum is required to verify the download"
 fi
 
+# Prints the file's sha256, or says why not and returns 1; every caller checks that status, since a
+# failure inside a command substitution or a condition wouldn't stop the script by itself.
 # The file goes in on stdin, not as an argument: for a name holding a backslash or newline,
 # sha256sum and shasum escape the name and prefix the digest with a backslash, which would then be
-# compared and written to the install record as part of the hash.
+# compared and written to the install record as part of the hash. The tool's output and exit
+# status are captured together, so a failing tool or an unreadable file is never taken for a hash.
 sha256_of() {
-  digest=$($sha_cmd <"$1" | { read -r digest _ && printf '%s' "$digest"; }) || die "could not hash $1"
-  case $digest in *[!0-9a-f]*) die "could not hash $1: the checksum tool printed '$digest'" ;; esac
-  [ ${#digest} -eq 64 ] || die "could not hash $1: the checksum tool printed '$digest'"
-  printf '%s' "$digest"
+  if ! hash_out=$($sha_cmd <"$1"); then
+    say "error: could not hash $1: $sha_cmd failed"
+    return 1
+  fi
+  hash_digest=${hash_out%% *}
+  case $hash_digest in
+    '' | *[!0-9a-f]*)
+      say "error: could not hash $1: $sha_cmd printed '$hash_out'"
+      return 1
+      ;;
+  esac
+  if [ ${#hash_digest} -ne 64 ]; then
+    say "error: could not hash $1: $sha_cmd printed '$hash_out'"
+    return 1
+  fi
+  printf '%s' "$hash_digest"
 }
 
 download() {
@@ -206,7 +221,9 @@ record_matches() {
   [ "$(record_line installer)" = '"install.sh"' ] || { why="$record was written by another installer"; return 1; }
   [ "$(record_line target)" = "\"$target\"" ] || { why="$record is for another target than $target"; return 1; }
   [ "$(record_line binary)" = "$(toml_string "$dest")" ] || { why="$record describes another binary path"; return 1; }
-  [ "$(record_line binary_sha256)" = "\"$(sha256_of "$dest")\"" ] || { why="$dest changed after it was installed"; return 1; }
+  # A file that can't be hashed is an error, never an unmanaged or a matching binary.
+  binary_sha=$(sha256_of "$dest") || exit 1
+  [ "$(record_line binary_sha256)" = "\"$binary_sha\"" ] || { why="$dest changed after it was installed"; return 1; }
 }
 
 # Sets dest and record from the canonical install directory and refuses anything this installer
@@ -268,10 +285,16 @@ shown_url() {
   esac
 }
 
-# The sha256 of the binary and of the record, or `absent`, as one line.
+# The sha256 of the binary and of the record, or `absent`, as one line; returns 1 if either can't
+# be hashed.
 install_state() {
   for path in "$dest" "$record"; do
-    if [ -e "$path" ]; then printf '%s ' "$(sha256_of "$path")"; else printf 'absent '; fi
+    if [ -e "$path" ]; then
+      state_hash=$(sha256_of "$path") || return 1
+      printf '%s ' "$state_hash"
+    else
+      printf 'absent '
+    fi
   done
 }
 
@@ -299,7 +322,7 @@ bin_dir=$HOME/.local/bin
 seen='absent absent '
 if [ -d "$bin_dir" ]; then
   check_destination "$bin_dir"
-  seen=$(install_state)
+  seen=$(install_state) || exit 1
 fi
 
 asset=loadout-$target.tar.gz
@@ -323,7 +346,7 @@ want=$(LC_ALL=C sed -n '1s/^\([0-9a-f]\{64\}\)  .*/\1/p' "$tmp/$asset.sha256")
 printf '%s  %s\n' "$want" "$asset" >"$tmp/expected.sha256"
 cmp -s "$tmp/expected.sha256" "$tmp/$asset.sha256" ||
   die "$asset.sha256 is not exactly one '<sha256>  $asset' line"
-got=$(sha256_of "$tmp/$asset")
+got=$(sha256_of "$tmp/$asset") || exit 1
 [ "$got" = "$want" ] || die "checksum mismatch for $asset: expected $want, got $got"
 say "verified sha256 $got"
 
@@ -359,12 +382,13 @@ check_destination "$bin_dir"
 # Another install may have finished while this one downloaded, so check again under the lock.
 lock_install "$canon_dir"
 check_destination "$bin_dir"
-[ "$(install_state)" = "$seen" ] ||
+now=$(install_state) || exit 1
+[ "$now" = "$seen" ] ||
   die "$dest or $record changed while this install was downloading, so nothing was replaced. Run the installer again"
 
 staged=$(mktemp "$canon_dir/.loadout.new.XXXXXX") || die "could not create a staging file in $canon_dir"
 cat "$new" >"$staged" && chmod 755 "$staged" || die "could not write $staged"
-staged_sha=$(sha256_of "$staged")
+staged_sha=$(sha256_of "$staged") || exit 1
 staged_record=$(mktemp "$canon_dir/.loadout.install.toml.new.XXXXXX") ||
   die "could not create a staging file in $canon_dir"
 {
