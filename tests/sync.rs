@@ -148,24 +148,36 @@ fn a_clone_is_up_to_date_and_then_fast_forwards_to_a_new_remote_commit() {
     assert_eq!(fs::read_to_string(clone.join("notes")).unwrap(), "new\n");
 }
 
+/// A password, or a token in the user name of an HTTP(S) URL, is refused before git runs: no
+/// clone, no temporary folder, nothing but the lock, and the secret appears in no message.
 #[test]
-fn a_url_with_a_password_is_refused_before_anything_is_written() {
-    let scratch = Scratch::new();
-    let lock = state::lock(&scratch.context).unwrap();
-    let error = sync::clone(
-        "https://user:secret@example.invalid/loadout.git",
-        &scratch.context,
-        &lock,
-    )
-    .unwrap_err();
-    assert!(matches!(error, Error::Password), "{error}");
-    assert!(!error.to_string().contains("secret"), "{error}");
-    let left: Vec<_> = fs::read_dir(&scratch.context.state)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name != "lock")
-        .collect();
-    assert!(left.is_empty(), "nothing but the lock may exist: {left:?}");
+fn a_url_carrying_a_credential_is_refused_before_anything_is_written() {
+    for url in [
+        "https://user:SENTINELsecret@example.invalid/loadout.git",
+        "https://ghp_SENTINELtoken@example.invalid/loadout.git",
+        "http://SENTINELtoken@example.invalid/loadout.git",
+    ] {
+        let scratch = Scratch::new();
+        let lock = state::lock(&scratch.context).unwrap();
+        let error = sync::clone(url, &scratch.context, &lock).unwrap_err();
+        assert!(matches!(error, Error::Credential), "{url}: {error}");
+        for shown in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!shown.contains("SENTINEL"), "{url}: {shown}");
+        }
+        let left: Vec<_> = fs::read_dir(&scratch.context.state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "lock")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{url}: nothing but the lock may exist: {left:?}"
+        );
+    }
 }
 
 #[test]

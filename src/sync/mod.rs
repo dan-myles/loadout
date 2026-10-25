@@ -5,7 +5,8 @@
 //! The clone lives at `<state>/loadout`. `clone` and `fetch` take the state lock by reference,
 //! so the checkout can't move while another run reads it; the caller then hands that same lock
 //! to `apply::run_under_lock`. No credential is captured, stored, or passed: a URL with a
-//! password is refused, and every URL loadout shows has its userinfo hidden.
+//! password, or any user name in an HTTP(S) URL, is refused before git runs, and every URL
+//! loadout shows has its userinfo hidden.
 
 pub mod background;
 mod git;
@@ -33,9 +34,9 @@ pub enum Error {
     #[error("git is not on PATH; install git and try again")]
     NoGit,
     #[error(
-        "the URL carries a password; loadout stores no credential, so give git a credential helper or an SSH key instead"
+        "the URL carries a credential (a password, or a user name in an HTTP(S) URL, which is usually a token); loadout stores no credential, so give git a credential helper or an SSH key instead"
     )]
-    Password,
+    Credential,
     #[error("{path} already exists, and loadout only clones into an empty place")]
     Exists { path: PathBuf },
     #[error("there is no loadout clone at {path}; run `loadout init <URL>` first")]
@@ -133,8 +134,8 @@ pub fn checkout(context: &Context) -> PathBuf {
 /// user; nothing it is given is stored by loadout.
 pub fn clone(url: &str, context: &Context, lock: &state::Lock) -> Result<(), Error> {
     lock.check(context)?;
-    if git::has_password(url) {
-        return Err(Error::Password);
+    if git::has_credential(url) {
+        return Err(Error::Credential);
     }
     let state = canonical_state(context)?;
     let destination = state.join("loadout");

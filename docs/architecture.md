@@ -1756,10 +1756,12 @@ Automatic updates are required, so they are on by default.
   doesn't fast-forward (the clone is ahead or diverged), nothing is applied and it exits 4. The
   clone's branch and working tree are left as they were; a block found only after the fetch
   (ahead, diverged) has updated the clone's remote-tracking refs, never its branch.
-  - Every git call is an argv array with `--git-dir`/`--work-tree` named, hooks pointed at a path
-    loadout never creates, no fsmonitor, no submodule recursion, and no `ext::` transport. Local
-    reads use the bounded query path (section 7). A URL with a password is refused; shown URLs have
-    their userinfo hidden.
+  - Every git call is an argv array with `--git-dir`/`--work-tree` named, no inherited git
+    redirection variable (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_CONFIG_PARAMETERS`, ...), hooks pointed
+    at a path loadout never creates, no fsmonitor, no submodule recursion, and no `ext::`
+    transport. Local reads use the bounded query path (section 7). A URL carrying a credential (a
+    password, or any user name in an HTTP(S) URL, usually a token) is refused before git runs; an
+    SSH user name is kept. Shown URLs have their userinfo hidden.
   - `update --loadout DIR` applies DIR as it is, after printing "not fetched": loadout never
     fetches or changes a checkout it doesn't manage. `--background` refuses `--loadout`.
 - `loadout update --background` is the scheduled job's command. It is the supervisor

@@ -204,10 +204,24 @@ pub(super) fn failed(args: &[&str], answer: &Answer) -> Error {
     }
 }
 
-/// A clone URL with a password in it. Loadout stores no credential, so it never takes one on
-/// the command line, where it would land in the clone's config.
-pub(super) fn has_password(url: &str) -> bool {
-    userinfo(url).is_some_and(|userinfo| userinfo.contains(':'))
+/// A clone URL that carries a credential: a password in any URL, or any user name at all in an
+/// `http(s)://` or `ftp(s)://` URL, where the "user name" is usually a token. Loadout stores no
+/// credential, so it never takes one on the command line, where it would land in the clone's
+/// config. An SSH user name (`ssh://git@host/...`, `git@host:path`) is not a credential and is
+/// kept.
+pub(super) fn has_credential(url: &str) -> bool {
+    let Some(userinfo) = userinfo(url) else {
+        return false;
+    };
+    if userinfo.contains(':') {
+        return true;
+    }
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ftp" | "ftps"
+        )
+    })
 }
 
 /// The URL as loadout shows it: any userinfo of a `scheme://` URL (a token can be the user
@@ -261,16 +275,29 @@ mod tests {
 
     #[test]
     fn a_password_in_the_url_is_found_in_every_url_form() {
-        assert!(has_password("https://user:secret@example.com/repo.git"));
-        assert!(has_password("https://user:secret@example.com"));
-        assert!(has_password("ssh://git:pw@example.com:22/repo.git"));
-        assert!(!has_password("host:path/with:at@sign"));
-        assert!(!has_password("https://example.com/repo.git"));
-        assert!(!has_password("https://token@example.com/repo.git"));
-        assert!(!has_password("git@github.com:dan-myles/loadout.git"));
-        assert!(!has_password("file:///tmp/remote.git"));
-        assert!(!has_password("/tmp/remote.git"));
-        assert!(!has_password("https://example.com/a:b@c"));
+        for credential in [
+            "https://user:secret@example.com/repo.git",
+            "https://user:secret@example.com",
+            "ssh://git:pw@example.com:22/repo.git",
+            "https://ghp_SENTINELtoken@github.com/u/r.git",
+            "HTTPS://token@example.com/repo.git",
+            "http://x-access-token@example.com/r.git",
+            "https://@example.com/r.git",
+            "ftp://user@example.com/r.git",
+        ] {
+            assert!(has_credential(credential), "{credential}");
+        }
+        for plain in [
+            "host:path/with:at@sign",
+            "https://example.com/repo.git",
+            "ssh://git@example.com/repo.git",
+            "git@github.com:dan-myles/loadout.git",
+            "file:///tmp/remote.git",
+            "/tmp/remote.git",
+            "https://example.com/a:b@c",
+        ] {
+            assert!(!has_credential(plain), "{plain}");
+        }
     }
 
     #[test]
