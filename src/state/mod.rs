@@ -393,37 +393,43 @@ pub fn write_private(context: &Context, file: Private, bytes: &[u8]) -> Result<P
     Ok(path)
 }
 
+/// The folder `file` lives in, checked like every internal folder: each part a real folder, not
+/// a link, resolving inside the canonical state dir. `None` when it, or the state dir, doesn't
+/// exist.
+fn private_dir(context: &Context, file: Private) -> Result<Option<PathBuf>, Error> {
+    let root = match context.state.canonicalize() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(disk::io("resolve", &context.state)(error)),
+        Ok(root) => root,
+    };
+    let (dirs, _) = file.parts();
+    match disk::internal_dir(&root, dirs, false) {
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        other => other.map(Some),
+    }
+}
+
 /// Reads one of the background update's files: `None` when it, or the state dir, doesn't exist.
-/// It must be a regular file that resolves inside the state dir; a link or anything else
-/// planted there is refused, never followed.
+/// It must be a regular file that resolves inside the state dir, in folders that are real
+/// folders there; a link or anything else planted there is refused, never followed.
 pub fn read_private(context: &Context, file: Private) -> Result<Option<Vec<u8>>, Error> {
-    if fs::symlink_metadata(&context.state).is_err() {
+    let Some(dir) = private_dir(context, file)? else {
         return Ok(None);
-    }
-    let (dirs, name) = file.parts();
-    let mut dir = context.state.clone();
-    for part in dirs {
-        dir.push(part);
-        match fs::symlink_metadata(&dir) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(disk::io("inspect", &dir)(error)),
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(Error::Invalid {
-                    path: dir,
-                    message: "must be a real folder inside the state dir, not a link or a file"
-                        .to_owned(),
-                });
-            }
-            Ok(_) => {}
-        }
-    }
+    };
+    let (_, name) = file.parts();
     disk::read_internal(&dir.join(name), &context.state)
 }
 
-/// Removes one of the background update's files, if it is there. Only a regular file is
-/// removed; anything else in its place is refused and left alone.
+/// Removes one of the background update's files, if it is there. Its folders must pass the same
+/// checks as for a read, so a linked folder can't point the removal outside the state dir, and
+/// only a regular file is removed; a link or anything else in its place is refused and left
+/// alone.
 pub fn remove_private(context: &Context, file: Private) -> Result<(), Error> {
-    let path = file.path(context);
+    let Some(dir) = private_dir(context, file)? else {
+        return Ok(());
+    };
+    let (_, name) = file.parts();
+    let path = dir.join(name);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(disk::io("inspect", &path)(error)),
@@ -838,5 +844,55 @@ mod tests {
         assert!(read_private(&context, Private::Supervisor).is_err());
         assert!(write_private(&context, Private::Supervisor, b"{}").is_err());
         assert!(!outside.join("supervisor.json").exists());
+    }
+
+    /// A linked `background` folder that leads outside the state dir is refused before anything
+    /// is removed, and so is a dangling link, as the folder or as the file; the outside file
+    /// keeps every byte and every link stays where it was.
+    #[cfg(unix)]
+    #[test]
+    fn removal_never_follows_a_linked_or_dangling_folder_or_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let context = scratch_context(&dir.path().join("state"));
+        fs::create_dir_all(&context.state).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("last-run.json"), "SENTINEL").unwrap();
+        let background = context.state.join("background");
+
+        symlink(&outside, &background).unwrap();
+        assert!(remove_private(&context, Private::LastRun).is_err());
+        assert_eq!(
+            fs::read(outside.join("last-run.json")).unwrap(),
+            b"SENTINEL"
+        );
+        fs::remove_file(&background).unwrap();
+
+        symlink(dir.path().join("missing"), &background).unwrap();
+        assert!(remove_private(&context, Private::LastRun).is_err());
+        assert!(fs::symlink_metadata(&background).is_ok(), "the link stays");
+        fs::remove_file(&background).unwrap();
+
+        fs::create_dir(&background).unwrap();
+        let leaf = Private::LastRun.path(&context);
+        symlink(dir.path().join("missing"), &leaf).unwrap();
+        assert!(remove_private(&context, Private::LastRun).is_err());
+        assert!(
+            fs::symlink_metadata(&leaf).is_ok(),
+            "the dangling link stays"
+        );
+        fs::remove_file(&leaf).unwrap();
+
+        write_private(&context, Private::LastRun, b"{}").unwrap();
+        remove_private(&context, Private::LastRun).unwrap();
+        assert!(
+            fs::symlink_metadata(&leaf).is_err(),
+            "a real file is removed"
+        );
+        assert_eq!(
+            fs::read(outside.join("last-run.json")).unwrap(),
+            b"SENTINEL"
+        );
     }
 }
