@@ -23,7 +23,7 @@ toml = "1.1"
 toml_edit = "0.25"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 loadout-winproc = { path = "crates/loadout-winproc" }

@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::platform::Os;
+use crate::process::{Containment, Supervised};
 
 pub const HOME_OVERRIDE: &str = "LOADOUT_HOME";
 pub const STATE_OVERRIDE: &str = "LOADOUT_STATE_DIR";
@@ -35,6 +37,9 @@ pub struct Context {
     pub xdg_data: PathBuf,
     pub state: PathBuf,
     pub agent_dirs: BTreeMap<&'static str, PathBuf>,
+    /// How this run's manager queries and installs are contained. `OwnGroup` (the foreground)
+    /// unless this process is a supervised background worker; see [`Context::supervised`].
+    pub containment: Containment,
 }
 
 impl Context {
@@ -98,7 +103,20 @@ impl Context {
             xdg_data,
             state,
             agent_dirs,
+            containment: Containment::OwnGroup,
         })
+    }
+
+    /// The same context for a background worker, given the result of its successful
+    /// `process::handshake`: its queries and installs stay in the group (Unix) or nest in the
+    /// job (Windows) it was started in, and a cancelled run starts no more of them. The
+    /// handshake is a cooperative-startup check, not proof of which supervisor started it.
+    #[must_use]
+    pub fn supervised(self, by: Arc<Supervised>) -> Self {
+        Self {
+            containment: Containment::Inherited(by),
+            ..self
+        }
     }
 
     pub fn expand(&self, path: &str) -> Option<PathBuf> {

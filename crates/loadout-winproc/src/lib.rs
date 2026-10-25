@@ -1,25 +1,47 @@
-//! The one Windows operation loadout needs that neither std nor `process-wrap`'s safe API
-//! offers: resume a child it created with `CREATE_SUSPENDED`, after the child was placed in a job
-//! object. This crate is loadout's only `unsafe` code. It owns every handle it opens (RAII
-//! through `windows::core::Owned`), never takes a caller's word that the child is suspended,
-//! and resumes nothing until it has found exactly one thread of that child and opened it, and
-//! nothing once the caller's deadline has passed.
+//! The Windows operations loadout needs that neither std nor `process-wrap`'s safe API offers:
+//!
+//! - resume a child it created with `CREATE_SUSPENDED`, after the child was placed in a job
+//!   object (U7 queries, and the background worker);
+//! - a job object of its own whose processes all die when its last handle closes, with
+//!   breakaway not allowed, and a count of the processes still in it (the background
+//!   supervisor, U8);
+//! - whether the current process is in any job, whether its standard input is a pipe, and a
+//!   32-byte nonce from the system RNG (the background worker's handshake, U8). These are
+//!   cooperative-startup checks only: none of them proves which job or which supervisor.
+//!
+//! This crate is loadout's only `unsafe` code. It owns every handle it opens (RAII through
+//! `windows::core::Owned`). It can't prove a child is suspended: its one-thread check only
+//! rules out a child that already runs several threads, and the caller's own
+//! `CREATE_SUSPENDED` is what keeps the child from running. `Prepared::resume_before` then
+//! resumes nothing unless it found exactly one thread of that child and opened it, never once
+//! the caller's deadline has passed, and reports an error unless the thread had been suspended
+//! exactly once.
 #![cfg(windows)]
 
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::time::Instant;
 
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+use windows::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
+};
 pub use windows::Win32::System::Threading::CREATE_SUSPENDED;
 use windows::Win32::System::Threading::{
-    GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetProcessIdOfThread, OpenThread, ResumeThread,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
-use windows::core::{HRESULT, Owned};
+use windows::core::{BOOL, HRESULT, Owned, PCWSTR};
 
 /// The child's only thread, found and opened for resuming, not yet resumed.
 ///
@@ -100,6 +122,199 @@ impl Prepared {
             ))),
         }
     }
+}
+
+/// A job object loadout created and owns. Its only limit is kill-on-close: when the last
+/// handle closes (this is dropped, or the owning process dies), every process in it is
+/// terminated. Breakaway is not allowed, so a child of a member can't leave it. Processes a
+/// member places in jobs of their own (U7 queries) are in nested jobs inside this one, and
+/// ending this job ends them.
+#[derive(Debug)]
+pub struct Job {
+    handle: Owned<HANDLE>,
+}
+
+impl Job {
+    /// Creates an unnamed job with kill-on-close set.
+    ///
+    /// # Errors
+    ///
+    /// The job can't be created, or its limit can't be set (then the new job is closed).
+    pub fn new() -> io::Result<Job> {
+        // SAFETY: CreateJobObjectW reads no pointer here (default security, no name) and only
+        // creates a new handle.
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+        // SAFETY: `handle` came from a successful call and nothing else holds it, so `Owned` may
+        // close it exactly once, when it drops.
+        let handle = unsafe { Owned::new(handle) };
+        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..JOBOBJECT_BASIC_LIMIT_INFORMATION::default()
+            },
+            ..JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default()
+        };
+        let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            .map_err(io::Error::other)?;
+        // SAFETY: `handle` is a live job handle; `info` is a correctly sized, initialized
+        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION that outlives the call, and `size` is its size.
+        unsafe {
+            SetInformationJobObject(
+                *handle,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                size,
+            )
+        }?;
+        Ok(Job { handle })
+    }
+
+    /// Places a child loadout created suspended in this job, and confirms it is a member.
+    ///
+    /// The child must still have exactly one thread, as a process created suspended does. That
+    /// check alone doesn't prove suspension: a running process with one thread can't be told
+    /// apart here. The caller's own `CREATE_SUSPENDED` is what establishes that nothing the child
+    /// could have started exists outside the job, and the resume that follows ([`prepare`])
+    /// checks that the thread was suspended exactly once.
+    ///
+    /// # Errors
+    ///
+    /// The child has exited or already runs several threads, or the assignment fails (for
+    /// example when the caller's own job forbids nesting): the child is then not in this job.
+    /// Or the assignment succeeded but the membership check after it failed or said no: the
+    /// child **may** be in this job. In every error case the caller must stop and reap the child
+    /// itself; dropping this job also ends it if it was assigned.
+    pub fn assign(&self, child: &Child) -> io::Result<()> {
+        only_thread(child.id())?;
+        let process = HANDLE(child.as_raw_handle());
+        // SAFETY: `self.handle` is a live job handle and `process` is the child's process
+        // handle, which `child` owns and keeps open for the duration of the call.
+        unsafe { AssignProcessToJobObject(*self.handle, process) }?;
+        if self.contains(child)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "process {} is not in loadout's job after it was assigned",
+                child.id()
+            )))
+        }
+    }
+
+    /// Whether `child` is in this job (directly or in a job nested inside it).
+    ///
+    /// # Errors
+    ///
+    /// The membership query fails.
+    pub fn contains(&self, child: &Child) -> io::Result<bool> {
+        let mut member = BOOL(0);
+        let process = HANDLE(child.as_raw_handle());
+        // SAFETY: `process` is kept open by `child`, `self.handle` is a live job handle, and
+        // `member` is a writable BOOL that outlives the call.
+        unsafe { IsProcessInJob(process, Some(*self.handle), &raw mut member) }?;
+        Ok(member.as_bool())
+    }
+
+    /// Terminates every process in the job, nested jobs included.
+    ///
+    /// # Errors
+    ///
+    /// `TerminateJobObject` fails. Its result is never discarded.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: `self.handle` is a live job handle, opened with all access by CreateJobObjectW.
+        unsafe { TerminateJobObject(*self.handle, exit_code) }?;
+        Ok(())
+    }
+
+    /// How many processes are in the job now, nested jobs included. Zero is the confirmation
+    /// that nothing loadout started through this job is still running.
+    ///
+    /// # Errors
+    ///
+    /// The accounting query fails.
+    pub fn active_processes(&self) -> io::Result<u32> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let size = u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+            .map_err(io::Error::other)?;
+        // SAFETY: `self.handle` is a live job handle; `info` is a writable, correctly sized
+        // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION that outlives the call, and `size` is its size.
+        unsafe {
+            QueryInformationJobObject(
+                Some(*self.handle),
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size,
+                None,
+            )
+        }?;
+        Ok(info.ActiveProcesses)
+    }
+}
+
+/// Whether the current process is in any job.
+///
+/// # Errors
+///
+/// The membership query fails.
+pub fn current_process_in_job() -> io::Result<bool> {
+    let mut member = BOOL(0);
+    // SAFETY: GetCurrentProcess takes nothing and returns a pseudo-handle that needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: `process` is the current process's pseudo-handle, valid for the whole call; no
+    // job handle is given (any job); `member` is a writable BOOL that outlives the call.
+    unsafe { IsProcessInJob(process, None, &raw mut member) }?;
+    Ok(member.as_bool())
+}
+
+/// 32 bytes from the system's preferred random number generator: the worker handshake's nonce.
+/// The size is fixed, so the generated wrapper's length conversion can't fail.
+///
+/// # Errors
+///
+/// `BCryptGenRandom` returns a failure status.
+pub fn random_nonce() -> io::Result<[u8; 32]> {
+    let mut bytes = [0_u8; 32];
+    // SAFETY: `bytes` is a writable 32-byte array for the duration of the call, and no algorithm
+    // handle with BCRYPT_USE_SYSTEM_PREFERRED_RNG is the documented use of the system RNG.
+    let status = unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status.0 >= 0 {
+        Ok(bytes)
+    } else {
+        Err(io::Error::other(format!(
+            "BCryptGenRandom failed with status {:#010x}",
+            status.0
+        )))
+    }
+}
+
+/// Whether this process's standard input is a pipe (`FILE_TYPE_PIPE`), as a supervisor's
+/// control pipe is. A console, a regular file, or the `NUL` device is not.
+///
+/// The handle is only borrowed from std's standard input for one `GetFileType` call; it is
+/// never closed or duplicated.
+///
+/// # Errors
+///
+/// The process has no standard input handle (null or `INVALID_HANDLE_VALUE`), or `GetFileType`
+/// fails (`FILE_TYPE_UNKNOWN` with an error set).
+pub fn stdin_is_pipe() -> io::Result<bool> {
+    let raw = io::stdin().as_raw_handle();
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this process has no standard input handle",
+        ));
+    }
+    // SAFETY: `raw` is this process's standard input handle, checked non-null and not
+    // INVALID_HANDLE_VALUE. It is borrowed for this call only and not closed; GetFileType reads
+    // no pointer.
+    let kind = unsafe { GetFileType(HANDLE(raw)) };
+    if kind == FILE_TYPE_UNKNOWN {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(0) {
+            return Err(error);
+        }
+    }
+    Ok(kind == FILE_TYPE_PIPE)
 }
 
 /// The id of the single thread the process owns, from one thread snapshot. Zero threads (the
@@ -248,6 +463,67 @@ mod tests {
 
     fn resume(child: &Child) -> io::Result<()> {
         prepare(child)?.resume_before(Instant::now() + Duration::from_secs(60))
+    }
+
+    #[test]
+    fn a_job_holds_a_suspended_child_and_ends_it_when_terminated() {
+        let mut fixture =
+            Fixture::spawn("ping.exe", &["-n", "30", "127.0.0.1"], CREATE_SUSPENDED.0);
+        let job = Job::new().unwrap();
+        job.assign(&fixture.child).unwrap();
+        assert!(job.contains(&fixture.child).unwrap());
+        resume(&fixture.child).unwrap();
+        // At least the child: a console host the system starts for it may be counted too.
+        assert!(job.active_processes().unwrap() >= 1);
+        job.terminate(1).unwrap();
+        assert!(fixture.exit_within(EXIT).unwrap().is_some());
+        let until = Instant::now() + EXIT;
+        while job.active_processes().unwrap() != 0 {
+            assert!(Instant::now() < until, "the job still has processes");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kill-on-close: dropping the last handle ends a running member.
+    #[test]
+    fn dropping_the_job_ends_its_processes() {
+        let mut fixture =
+            Fixture::spawn("ping.exe", &["-n", "30", "127.0.0.1"], CREATE_SUSPENDED.0);
+        let job = Job::new().unwrap();
+        job.assign(&fixture.child).unwrap();
+        resume(&fixture.child).unwrap();
+        assert!(fixture.child.try_wait().unwrap().is_none());
+        drop(job);
+        assert!(fixture.exit_within(EXIT).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_child_that_has_exited_is_not_assigned() {
+        let mut fixture = Fixture::spawn("cmd.exe", &["/d", "/c", "exit 0"], CREATE_SUSPENDED.0);
+        resume(&fixture.child).unwrap();
+        assert!(fixture.exit_within(EXIT).unwrap().is_some());
+        let job = Job::new().unwrap();
+        assert!(job.assign(&fixture.child).is_err());
+        assert_eq!(job.active_processes().unwrap(), 0);
+    }
+
+    #[test]
+    fn job_membership_of_this_process_can_be_asked() {
+        current_process_in_job().unwrap();
+    }
+
+    #[test]
+    fn nonces_differ_between_calls() {
+        assert_ne!(random_nonce().unwrap(), random_nonce().unwrap());
+    }
+
+    /// The test harness's own standard input can be a console, a file, a pipe, or absent, so
+    /// only that the call answers without closing anything is checked here; the refusals and
+    /// the pipe positive run through real worker processes in `tests/background.rs`.
+    #[test]
+    fn the_stdin_type_can_be_asked_twice() {
+        let first = stdin_is_pipe().map_err(|error| error.kind());
+        assert_eq!(first, stdin_is_pipe().map_err(|error| error.kind()));
     }
 
     #[test]

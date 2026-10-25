@@ -7,11 +7,11 @@ use crate::diagnostic::{Check, CheckStatus};
 use crate::machine::Facts;
 use crate::manifest::Manager;
 use crate::platform::Os;
+use crate::process::{self, Containment};
 use crate::resolve::Program;
 
 mod detect;
 mod manager;
-mod process;
 
 use detect::Eligibility;
 use manager::Invocation;
@@ -131,11 +131,13 @@ impl Package {
     }
 }
 
-/// A package `steps` found missing, and the scope its install needs.
+/// A package `steps` found missing, the scope its install needs, and the containment of the
+/// run that found it, which its install and re-checks use too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Missing {
     package: Package,
     scope: Scope,
+    containment: Containment,
 }
 
 impl Missing {
@@ -188,7 +190,7 @@ pub fn steps(
             let state = if context.isolated {
                 State::Blocked(ISOLATED.to_owned())
             } else {
-                state(id, program, facts.os)?
+                state(id, program, facts.os, &context.containment)?
             };
             Ok(Step {
                 program: id.clone(),
@@ -198,7 +200,7 @@ pub fn steps(
         .collect()
 }
 
-fn state(id: &str, program: &Program, os: Os) -> Result<State, Error> {
+fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Result<State, Error> {
     let (manager, package, executable) = match select(program, os, manager::available) {
         Ok(selected) => selected,
         Err(reason) => return Ok(State::Unsupported(reason)),
@@ -215,9 +217,13 @@ fn state(id: &str, program: &Program, os: Os) -> Result<State, Error> {
         executable,
     };
     Ok(
-        match observe(&package).map_err(|detail| detect_error(id, &package, detail))? {
+        match observe(&package, containment).map_err(|detail| detect_error(id, &package, detail))? {
             Observation::Installed => State::Installed(package),
-            Observation::Missing(scope) => State::Missing(Missing { package, scope }),
+            Observation::Missing(scope) => State::Missing(Missing {
+                package,
+                scope,
+                containment: containment.clone(),
+            }),
             Observation::Unsupported(reason) => State::Unsupported(reason),
         },
     )
@@ -230,17 +236,36 @@ enum Observation {
 }
 
 /// The one answer `steps` and `install` both act on: the manager's installed-query, then, for a
-/// missing package, whether and in which scope it can be installed.
-fn observe(package: &Package) -> Result<Observation, String> {
-    if detect::installed(package.manager, &package.executable, &package.id)? {
+/// missing package, whether and in which scope it can be installed. An answer loadout can't
+/// classify cancels a supervised run (see `unclassified`).
+fn observe(package: &Package, containment: &Containment) -> Result<Observation, String> {
+    unclassified(containment, classify(package, containment))
+}
+
+fn classify(package: &Package, containment: &Containment) -> Result<Observation, String> {
+    if detect::installed(containment, package.manager, &package.executable, &package.id)? {
         return Ok(Observation::Installed);
     }
     Ok(
-        match detect::eligibility(package.manager, &package.executable, &package.id)? {
+        match detect::eligibility(containment, package.manager, &package.executable, &package.id)? {
             Eligibility::Scope(scope) => Observation::Missing(scope),
             Eligibility::Unsupported(reason) => Observation::Unsupported(reason),
         },
     )
+}
+
+/// A manager answer `detect` can't classify (an unexpected exit, malformed or unrecognized
+/// output, or a query that failed) is an error, as in the foreground; in a supervised
+/// background run it also cancels the run, so no later query or installer starts. Installed,
+/// missing, and unsupported answers, including the nonzero exits some managers use for
+/// "missing", are classified and never cancel.
+fn unclassified<T>(containment: &Containment, answer: Result<T, String>) -> Result<T, String> {
+    if answer.is_err()
+        && let Some(cancel) = containment.cancel()
+    {
+        cancel.cancel();
+    }
+    answer
 }
 
 fn detect_error(program: &str, package: &Package, detail: String) -> Error {
@@ -357,7 +382,9 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
             )));
         }
     }
-    match observe(package).map_err(|detail| detect_error(program, package, detail))? {
+    match observe(package, &missing.containment)
+        .map_err(|detail| detect_error(program, package, detail))?
+    {
         Observation::Installed => return Ok(Installed::Already),
         Observation::Missing(scope) if scope == missing.scope => {}
         Observation::Missing(scope) => {
@@ -388,7 +415,7 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
         invocation
     };
     let command = invocation.display();
-    let output = process::install(&invocation).map_err(|source| Error::Spawn {
+    let output = process::install(&invocation, &missing.containment).map_err(|source| Error::Spawn {
         program: program.to_owned(),
         command: command.clone(),
         source,
@@ -404,11 +431,24 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
             output: output.tail(),
         });
     }
-    match detect::installed(manager, &package.executable, &package.id) {
+    verified(program, missing)
+}
+
+/// The installed-query after a successful install. An answer that can't be classified cancels a
+/// supervised run, as in `observe`.
+fn verified(program: &str, missing: &Missing) -> Result<Installed, Error> {
+    let package = &missing.package;
+    let answer = detect::installed(
+        &missing.containment,
+        package.manager,
+        &package.executable,
+        &package.id,
+    );
+    match unclassified(&missing.containment, answer) {
         Ok(true) => Ok(Installed::Now),
         Ok(false) => Err(Error::NotInstalled {
             program: program.to_owned(),
-            manager: manager.id(),
+            manager: package.manager.id(),
             package: package.id.clone(),
         }),
         Err(detail) => Err(detect_error(program, package, detail)),
@@ -497,7 +537,7 @@ pub fn checks(context: &Context) -> Vec<Check> {
         checks.push(elevation(&system));
     }
     if !context.isolated && user.contains(&Manager::Flatpak.id()) {
-        checks.push(flatpak_remotes());
+        checks.push(flatpak_remotes(&context.containment));
     }
     checks
 }
@@ -527,12 +567,12 @@ fn elevation(system: &[&str]) -> Check {
     }
 }
 
-fn flatpak_remotes() -> Check {
+fn flatpak_remotes(containment: &Containment) -> Check {
     let Some(flatpak) = manager::available(Manager::Flatpak) else {
         return Check::new("flatpak", CheckStatus::Warn, "flatpak is no longer on PATH");
     };
     let invocation = Invocation::new(&flatpak, ["remotes", "--user", "--columns=name"]);
-    match process::query(&invocation) {
+    match process::query(&invocation, containment) {
         Ok(output) if output.code == Some(0) => {
             let remotes: Vec<&str> = output
                 .stdout
@@ -703,6 +743,328 @@ mod tests {
         }
     }
 
+    /// Manager answers that can't be classified cancel a supervised run at the layer that
+    /// knows the answer, so nothing starts after them; classified answers never cancel. The
+    /// managers are scripts given by path, so no PATH or real manager is involved.
+    #[cfg(unix)]
+    mod cancellation {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use super::super::*;
+        use crate::process::owned::{Faults, Owned, Record};
+
+        /// A fake manager: records each call in `calls`, then prints `stdout` and exits `code`.
+        fn manager(dir: &Path, name: &str, stdout: &str, code: i32) -> PathBuf {
+            let path = dir.join(name);
+            let calls = dir.join(format!("{name}.calls"));
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nprintf '%s' '{stdout}'\nexit {code}\n",
+                calls.display()
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        fn package(manager: Manager, executable: PathBuf) -> Package {
+            Package {
+                manager,
+                id: "tool".to_owned(),
+                executable,
+            }
+        }
+
+        #[test]
+        fn an_unexpected_exit_cancels_and_no_later_query_starts() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let broken = package(Manager::Cargo, manager(dir.path(), "broken", "", 2));
+            assert!(observe(&broken, &containment).is_err());
+            assert!(containment.is_cancelled());
+
+            let healthy = package(Manager::Cargo, manager(dir.path(), "healthy", "", 0));
+            assert!(observe(&healthy, &containment).is_err());
+            assert!(
+                !dir.path().join("healthy.calls").exists(),
+                "a cancelled run must start no query"
+            );
+        }
+
+        #[test]
+        fn malformed_json_cancels() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let npm = package(Manager::Npm, manager(dir.path(), "npm", "{not json", 0));
+            assert!(observe(&npm, &containment).is_err());
+            assert!(containment.is_cancelled());
+        }
+
+        #[test]
+        fn an_unclassified_answer_after_an_install_cancels() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let missing = Missing {
+                package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 2)),
+                scope: Scope::User,
+                containment: containment.clone(),
+            };
+            let error = verified("tool", &missing).unwrap_err();
+            assert!(matches!(error, Error::Detect { .. }), "{error}");
+            assert!(containment.is_cancelled());
+        }
+
+        #[test]
+        fn a_classified_missing_answer_does_not_cancel() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let cargo = package(Manager::Cargo, manager(dir.path(), "cargo", "", 0));
+            assert!(matches!(
+                observe(&cargo, &containment),
+                Ok(Observation::Missing(Scope::User))
+            ));
+            let npm = package(
+                Manager::Npm,
+                manager(dir.path(), "npm", r#"{"name":"lib","dependencies":{}}"#, 0),
+            );
+            assert!(matches!(
+                observe(&npm, &containment),
+                Ok(Observation::Missing(Scope::User))
+            ));
+            assert!(!containment.is_cancelled());
+        }
+
+        /// A fake manager from a shell body, given by path.
+        fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        #[test]
+        fn a_malformed_but_complete_answer_cancels() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let npm = package(
+                Manager::Npm,
+                manager(dir.path(), "npm", r#"{"dependencies":{}}"#, 0),
+            );
+            assert!(observe(&npm, &containment).is_err());
+            assert!(containment.is_cancelled());
+        }
+
+        /// pacman's documented "missing" answer is exit 1 with "was not found": a nonzero exit
+        /// that is a classification, not a failure.
+        #[test]
+        fn a_documented_nonzero_missing_answer_does_not_cancel() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let pacman = package(
+                Manager::Pacman,
+                script(
+                    dir.path(),
+                    "pacman",
+                    "echo \"error: package 'tool' was not found\" >&2\nexit 1\n",
+                ),
+            );
+            assert!(matches!(
+                observe(&pacman, &containment),
+                Ok(Observation::Missing(Scope::System))
+            ));
+            assert!(!containment.is_cancelled());
+        }
+
+        /// winget answering that no installer applies in either scope is the classified
+        /// `Unsupported`, through the same wrapper `observe` uses.
+        #[test]
+        fn an_unsupported_eligibility_answer_does_not_cancel() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let winget = script(
+                dir.path(),
+                "winget",
+                "printf 'Found X [A.B]\\nInstaller:\\n  No applicable installer found; see logs for more details.\\n  Installer Url: https://x\\n'\n",
+            );
+            let answer = unclassified(
+                &containment,
+                detect::eligibility(&containment, Manager::Winget, &winget, "A.B"),
+            );
+            assert!(matches!(answer, Ok(Eligibility::Unsupported(_))), "{answer:?}");
+            assert!(!containment.is_cancelled());
+        }
+
+        /// The public producer flow, in a child process whose PATH holds only a fake `cargo`:
+        /// `steps` finds two missing programs, the re-check before the first install gets an
+        /// unexpected exit, and then the second install starts neither a query nor an installer.
+        #[test]
+        #[ignore = "run in a child process by the tests below"]
+        fn producer_flow() {
+            let Some(dir) = std::env::var_os("LOADOUT_TEST_PRODUCER") else {
+                return;
+            };
+            if std::env::var_os("LOADOUT_TEST_PRODUCER_HOLD").is_some() {
+                // Held live for a control, doing nothing else; it ends by itself as a fallback.
+                std::thread::sleep(Duration::from_secs(60));
+                return;
+            }
+            let dir = PathBuf::from(dir);
+            let os = Os::current().unwrap();
+            let home = dir.join("home");
+            let context =
+                Context::resolve(os, |name| std::env::var_os(name), Some(home.clone())).unwrap();
+            let context = Context {
+                containment: Containment::inherited_for_tests(),
+                ..context
+            };
+            let facts = Facts {
+                name: "box".to_owned(),
+                os,
+                distro: None,
+                arch: crate::platform::Arch::X86_64,
+                home,
+            };
+            let programs = BTreeMap::from([
+                ("a".to_owned(), super::program(&[(Manager::Cargo, "a")])),
+                ("b".to_owned(), super::program(&[(Manager::Cargo, "b")])),
+            ]);
+            let found = steps(&programs, &facts, &context).unwrap();
+            assert!(
+                found.iter().all(|step| matches!(step.state, State::Missing(_))),
+                "{found:?}"
+            );
+            std::fs::write(dir.join("fail"), "").unwrap();
+            let first = install(&found[0], false).unwrap_err();
+            assert!(matches!(first, Error::Detect { .. }), "{first}");
+            assert!(context.containment.is_cancelled());
+            std::fs::remove_file(dir.join("fail")).unwrap();
+            let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+            let second = install(&found[1], false).unwrap_err();
+            assert!(matches!(second, Error::Detect { .. }), "{second}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("calls")).unwrap(),
+                calls,
+                "no query or installer may start after the cancel"
+            );
+            assert!(!dir.join("installed-a").exists() && !dir.join("installed-b").exists());
+        }
+
+        /// A fake `cargo` in its own `bin`: it records each call in `calls`, answers the
+        /// installed-list query (exit 2 while `fail` exists), and an install writes
+        /// `installed-<name>`.
+        fn fake_cargo(dir: &Path) -> PathBuf {
+            let bin = dir.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let root = dir.display().to_string();
+            script(
+                &bin,
+                "cargo",
+                &format!(
+                    "echo \"$*\" >> '{root}/calls'\n\
+                     if [ \"$1\" = install ] && [ \"$2\" = --list ]; then\n\
+                     if [ -e '{root}/fail' ]; then exit 2; fi\nexit 0\nfi\n\
+                     if [ \"$1\" = install ]; then : > \"{root}/installed-$2\"; exit 0; fi\nexit 64\n"
+                ),
+            );
+            bin
+        }
+
+        /// `producer_flow` in a child process with only `bin` on its PATH, owned from the
+        /// moment it exists. `hold` keeps it live and idle instead, for the wrapper's own
+        /// failure controls.
+        fn producer(dir: &Path, bin: &Path, hold: bool) -> Owned {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "programs::tests::cancellation::producer_flow",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("PATH", bin)
+                .env("LOADOUT_TEST_PRODUCER", dir)
+                .stdin(std::process::Stdio::null());
+            if hold {
+                command.env("LOADOUT_TEST_PRODUCER_HOLD", "1");
+            }
+            Owned::new(command.spawn().unwrap())
+        }
+
+        #[test]
+        fn a_semantic_failure_stops_later_queries_and_installers_through_the_public_api() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = fake_cargo(dir.path());
+            let mut flow = producer(dir.path(), &bin, false);
+            let status = flow
+                .finish_within(Duration::from_secs(60), Duration::from_secs(10))
+                .unwrap_or_else(|detail| panic!("the producer flow did not finish: {detail}"));
+            assert!(status.success(), "the producer flow failed: {status}");
+        }
+
+        /// The wrapper's failure paths, on a producer held live: a failure right after the
+        /// spawn, a first observation that fails before the OS is asked (the child stays
+        /// pinned), and a termination that fails. Each stops the child or reports why it could
+        /// not, within a bound, keeping the first error. The guard's own controls cover a real
+        /// OS error, which on Unix leaves the child alone.
+        #[test]
+        fn the_producer_wrapper_stops_its_child_on_every_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = fake_cargo(dir.path());
+
+            let record = Arc::new(Mutex::new(Record::default()));
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _flow = producer(dir.path(), &bin, true).recording(&record);
+                panic!("injected: failure right after the spawn");
+            }));
+            assert!(failed.is_err());
+            assert!(record.lock().unwrap().exit.is_some(), "the held producer was not stopped");
+
+            let mut flow = producer(dir.path(), &bin, true);
+            flow.inject(Faults {
+                before_poll: 1,
+                ..Faults::default()
+            });
+            let detail = flow
+                .finish_within(Duration::from_secs(60), Duration::from_secs(10))
+                .unwrap_err();
+            assert!(detail.contains("cannot observe the child: injected"), "{detail}");
+            assert!(detail.ends_with("it was stopped"), "{detail}");
+            assert_eq!(flow.kills(), 1);
+
+            let mut flow = producer(dir.path(), &bin, true);
+            flow.inject(Faults {
+                kill: true,
+                ..Faults::default()
+            });
+            let started = Instant::now();
+            let detail = flow
+                .finish_within(Duration::from_millis(500), Duration::from_secs(1))
+                .unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            assert!(detail.contains("did not exit within"), "{detail}");
+            assert!(detail.contains("could not be killed"), "{detail}");
+            assert!(detail.contains("has not exited"), "{detail}");
+            assert!(flow.observe().unwrap().is_none(), "the held producer still runs");
+            flow.inject(Faults::default());
+            assert_eq!(flow.stop(Duration::from_secs(10)), Ok(()));
+        }
+
+        #[test]
+        fn the_foreground_has_no_run_to_cancel() {
+            let dir = tempfile::tempdir().unwrap();
+            let broken = package(Manager::Cargo, manager(dir.path(), "broken", "", 2));
+            let foreground = Containment::OwnGroup;
+            assert!(observe(&broken, &foreground).is_err());
+            assert!(!foreground.is_cancelled());
+            let again = package(Manager::Cargo, manager(dir.path(), "again", "", 0));
+            assert!(observe(&again, &foreground).is_ok());
+            assert!(dir.path().join("again.calls").exists());
+        }
+    }
+
     #[test]
     fn install_rechecks_a_step_against_path_before_anything_runs() {
         let step = Step {
@@ -714,6 +1076,7 @@ mod tests {
                     executable: "/nonexistent/apt-get".into(),
                 },
                 scope: Scope::System,
+                containment: Containment::OwnGroup,
             }),
         };
         assert!(step.needs_elevation());
