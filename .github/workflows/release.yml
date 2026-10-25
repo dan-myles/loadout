@@ -23,6 +23,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes its packaging run; tag and manual runs finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"

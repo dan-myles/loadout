@@ -10,7 +10,7 @@ Runs on pushes to `main`, every pull request, and manual dispatch.
 | Job | Runner | Command |
 |-----|--------|---------|
 | rustfmt | ubuntu-24.04 | `cargo fmt --all --check` |
-| clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --workspace --all-targets -- -D warnings`, then `cargo test --locked --workspace` |
+| clippy and test | ubuntu-24.04, ubuntu-24.04-arm, macos-15 (arm64), macos-15-intel, windows-2025, windows-11-arm | `cargo clippy --locked --workspace --all-targets -- -D warnings`, then `cargo nextest run --locked --workspace --no-fail-fast` and `cargo test --locked --workspace --doc --no-fail-fast` |
 | release packaging tests | ubuntu-24.04, Python 3.8 and 3.12 | `python -m unittest discover -s scripts/release -v` |
 
 `--workspace` also lints and tests `crates/loadout-winproc`, the Windows-only helper that holds
@@ -20,8 +20,21 @@ the workspace's only `unsafe` code; elsewhere it compiles to an empty crate. Wit
 Every job runs `rustup toolchain install --no-self-update`, which installs the exact toolchain
 and components pinned in `rust-toolchain.toml`. Bump that file to move CI and releases to a new
 Rust. `--locked` means a stale
-`Cargo.lock` fails the job instead of being rewritten silently. Only the CI jobs cache Cargo
-downloads and `target/`. Release builds start clean so a poisoned cache can't reach a shipped binary.
+`Cargo.lock` fails the job instead of being rewritten silently.
+
+Only the clippy and test jobs cache, through `Swatinem/rust-cache`: the Cargo registry and the
+compiled dependencies, keyed by runner OS and architecture, `rustc -vV`, the `CARGO*`/`RUST*`
+environment, `Cargo.lock` and the manifests. It prunes the workspace crates before saving, so each
+run compiles the checked-out source and runs every test; a cache entry never stands in for a test
+result. Debuginfo is off (`CARGO_PROFILE_DEV_DEBUG=0`), which makes the test binaries quicker to
+link and the cache smaller. `cargo nextest` runs the test binaries concurrently, which `cargo test`
+does one at a time; it skips doctests, so `cargo test --doc` runs them. Release builds start clean
+so a poisoned cache can't reach a shipped binary.
+
+`scripts/ci/check.sh` runs the same gates locally (rustfmt, clippy, tests, release-script tests)
+with the same build settings, keeps going past a failed gate, and prints each gate's exit status
+and the commit it checked. It uses nextest when installed and `cargo test` otherwise. Pass
+`--fresh DIR` to build in a new empty target directory when the result is evidence for a review.
 
 ## Release artifacts (`.github/workflows/release.yml`)
 

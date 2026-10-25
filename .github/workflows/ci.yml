@@ -16,6 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # No debuginfo: the many test binaries link faster and the cache is smaller. Panics still
+  # report file:line, and debug assertions and overflow checks stay on.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 defaults:
   run:
@@ -48,17 +51,22 @@ jobs:
         run: |
           rustup toolchain install --no-self-update
           rustc -vV
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Caches only the registry and compiled dependencies, keyed by runner OS/arch, rustc -vV,
+      # CARGO*/RUST* env, Cargo.lock and manifests. Workspace crates are pruned before saving, so
+      # every run compiles and tests the checked-out source.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+          key: ${{ matrix.os }}
+          cache-bin: "false"
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace --no-fail-fast
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+      # nextest runs the test binaries concurrently instead of one after another; it does not run
+      # doctests, so cargo test --doc covers those.
+      - run: cargo nextest run --locked --workspace --no-fail-fast
+      - run: cargo test --locked --workspace --doc --no-fail-fast
 
   release-scripts:
     name: release packaging tests (Python ${{ matrix.python }})
