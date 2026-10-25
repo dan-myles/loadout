@@ -305,6 +305,7 @@ function Publish-StagedFile($Owned, [string]$Staged, [string]$Destination) {
 # Windows can't overwrite a running executable, but it can rename one, so each existing binary is
 # first moved aside to `.<name>.old.<guid>`. If a later step fails, every completed move is undone
 # in reverse and the record is never touched. The binaries are not replaced as one atomic step.
+# Returns the aside paths this run made; the caller deletes them only once the record is in place.
 function Publish-Binaries($Owned, [object[]]$Pairs) {
     $moves = New-Object Collections.Generic.List[object]
     try {
@@ -338,10 +339,23 @@ function Publish-Binaries($Owned, [object[]]$Pairs) {
         }
         throw "could not put the new binaries in place, and the previous ones could not all be restored; reinstall with install.ps1 ($failure)"
     }
-    # Only this run's own asides; one still running stays, and nothing else is ever deleted.
     foreach ($move in $moves) {
-        if ($move[1] -like '*.old.*') { Remove-Item -LiteralPath $move[1] -Force -ErrorAction SilentlyContinue }
+        if ($move[1] -like '*.old.*') { $move[1] }
     }
+}
+
+# The binaries, then the record, then this run's own asides: exactly the paths Publish-Binaries
+# made. If the record can't be written, those old binaries stay for recovery. An aside that is
+# still running stays too, and no other file is ever deleted.
+function Publish-Install($Owned, [object[]]$Pairs, [string]$StagedRecord, [string]$Record) {
+    $asides = @(Publish-Binaries $Owned $Pairs)
+    try {
+        Publish-StagedFile $Owned $StagedRecord $Record
+    } catch {
+        $kept = if ($asides.Count) { "; the previous binaries are kept as $($asides -join ', ')" } else { '' }
+        throw "the new binaries are in place but $Record could not be written, so self-update will not replace them$kept ($($_.Exception.Message))"
+    }
+    foreach ($aside in $asides) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
 }
 
 # Quotes one argument so CommandLineToArgvW, the MSVC runtime, and Rust's std::env::args all read it
@@ -508,12 +522,7 @@ function Install-Loadout {
         # The launcher first: until the record names it, a run that starts meanwhile finds a launcher
         # of this release beside whichever loadout.exe is in place.
         $pairs = @(@($stagedBackground, $background), @($staged, $dest))
-        Publish-Binaries $owned $pairs
-        try {
-            Publish-StagedFile $owned $stagedRecord $record
-        } catch {
-            throw "installed $dest but could not write $record, so self-update will not replace these binaries ($($_.Exception.Message))"
-        }
+        Publish-Install $owned $pairs $stagedRecord $record
         Say "installed loadout $installedVersion ($target) to $dest, with $background"
 
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
