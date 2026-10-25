@@ -141,8 +141,10 @@ fn not_loaded(answer: &crate::process::Captured) -> bool {
 
 /// How the agent differs from the one `install` would load for this record, if it does: first
 /// the plist on disk, then (outside isolation) the program arguments launchd has loaded, since a
-/// matching plist proves nothing about an agent loaded before it was written. A plist that can't
-/// be read, or a launchd that can't be asked, is an error, never a match.
+/// matching plist proves nothing about an agent loaded before it was written. An agent launchd
+/// doesn't have loaded when its arguments are read is a mismatch, even if an earlier query found
+/// it; a plist that can't be read, or a launchd that can't be asked, is an error. Neither is ever
+/// a match.
 pub(super) fn differs(
     context: &Context,
     exe: &str,
@@ -167,7 +169,7 @@ pub(super) fn differs(
     let answer = query(context, "launchctl", &args).map_err(|error| error.to_string())?;
     if !answer.success() {
         if not_loaded(&answer) {
-            return Ok(None);
+            return Ok(Some(format!("launchd doesn't have {job} loaded")));
         }
         return Err(failed("launchctl", &args, &answer).to_string());
     }

@@ -244,8 +244,8 @@ fn run_query_output(
     )
 }
 
-/// `run_query_output`, read as text, for the tests written against it.
-#[cfg(test)]
+/// `run_query_output`, read as text, for the Unix tests written against it.
+#[cfg(all(test, unix))]
 fn run_query(
     invocation: &Invocation,
     deadline: Duration,
@@ -1340,8 +1340,8 @@ fn settled(
     Ok(std::mem::take(&mut buffer.bytes))
 }
 
-/// `settled`, read as text as `Captured` reads it, for the tests written against it.
-#[cfg(test)]
+/// `settled`, read as text as `Captured` reads it, for the Unix tests written against it.
+#[cfg(all(test, unix))]
 fn validated(
     buffer: &Mutex<Buffer>,
     stream: &'static str,
