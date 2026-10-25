@@ -45,6 +45,11 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
           - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    env:
+      # ring (rustls' crypto) compiles C; the musl targets need a musl C compiler, which cc would
+      # otherwise look for as aarch64-linux-musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,6 +61,9 @@ jobs:
         run: |
           rustup toolchain install --no-self-update
           rustup target add "${{ matrix.target }}"
+      - name: Install the musl C toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build and package
         run: |
           args=(--target "${{ matrix.target }}" --out-dir dist --require-smoke)

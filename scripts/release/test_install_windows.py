@@ -34,12 +34,17 @@ if ($errors.Count) { throw "install.ps1 does not parse: $($errors[0])" }
 foreach ($statement in $ast.EndBlock.Statements) {
     $isFunction = $statement -is [System.Management.Automation.Language.FunctionDefinitionAst]
     $isConstant = $statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-        @('Repo', 'RecordKeys', 'MaxRedirects', 'LoopbackHosts') -contains $statement.Left.VariablePath.UserPath
+        @('Repo', 'RecordKeys', 'BackgroundKeys', 'Binaries', 'MaxRedirects', 'LoopbackHosts') -contains $statement.Left.VariablePath.UserPath
     if ($isFunction -or $isConstant) { . ([ScriptBlock]::Create($statement.Extent.Text)) }
 }
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($call in (Get-Content -LiteralPath $CallsPath -Raw -Encoding UTF8 | ConvertFrom-Json)) {
-    $arguments = @($call.args)
+    # '@owned' stands for the List[string] of owned staging names that Publish-Binaries updates.
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($arg in @($call.args)) {
+        if ($arg -is [string] -and $arg -ceq '@owned') { $list.Add((New-Object System.Collections.Generic.List[string])) } else { $list.Add($arg) }
+    }
+    $arguments = $list.ToArray()
     try {
         $value = & $call.fn @arguments
         if ($value -is [Uri]) { $value = $value.AbsoluteUri }
@@ -104,17 +109,23 @@ def argv_mismatches(directory, results):
 
 
 def zip_calls(directory, zip_paths):
-    # Export-ZipBinary opens its output with CreateNew, so each runtime needs its own output names.
-    return [
-        {"fn": "Export-ZipBinary", "args": [str(zip_path), TARGET, str(Path(directory) / f"out-{index}.exe")]}
-        for index, zip_path in enumerate(zip_paths)
-    ]
+    # Export-ZipBinaries opens each output with CreateNew, so every runtime and case needs its own folder.
+    calls = []
+    for index, zip_path in enumerate(zip_paths):
+        out = Path(directory) / f"out-{index}"
+        out.mkdir(parents=True, exist_ok=True)
+        calls.append({"fn": "Export-ZipBinaries", "args": [str(zip_path), TARGET, str(out)]})
+    return calls
 
 
-def record_text(binary, binary_sha, installer="install.ps1", newline="\n", extra=""):
+def toml_string(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def record_text(binary, binary_sha, installer="install.ps1", newline="\n", extra="", background=None):
     lines = [
         "# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.",
-        "schema = 1",
+        "schema = 2" if background else "schema = 1",
         f'installer = "{installer}"',
         'repository = "dan-myles/loadout"',
         f'source = "https://github.com/dan-myles/loadout/releases/latest/download/loadout-{TARGET}.zip"',
@@ -124,6 +135,9 @@ def record_text(binary, binary_sha, installer="install.ps1", newline="\n", extra
         'binary = "' + binary.replace("\\", "\\\\").replace('"', '\\"') + '"',
         f'binary_sha256 = "{binary_sha}"',
     ]
+    if background:
+        path, sha = background
+        lines += [f"background = {toml_string(path)}", f'background_sha256 = "{sha}"']
     return newline.join(lines) + newline + extra
 
 
@@ -244,32 +258,45 @@ class InstallPs1FunctionTest(unittest.TestCase):
                     archive.writestr(info, data)
         return path
 
-    def test_zip_layout_is_checked_and_only_the_binary_is_extracted(self):
+    def test_zip_layout_is_checked_and_only_the_binaries_are_extracted(self):
         exe = (f"{PREFIX}loadout.exe", b"MZ fake", 0o100755)
-        good = [(PREFIX, b"", 0o040755), exe, (f"{PREFIX}README.md", b"readme", 0o100644)]
+        launcher = (f"{PREFIX}loadout-background.exe", b"MZ launcher", 0o100755)
+        good = [(PREFIX, b"", 0o040755), exe, launcher, (f"{PREFIX}README.md", b"readme", 0o100644)]
         cases = {
             "good": (good, True),
             "duplicate binary": (good + [exe], False),
-            "binary is a symlink": ([(f"{PREFIX}loadout.exe", b"C:\\Windows\\notepad.exe", 0o120777)], False),
+            "duplicate launcher": (good + [launcher], False),
+            "missing launcher": ([(PREFIX, b"", 0o040755), exe], False),
+            "missing binary": ([(PREFIX, b"", 0o040755), launcher], False),
+            "binary is a symlink": ([(f"{PREFIX}loadout.exe", b"C:\\Windows\\notepad.exe", 0o120777), launcher], False),
+            "launcher is a symlink": ([exe, (f"{PREFIX}loadout-background.exe", b"x", 0o120777)], False),
+            "unexpected extra file": (good + [(f"{PREFIX}install.ps1", b"x", 0o100644)], False),
             "entry outside the prefix": (good + [("evil.exe", b"x", 0o100644)], False),
             "nested entry": (good + [(f"{PREFIX}sub/loadout.exe", b"x", 0o100644)], False),
             "parent traversal": (good + [(f"{PREFIX}../evil.exe", b"x", 0o100644)], False),
             "backslash name": (good + [(f"{PREFIX}..\\evil.exe", b"x", 0o100644)], False),
-            "missing binary": ([(f"{PREFIX}README.md", b"readme", 0o100644)], False),
         }
         zip_paths = [self.write_zip(f"case-{index}.zip", entries) for index, (entries, _) in enumerate(cases.values())]
         outcomes = self.assert_outcomes(lambda directory: zip_calls(directory, zip_paths), [ok for _, ok in cases.values()])
         for shell, (directory, _, _) in outcomes.items():
             with self.subTest(shell=shell):
-                self.assertEqual((directory / "out-0.exe").read_bytes(), b"MZ fake")
+                self.assertEqual((directory / "out-0" / "loadout.exe").read_bytes(), b"MZ fake")
+                self.assertEqual((directory / "out-0" / "loadout-background.exe").read_bytes(), b"MZ launcher")
+                self.assertEqual(sorted(path.name for path in (directory / "out-0").iterdir()),
+                                 ["loadout-background.exe", "loadout.exe"])
                 self.assertFalse((directory / "evil.exe").exists())
         self.assertFalse((self.tmp / "evil.exe").exists())
 
-    def test_record_parser_accepts_only_the_schema_1_data_format(self):
+    def test_record_parser_accepts_only_the_schema_1_and_2_data_formats(self):
         binary = "C:\\Users\\me\\AppData\\Local\\Programs\\loadout\\loadout.exe"
         good = record_text(binary, "c" * 64)
+        good2 = record_text(binary, "c" * 64, background=(binary.replace("loadout.exe", "loadout-background.exe"), "e" * 64))
         cases = {
             "good": (good, True),
+            "good schema 2": (good2, True),
+            "schema 2 without launcher": (good.replace("schema = 1", "schema = 2"), False),
+            "schema 1 with launcher": (good2.replace("schema = 2", "schema = 1"), False),
+            "schema 3": (good.replace("schema = 1", "schema = 3"), False),
             "byte order mark": ("\ufeff" + good, False),
             "crlf": (record_text(binary, "c" * 64, newline="\r\n"), False),
             "no final newline": (good[:-1], False),
@@ -288,34 +315,83 @@ class InstallPs1FunctionTest(unittest.TestCase):
             calls.append({"fn": "Read-InstallRecord", "args": [str(path)]})
         self.assert_outcomes(lambda directory: calls, [ok for _, ok in cases.values()])
 
-    def test_record_must_bind_installer_target_path_and_current_hash(self):
-        dest = self.tmp / "Programs" / "loadout" / "loadout.exe"
-        dest.parent.mkdir(parents=True)
-        dest.write_bytes(b"MZ installed")
+    def test_record_must_bind_installer_target_paths_and_current_hashes(self):
+        legacy = self.tmp / "legacy" / "loadout.exe"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"MZ installed")
+        current = self.tmp / "current" / "loadout.exe"
+        current.parent.mkdir(parents=True)
+        current.write_bytes(b"MZ installed")
+        launcher = current.with_name("loadout-background.exe")
+        launcher.write_bytes(b"MZ launcher")
         digest = hashlib.sha256(b"MZ installed").hexdigest()
-        cases = {
-            "matching": (record_text(str(dest), digest), None),
-            "path differs only in case": (record_text(str(dest).upper(), digest), None),
-            "edited binary": (record_text(str(dest), "d" * 64), "changed after it was installed"),
-            "other installer": (record_text(str(dest), digest, installer="install.sh"), "another installer"),
-            "other path": (record_text(str(dest) + ".old", digest), "another binary path"),
-        }
+        launcher_digest = hashlib.sha256(b"MZ launcher").hexdigest()
+        no_launcher = legacy.with_name("loadout-background.exe")
+        cases = [
+            ("matching schema 1", record_text(str(legacy), digest), legacy, no_launcher, None),
+            ("path differs only in case", record_text(str(legacy).upper(), digest), legacy, no_launcher, None),
+            ("edited binary", record_text(str(legacy), "d" * 64), legacy, no_launcher, "changed after it was installed"),
+            ("other installer", record_text(str(legacy), digest, installer="install.sh"), legacy, no_launcher, "another installer"),
+            ("other path", record_text(str(legacy) + ".old", digest), legacy, no_launcher, "another binary path"),
+            ("schema 2 without its launcher", record_text(str(legacy), digest, background=(str(no_launcher), launcher_digest)),
+             legacy, no_launcher, "is missing"),
+            ("matching schema 2", record_text(str(current), digest, background=(str(launcher), launcher_digest)),
+             current, launcher, None),
+            ("edited launcher", record_text(str(current), digest, background=(str(launcher), "f" * 64)),
+             current, launcher, "changed after it was installed"),
+            ("other launcher path", record_text(str(current), digest, background=(str(launcher) + ".old", launcher_digest)),
+             current, launcher, "another background launcher"),
+            ("schema 1 with an unrecorded launcher", record_text(str(current), digest), current, launcher,
+             "is not in the schema 1 record"),
+        ]
         calls = []
-        for index, (text, _) in enumerate(cases.values()):
+        for index, (_, text, dest, background, _) in enumerate(cases):
             path = self.tmp / f"bind-{index}.toml"
             path.write_bytes(text.encode("utf-8"))
-            calls.append({"fn": "Get-RecordMismatch", "args": [str(path), str(dest), TARGET]})
-        calls.append({"fn": "Get-RecordMismatch", "args": [str(self.tmp / "absent.toml"), str(dest), TARGET]})
-        expected = [why for _, why in cases.values()] + ["there is no install record"]
+            calls.append({"fn": "Get-RecordMismatch", "args": [str(path), str(dest), str(background), TARGET]})
+        calls.append({"fn": "Get-RecordMismatch",
+                      "args": [str(self.tmp / "absent.toml"), str(legacy), str(no_launcher), TARGET]})
+        expected = [(name, why) for name, _, _, _, why in cases] + [("absent", "there is no install record")]
         self.assertEqual(len(expected), len(calls))
         for shell, (_, _, results) in self.run_calls(lambda directory: calls).items():
-            for result, why in zip(results, expected):
-                with self.subTest(shell=shell, why=why):
+            for result, (name, why) in zip(results, expected):
+                with self.subTest(shell=shell, case=name):
                     self.assertTrue(result["ok"], result["error"])
                     if why is None:
                         self.assertIsNone(result["value"])
                     else:
                         self.assertIn(why, result["value"])
+
+    def test_binaries_are_published_in_order_and_restored_on_failure(self):
+        def build(directory):
+            calls = []
+            for case, second_staged in (("ok", True), ("fail", False)):
+                folder = directory / case
+                folder.mkdir()
+                (folder / "loadout-background.exe").write_bytes(b"old launcher")
+                (folder / "loadout.exe").write_bytes(b"old main")
+                (folder / ".loadout-background.exe.new.a").write_bytes(b"new launcher")
+                if second_staged:
+                    (folder / ".loadout.exe.new.b").write_bytes(b"new main")
+                pairs = [
+                    [str(folder / ".loadout-background.exe.new.a"), str(folder / "loadout-background.exe")],
+                    [str(folder / ".loadout.exe.new.b"), str(folder / "loadout.exe")],
+                ]
+                calls.append({"fn": "Publish-Binaries", "args": ["@owned", pairs]})
+            return calls
+
+        outcomes = self.assert_outcomes(build, [True, False])
+        for shell, (directory, _, results) in outcomes.items():
+            with self.subTest(shell=shell):
+                ok, fail = directory / "ok", directory / "fail"
+                self.assertEqual((ok / "loadout-background.exe").read_bytes(), b"new launcher")
+                self.assertEqual((ok / "loadout.exe").read_bytes(), b"new main")
+                self.assertEqual(sorted(path.name for path in ok.iterdir()), ["loadout-background.exe", "loadout.exe"])
+                self.assertIn("previous ones are back", results[1]["error"])
+                self.assertEqual((fail / "loadout-background.exe").read_bytes(), b"old launcher")
+                self.assertEqual((fail / "loadout.exe").read_bytes(), b"old main")
+                self.assertEqual((fail / ".loadout-background.exe.new.a").read_bytes(), b"new launcher")
+                self.assertFalse(any(".old." in path.name for path in fail.iterdir()))
 
 
 class RuntimeIsolationControlTest(unittest.TestCase):
@@ -333,8 +409,8 @@ class RuntimeIsolationControlTest(unittest.TestCase):
     def test_each_runtime_writes_into_its_own_directory(self):
         first, second = self.tmp / "runtime-powershell", self.tmp / "runtime-pwsh"
         for build in (argv_calls, lambda directory: zip_calls(directory, [self.tmp / "a.zip", self.tmp / "b.zip"])):
-            first_outputs = [call["args"][-1] if call["fn"] == "Export-ZipBinary" else call["args"][1][2] for call in build(first)]
-            second_outputs = [call["args"][-1] if call["fn"] == "Export-ZipBinary" else call["args"][1][2] for call in build(second)]
+            first_outputs = [call["args"][-1] if call["fn"] == "Export-ZipBinaries" else call["args"][1][2] for call in build(first)]
+            second_outputs = [call["args"][-1] if call["fn"] == "Export-ZipBinaries" else call["args"][1][2] for call in build(second)]
             self.assertTrue(all(Path(path).parent == first for path in first_outputs))
             self.assertTrue(all(Path(path).parent == second for path in second_outputs))
             self.assertFalse(set(first_outputs) & set(second_outputs))
@@ -359,6 +435,18 @@ class RuntimeIsolationControlTest(unittest.TestCase):
         self.assertTrue(any("case 0: exit 0" in problem for problem in problems))
         self.assertTrue(any(f"case {len(ARGV_CASES) - 1}: the child wrote no" in problem for problem in problems))
         self.assertTrue(any("results for" in problem for problem in argv_mismatches(directory, results[:-1])))
+
+
+def fake_background_cs(printed):
+    return """
+using System;
+public static class FakeBackground {
+    public static int Main(string[] args) {
+        if (args.Length == 1 && args[0] == "--version") { Console.Out.Write("%s\\n"); return 0; }
+        return 2;
+    }
+}
+""" % printed
 
 
 FAKE_LOADOUT_CS = r"""
@@ -518,37 +606,54 @@ class InstallPs1WrapperTest(unittest.TestCase):
         cls.addClassCleanup(shutil.rmtree, cls.root, True)
         served = cls.root / "served"
         served.mkdir()
-        source = cls.root / "FakeLoadout.cs"
-        source.write_text(FAKE_LOADOUT_CS, encoding="utf-8")
-        exe = cls.root / "loadout.exe"
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             "Add-Type -TypeDefinition ([IO.File]::ReadAllText($env:LT_SOURCE)) "
-             "-OutputAssembly $env:LT_EXE -OutputType ConsoleApplication"],
-            cwd=str(cls.root),
-            env=dict(os.environ, LT_SOURCE=str(source), LT_EXE=str(exe)),
-            check=True,
-            timeout=TIMEOUT,
-        )
+        exe = cls.compile("loadout.exe", FAKE_LOADOUT_CS)
+        launcher = cls.compile("loadout-background.exe", fake_background_cs("loadout-background 1.2.3"))
         target = native_target()
-        asset = f"loadout-{target}.zip"
-        with zipfile.ZipFile(served / asset, "w") as archive:
-            for name, data, mode in (
-                (f"loadout-{target}/", b"", 0o040755),
-                (f"loadout-{target}/loadout.exe", exe.read_bytes(), 0o100755),
-            ):
-                info = zipfile.ZipInfo(name)
-                info.create_system = 3
-                info.external_attr = mode << 16
-                archive.writestr(info, data)
-        digest = hashlib.sha256((served / asset).read_bytes()).hexdigest()
-        (served / f"{asset}.sha256").write_bytes(f"{digest}  {asset}\n".encode("ascii"))
+        cls.asset = f"loadout-{target}.zip"
+        cls.target = target
+        cls.serve(served, [exe, launcher])
+        cls.serve(served / "missing-launcher", [exe])
+        cls.serve(served / "wrong-launcher", [exe, (launcher.name, exe.read_bytes())])
+        cls.main_bytes = exe.read_bytes()
+        cls.launcher_bytes = launcher.read_bytes()
         (cls.root / "wrapper.ps1").write_text(WRAPPER, encoding="utf-8-sig")
         server = FixtureServer(served)
         cls.addClassCleanup(server.close)
         server.start()
         cls.addClassCleanup(stop_fixture_server, server)
         cls.base = server.base
+
+    @classmethod
+    def compile(cls, name, source):
+        source_path = cls.root / (name + ".cs")
+        source_path.write_text(source, encoding="utf-8")
+        out = cls.root / name
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Add-Type -TypeDefinition ([IO.File]::ReadAllText($env:LT_SOURCE)) "
+             "-OutputAssembly $env:LT_EXE -OutputType ConsoleApplication"],
+            cwd=str(cls.root),
+            env=dict(os.environ, LT_SOURCE=str(source_path), LT_EXE=str(out)),
+            check=True,
+            timeout=TIMEOUT,
+        )
+        return out
+
+    @classmethod
+    def serve(cls, folder, binaries):
+        folder.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(folder / cls.asset, "w") as archive:
+            entries = [(f"loadout-{cls.target}/", b"", 0o040755)]
+            for binary in binaries:
+                name, data = binary if isinstance(binary, tuple) else (binary.name, binary.read_bytes())
+                entries.append((f"loadout-{cls.target}/{name}", data, 0o100755))
+            for name, data, mode in entries:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = mode << 16
+                archive.writestr(info, data)
+        digest = hashlib.sha256((folder / cls.asset).read_bytes()).hexdigest()
+        (folder / f"{cls.asset}.sha256").write_bytes(f"{digest}  {cls.asset}\n".encode("ascii"))
 
     def run_installer(self, shell, command, init_args, child_exit, extra_env=None):
         case = Path(tempfile.mkdtemp(dir=str(self.root)))
@@ -606,6 +711,81 @@ class InstallPs1WrapperTest(unittest.TestCase):
                     self.assertIn("could not run", completed.stderr)
                     self.assertTrue(installed.exists())
                     self.assertFalse(received.exists())
+
+    def install_only(self, shell, base, local_app_data):
+        command = ["-File", str(SCRIPT), "-BaseUrl", base]
+        return subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"] + command,
+            cwd=str(local_app_data.parent),
+            env=dict(os.environ, LOCALAPPDATA=str(local_app_data)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=TIMEOUT,
+        )
+
+    def record(self, folder):
+        values = {}
+        for line in (folder / "loadout.install.toml").read_text(encoding="utf-8").splitlines():
+            if not line.startswith("#"):
+                key, value = line.split(" = ", 1)
+                values[key] = value
+        return values
+
+    def test_installs_both_binaries_with_a_schema_2_record(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                completed = self.install_only(shell, self.base, local)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                folder = local / "Programs" / "loadout"
+                self.assertEqual((folder / "loadout.exe").read_bytes(), self.main_bytes)
+                self.assertEqual((folder / "loadout-background.exe").read_bytes(), self.launcher_bytes)
+                record = self.record(folder)
+                self.assertEqual(record["schema"], "2")
+                self.assertEqual(record["background_sha256"], f'"{hashlib.sha256(self.launcher_bytes).hexdigest()}"')
+                self.assertEqual(sorted(path.name for path in folder.iterdir()),
+                                 ["loadout-background.exe", "loadout.exe", "loadout.install.toml"])
+
+    def test_a_schema_1_install_upgrades_to_schema_2(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                folder = local / "Programs" / "loadout"
+                folder.mkdir(parents=True)
+                (folder / "loadout.exe").write_bytes(b"MZ old")
+                (folder / "loadout.install.toml").write_bytes(
+                    record_text(str(folder / "loadout.exe"), hashlib.sha256(b"MZ old").hexdigest())
+                    .replace(TARGET, self.target).encode("utf-8"))
+                completed = self.install_only(shell, self.base, local)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual((folder / "loadout.exe").read_bytes(), self.main_bytes)
+                self.assertEqual((folder / "loadout-background.exe").read_bytes(), self.launcher_bytes)
+                self.assertEqual(self.record(folder)["schema"], "2")
+
+    def test_a_release_without_the_right_launcher_changes_nothing(self):
+        for shell in SHELLS:
+            for variant, message in (("missing-launcher", "has no"), ("wrong-launcher", "loadout-background.exe printed")):
+                with self.subTest(shell=shell, variant=variant):
+                    local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                    completed = self.install_only(shell, f"{self.base}/{variant}", local)
+                    self.assertEqual(completed.returncode, 1, completed.stderr)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((local / "Programs" / "loadout" / "loadout.exe").exists())
+                    self.assertFalse((local / "Programs" / "loadout" / "loadout-background.exe").exists())
+
+    def test_an_unrecorded_launcher_is_left_alone(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                folder = local / "Programs" / "loadout"
+                folder.mkdir(parents=True)
+                (folder / "loadout-background.exe").write_bytes(b"someone else's")
+                completed = self.install_only(shell, self.base, local)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertIn("another installer may own it", completed.stderr)
+                self.assertEqual((folder / "loadout-background.exe").read_bytes(), b"someone else's")
+                self.assertFalse((folder / "loadout.exe").exists())
 
     def test_direct_file_invocation_forwards_a_nonzero_child_exit(self):
         for shell in SHELLS:

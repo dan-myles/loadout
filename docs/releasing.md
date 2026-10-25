@@ -34,6 +34,13 @@ downloads and `target/`. Release builds start clean so a poisoned cache can't re
 | `x86_64-pc-windows-msvc` | windows-2025 |
 | `aarch64-pc-windows-msvc` | windows-11-arm |
 
+The Windows targets build and ship two binaries: `loadout.exe` and `loadout-background.exe`,
+the windowless launcher U8's scheduled task starts (`cargo build --bin loadout --bin
+loadout-background`). `package.py` requires `loadout-background --version` to print exactly
+`loadout-background <version>`, and `smoke.py` checks it again from the archive. The musl jobs
+install `musl-tools` and set `CC_<target>=musl-gcc`, because `ring` (the crypto behind rustls,
+which self-update uses) compiles C.
+
 Every target builds natively on the matching architecture, using only
 [standard GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 which are free for public repositories. No larger runners are used. Every build runs
@@ -148,8 +155,10 @@ Neither script installs git; each names the per-OS command instead.
    run.
 5. **Archive layout.** The archive is checked before extraction. Every entry must be
    `loadout-<target>/` or a plain name directly inside it (letters, digits, `.`, `_`, `-`), and
-   there must be exactly one `loadout-<target>/loadout[.exe]`.
-   - Only that one entry is extracted, into the script's own temporary directory.
+   there must be exactly one `loadout-<target>/loadout`. A Windows zip must hold exactly one
+   `loadout.exe` and exactly one `loadout-background.exe`; besides `README.md` and `LICENSE*`,
+   any other entry is refused rather than ignored.
+   - Only the binaries are extracted, into the script's own temporary directory.
    - Tar: every entry's type must be a regular file or a directory. `install.sh` reads the type
      from the first character of `tar -tv` output, which GNU and BSD tar print ls-style (`h` hard
      link, `l` symlink), so links and devices are refused before extraction. That check depends on
@@ -159,17 +168,21 @@ Neither script installs git; each names the per-OS command instead.
      regular file, and other entries are never extracted.
    - This is a layout check for official release archives, not a sandbox for hostile archives.
 6. **Version check.** The extracted binary must print `loadout <version>` from `--version`. With a
-   requested tag, `v<version>` must equal it exactly, case-sensitively.
+   requested tag, `v<version>` must equal it exactly, case-sensitively. On Windows,
+   `loadout-background.exe --version` must then print exactly `loadout-background <version>`.
 7. **Staging.** Each staging file is created exclusively, under a fresh unique name in the
    destination directory: `mktemp` for `.loadout.new.XXXXXX` and `.loadout.install.toml.new.XXXXXX`,
    or a GUID name opened with `CreateNew`.
    - The script deletes only names it created and hasn't yet published.
    - Other files, including other runs' staging files, are never overwritten or deleted.
    - No backup file is kept.
-8. **Publishing.** The binary is published first, with a same-directory rename: `mv -f`, or
-   `File.Replace` with no backup (`File.Move` when nothing is there yet). Then the record is
-   published the same way. Every failure before the first rename leaves the previous binary and
-   record untouched.
+8. **Publishing.** The binary is published first, with a same-directory rename (`mv -f`). Then the
+   record is published the same way. Every failure before the first rename leaves the previous
+   binary and record untouched.
+   - On Windows the launcher goes first, then `loadout.exe`. Each existing binary, which may be
+     running, is first moved aside to `.<name>.old.<guid>`, and if a later move fails every
+     completed move is undone in reverse. Then the record is replaced (`File.Replace`, no backup).
+   - Aside copies that are still running are removed by the next install or self-update.
 9. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
    shell profiles or `PATH`.
 10. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
@@ -195,7 +208,7 @@ open; it sets `$LASTEXITCODE` instead. Run with `-File`, it exits with the code.
 from its own `$MyInvocation`, never from `$PSCommandPath`, which a script block could inherit from
 a calling script.
 
-### Install record, schema 1 (input to U9 self-update)
+### Install record, schemas 1 and 2 (read by self-update)
 
 The record sits next to the binary as `loadout.install.toml`: `~/.local/bin/loadout.install.toml`
 on macOS and Linux, `%LOCALAPPDATA%\Programs\loadout\loadout.install.toml` on Windows. Producers
@@ -216,10 +229,15 @@ binary_sha256 = "<sha256 of that binary>"
 
 - **Framing.** The whole file is UTF-8 with no byte order mark, no NUL or other control bytes
   except LF, and a final LF.
-- **Lines.** Each line is a `#` comment, exactly `schema = 1` (an integer, never a string), or
-  `<key> = "<value>"`. The keys are exactly
+- **Lines.** Each line is a `#` comment, exactly `schema = 1` or `schema = 2` (an integer, never a
+  string), or `<key> = "<value>"`. The keys are exactly
   `installer` (`"install.sh"` or `"install.ps1"`), `repository`, `source`, `target`, `version`,
   `archive_sha256`, `binary` and `binary_sha256`, each once.
+- **Schema 2** (Windows) adds exactly `background`, the launcher's path written like `binary`, and
+  `background_sha256`. `install.ps1` and Windows self-update write schema 2. `install.sh` and Unix
+  self-update write schema 1. A Windows schema-1 record, from the one-binary `install.ps1`, is still
+  read: it is managed only while no `loadout-background.exe` sits beside it, and the next install
+  or self-update upgrades it to schema 2 with the launcher.
 - **Values.** They never contain control characters, and only `\\` and `\"` are escaped.
   Producers refuse a value they can't encode that way before changing anything: a control
   character, invalid UTF-8, or an unpaired UTF-16 surrogate. So the file is always valid TOML.
@@ -238,26 +256,32 @@ binary_sha256 = "<sha256 of that binary>"
 - `target` equals the target being installed or running
 - `binary` names the same file
 - that file's current sha256 equals `binary_sha256`
+- for schema 2, `background` names the `loadout-background.exe` beside it, and that file's current
+  sha256 equals `background_sha256`
 
 If any check fails, the binary is unmanaged. Both installers refuse to replace an unmanaged binary
 and give no force option. To reinstall, the user removes the binary and record themselves.
 
-The two files are not published atomically. A failure between the two renames leaves a new binary
-with the previous record, or with no record, and the hash check then fails closed.
+The files are not published as one atomic step, and the binaries and record are separate
+renames. A failure or power loss between them leaves new binaries with the previous record, or
+with no record, and the hash check then fails closed: the binaries are unmanaged until the user
+reinstalls them.
 
-No CLI code reads this file yet. U9's self-update must apply exactly the rule above. It must also
-verify the downloaded archive and sidecar the way the scripts do, and publish the binary and then
-the record with same-directory renames. Anything else, such as `cargo install`, a package manager,
-or a hand copy, is never replaced, and `doctor` reports which case applies.
+### Self-update (`src/release/`)
 
-### Pending: Windows background launcher (U8)
+`loadout update` (U8) calls `release::latest` after its apply when the resolved `[update] cli` is
+true, then `release::install` when a strictly newer stable release exists. Self-update applies
+exactly the rule above, with no token:
+- **Latest tag.** It reads the tag from the `releases/latest` redirect.
+- **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
+  the exact sidecar and a matching hash.
+- **Archive.** It reads the expected binaries from memory, checking each name, type and size.
+- **Staging.** It stages each binary with `create_new`, and requires its exact `--version` line.
+- **Publishing.** It publishes the binaries as above, then rewrites the record in the same schema
+  rules.
 
-The U8 background service will need a windowless companion on Windows, because `loadout.exe` is a
-console program and a Scheduled Task running it flashes a console. This repair doesn't implement
-it. When U8 adds it:
-- release packaging must ship it in the Windows zip
-- `install.ps1` must extract, verify, stage, and publish it with the same rules
-- the record schema needs a version bump to cover it
+Anything else, such as `cargo install`, a package manager, a hand copy, or a `LOADOUT_HOME`
+isolated run, is never replaced. `doctor` reports which case applies (`cli install`).
 
 ## Building a release archive locally
 

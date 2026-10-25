@@ -134,5 +134,51 @@ class SmokeVersionTest(unittest.TestCase):
             self.smoke("other 0.1.0", "0.1.0")
 
 
+class WindowsLauncherTest(unittest.TestCase):
+    def test_only_windows_targets_ship_the_background_launcher(self):
+        self.assertEqual(package.binary_names("x86_64-unknown-linux-musl"), ["loadout"])
+        self.assertEqual(package.binary_names("aarch64-apple-darwin"), ["loadout"])
+        for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+            self.assertEqual(package.binary_names(target), ["loadout", "loadout-background"])
+
+    def test_members_include_every_binary_as_executable(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "loadout.exe").write_bytes(b"main")
+        (root / "loadout-background.exe").write_bytes(b"launcher")
+        (root / "README.md").write_text("readme")
+        _, entries = package.members(root, root / "loadout.exe", "t", [root / "loadout-background.exe"])
+        self.assertEqual(
+            [(name, mode) for name, _, mode in entries],
+            [
+                ("loadout-t/README.md", 0o644),
+                ("loadout-t/loadout-background.exe", 0o755),
+                ("loadout-t/loadout.exe", 0o755),
+            ],
+        )
+
+
+@unittest.skipIf(os.name == "nt", "fake binary is a POSIX shell script")
+class BackgroundSmokeTest(unittest.TestCase):
+    def smoke(self, printed):
+        binary = Path(tempfile.mkdtemp()) / "loadout-background"
+        binary.write_text(f"#!/bin/sh\nprintf '{printed}'\n")
+        binary.chmod(0o755)
+        with mock.patch.object(package, "host_can_run", return_value=True):
+            package.smoke_background(binary, "any-target", "1.2.3", required=True)
+
+    def test_exact_line_passes(self):
+        self.smoke("loadout-background 1.2.3\\n")
+
+    def test_anything_else_fails(self):
+        for printed in (
+            "loadout 1.2.3\\n",
+            "loadout-background 1.2.30\\n",
+            "loadout-background 1.2.3",
+            "loadout-background 1.2.3 (extra)\\n",
+        ):
+            with self.subTest(printed=printed), self.assertRaises(package.ReleaseError):
+                self.smoke(printed)
+
+
 if __name__ == "__main__":
     unittest.main()

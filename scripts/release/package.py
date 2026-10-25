@@ -21,6 +21,8 @@ import zipfile
 from pathlib import Path
 
 PACKAGE = "loadout"
+# The Windows background launcher the scheduled task starts (U8), shipped beside loadout.exe.
+BACKGROUND = "loadout-background"
 EXTRA_FILES = ("README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE")
 ZIP_EPOCH_FLOOR = 315532800  # 1980-01-01, the earliest timestamp zip can store
 
@@ -37,15 +39,16 @@ def run(cmd, cwd=None, env=None):
     return result.stdout
 
 
-def cargo_package(root):
+def cargo_package(root, bins=(PACKAGE,)):
     metadata = json.loads(
         run(["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"], cwd=root)
     )
     for package in metadata["packages"]:
         if package["name"] != PACKAGE:
             continue
-        if not any(t["name"] == PACKAGE and "bin" in t["kind"] for t in package["targets"]):
-            raise ReleaseError(f"package {PACKAGE} has no binary target named {PACKAGE}")
+        for name in bins:
+            if not any(t["name"] == name and "bin" in t["kind"] for t in package["targets"]):
+                raise ReleaseError(f"package {PACKAGE} has no binary target named {name}")
         return package["version"], Path(metadata["target_directory"])
     raise ReleaseError(f"no package named {PACKAGE} in {root / 'Cargo.toml'}")
 
@@ -55,6 +58,11 @@ def source_date_epoch(root):
         ["git", "log", "-1", "--format=%ct"], cwd=root
     ).strip()
     return int(value)
+
+
+def binary_names(target):
+    """The binaries a release for `target` ships, main CLI first."""
+    return [PACKAGE, BACKGROUND] if is_windows(target) else [PACKAGE]
 
 
 def is_windows(target):
@@ -110,9 +118,23 @@ def smoke_test(binary, target, version, required=False):
     print(f"smoke test passed: {output.strip()}", file=sys.stderr)
 
 
-def members(root, binary, target):
+def smoke_background(binary, target, version, required=False):
+    """The launcher must print exactly `loadout-background <version>`, which self-update checks."""
+    if not host_can_run(target):
+        if required:
+            raise ReleaseError(f"--require-smoke: this host cannot execute {target}")
+        print(f"smoke test skipped: this host cannot execute {target}", file=sys.stderr)
+        return
+    output = run([str(binary), "--version"])
+    expected = f"{BACKGROUND} {version}\n"
+    if output != expected:
+        raise ReleaseError(f"{binary.name} --version printed {output!r}, expected {expected!r}")
+    print(f"smoke test passed: {output.strip()}", file=sys.stderr)
+
+
+def members(root, binary, target, extra_binaries=()):
     prefix = f"{PACKAGE}-{target}"
-    entries = [(f"{prefix}/{binary.name}", binary.read_bytes(), 0o755)]
+    entries = [(f"{prefix}/{path.name}", path.read_bytes(), 0o755) for path in [binary, *extra_binaries]]
     for name in EXTRA_FILES:
         path = root / name
         if path.is_symlink():
@@ -182,7 +204,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     root = Path(run(["git", "rev-parse", "--show-toplevel"]).strip())
-    version, target_dir = cargo_package(root)
+    names = binary_names(args.target)
+    version, target_dir = cargo_package(root, names)
     if args.expect_version and args.expect_version != version:
         raise ReleaseError(
             f"tag version {args.expect_version} does not match Cargo.toml version {version}"
@@ -190,16 +213,19 @@ def main(argv=None):
     epoch = source_date_epoch(root)
 
     print(run(["rustc", "-vV"], cwd=root), file=sys.stderr)
+    bins = [flag for name in names for flag in ("--bin", name)]
     run(
-        ["cargo", "build", "--release", "--locked", "--target", args.target, "--bin", PACKAGE],
+        ["cargo", "build", "--release", "--locked", "--target", args.target, *bins],
         cwd=root,
         env=build_env(root, args.target, epoch),
     )
-    exe = PACKAGE + (".exe" if is_windows(args.target) else "")
-    binary = target_dir / args.target / "release" / exe
+    suffix = ".exe" if is_windows(args.target) else ""
+    binary, *extra = [target_dir / args.target / "release" / (name + suffix) for name in names]
     smoke_test(binary, args.target, version, args.require_smoke)
+    for launcher in extra:
+        smoke_background(launcher, args.target, version, args.require_smoke)
 
-    prefix, entries = members(root, binary, args.target)
+    prefix, entries = members(root, binary, args.target, extra)
     out_dir = (args.out_dir or target_dir / "dist").resolve()
     archive, checksum = write_archive(out_dir, prefix, entries, args.target, epoch)
     print(checksum.read_text(encoding="ascii"), end="")

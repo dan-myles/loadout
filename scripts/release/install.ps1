@@ -22,6 +22,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $Repo = 'dan-myles/loadout'
 $RecordKeys = @('schema', 'installer', 'repository', 'source', 'target', 'version', 'archive_sha256', 'binary', 'binary_sha256')
+$BackgroundKeys = @('background', 'background_sha256')
+# The release zip ships both: the console CLI and the windowless launcher its scheduled task starts.
+$Binaries = @('loadout.exe', 'loadout-background.exe')
 $MaxRedirects = 5
 $LoopbackHosts = @('127.0.0.1', 'localhost', '[::1]')
 
@@ -130,14 +133,15 @@ function Read-Sidecar([string]$Path, [string]$Asset) {
     $match.Groups[1].Value
 }
 
-# Exactly one regular loadout-<target>/loadout.exe, and no entry outside loadout-<target>/ or nested in it.
-function Export-ZipBinary([string]$Zip, [string]$Target, [string]$OutFile) {
+# Exactly one regular loadout-<target>/<name> for each of $Binaries, besides README.md and LICENSE*,
+# and no entry outside loadout-<target>/ or nested in it. Only the binaries are written, to $OutDir.
+function Export-ZipBinaries([string]$Zip, [string]$Target, [string]$OutDir) {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $prefix = "loadout-$Target/"
     $archive = [IO.Compression.ZipFile]::OpenRead($Zip)
     try {
-        $binary = $null
+        $found = @{}
         foreach ($entry in $archive.Entries) {
             $name = $entry.FullName
             if ($name -ceq $prefix) { continue }
@@ -145,17 +149,25 @@ function Export-ZipBinary([string]$Zip, [string]$Target, [string]$OutFile) {
             if ($leaf -cnotmatch '\A[A-Za-z0-9._-]+\z' -or $leaf -eq '.' -or $leaf -eq '..') {
                 throw "the archive has an unexpected entry '$name'"
             }
-            if ($leaf -ceq 'loadout.exe') {
-                if ($binary) { throw "the archive has more than one $name" }
+            if ($Binaries -ccontains $leaf) {
+                if ($found.ContainsKey($leaf)) { throw "the archive has more than one $name" }
                 $type = ($entry.ExternalAttributes -shr 16) -band 0xF000
                 if ($type -ne 0 -and $type -ne 0x8000) { throw "$name in the archive is not a regular file" }
-                $binary = $entry
+                $found[$leaf] = $entry
+            } elseif ($leaf -cne 'README.md' -and -not $leaf.StartsWith('LICENSE', [StringComparison]::Ordinal)) {
+                throw "the archive has an entry that is not part of a loadout release: '$name'"
             }
         }
-        if (-not $binary) { throw "the archive has no ${prefix}loadout.exe" }
-        $source = $binary.Open()
-        $file = [IO.File]::Open($OutFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $source.CopyTo($file) } finally { $file.Dispose(); $source.Dispose() }
+        $paths = @{}
+        foreach ($binary in $Binaries) {
+            if (-not $found.ContainsKey($binary)) { throw "the archive has no $prefix$binary" }
+            $out = Join-Path $OutDir $binary
+            $source = $found[$binary].Open()
+            $file = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $source.CopyTo($file) } finally { $file.Dispose(); $source.Dispose() }
+            $paths[$binary] = $out
+        }
+        $paths
     } finally {
         $archive.Dispose()
     }
@@ -168,20 +180,21 @@ function ConvertTo-TomlString([string]$Value) {
     '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
 }
 
-# Data only: the header comment, `schema = 1`, and one basic string per known key. Values stay encoded.
+# Data only: the header comment, `schema = 1` or `schema = 2`, and one basic string per known key of
+# that schema (schema 2 adds the background launcher). Values stay encoded.
 function Read-InstallRecord([string]$Path) {
     $text = (New-Object Text.UTF8Encoding($false, $true)).GetString([IO.File]::ReadAllBytes($Path))
     if (-not $text.EndsWith("`n")) { throw 'it does not end with a newline' }
     $values = @{}
     foreach ($line in $text.Substring(0, $text.Length - 1).Split([char]10)) {
         if ($line -cmatch '\A#[^\x00-\x1F\x7F]*\z') { continue }
-        if ($line -ceq 'schema = 1') {
-            $key = 'schema'; $value = '1'
+        if ($line -ceq 'schema = 1' -or $line -ceq 'schema = 2') {
+            $key = 'schema'; $value = $line.Substring(9)
         } else {
             $match = [regex]::Match($line, '\A([a-z0-9_]+) = ("(?:[^"\\\x00-\x1F\x7F]|\\["\\])*")\z')
             if (-not $match.Success) { throw "line '$line' is not part of the install record format" }
             $key = $match.Groups[1].Value; $value = $match.Groups[2].Value
-            if ($key -ceq 'schema' -or -not ($RecordKeys -ccontains $key)) { throw "unknown key $key" }
+            if ($key -ceq 'schema' -or -not (($RecordKeys + $BackgroundKeys) -ccontains $key)) { throw "unknown key $key" }
         }
         if ($values.ContainsKey($key)) { throw "$key appears twice" }
         $values[$key] = $value
@@ -189,10 +202,15 @@ function Read-InstallRecord([string]$Path) {
     foreach ($key in $RecordKeys) {
         if (-not $values.ContainsKey($key)) { throw "$key is missing" }
     }
+    foreach ($key in $BackgroundKeys) {
+        if (($values['schema'] -ceq '2') -ne $values.ContainsKey($key)) {
+            throw "$key does not fit a schema $($values['schema']) record"
+        }
+    }
     $values
 }
 
-function Get-RecordMismatch([string]$Record, [string]$Dest, [string]$Target) {
+function Get-RecordMismatch([string]$Record, [string]$Dest, [string]$Background, [string]$Target) {
     if (-not (Test-Path -LiteralPath $Record -PathType Leaf)) { return "there is no install record $Record" }
     try {
         $values = Read-InstallRecord $Record
@@ -205,20 +223,32 @@ function Get-RecordMismatch([string]$Record, [string]$Dest, [string]$Target) {
         return "$Record describes another binary path"
     }
     if ($values['binary_sha256'] -cne "`"$(Get-Sha256 $Dest)`"") { return "$Dest changed after it was installed" }
+    if ($values['schema'] -ceq '1') {
+        # A schema-1 install had no launcher; one there now came from somewhere else.
+        if (Test-Path -LiteralPath $Background) { return "$Background is not in the schema 1 record $Record" }
+        return $null
+    }
+    if (-not [string]::Equals($values['background'], (ConvertTo-TomlString $Background), [StringComparison]::OrdinalIgnoreCase)) {
+        return "$Record describes another background launcher"
+    }
+    if (-not (Test-Path -LiteralPath $Background -PathType Leaf)) { return "$Background is missing" }
+    if ($values['background_sha256'] -cne "`"$(Get-Sha256 $Background)`"") { return "$Background changed after it was installed" }
     $null
 }
 
-function Assert-Destination([string]$Dest, [string]$Record, [string]$Target) {
-    foreach ($path in @($Dest, $Record)) {
+function Assert-Destination([string]$Dest, [string]$Background, [string]$Record, [string]$Target) {
+    foreach ($path in @($Dest, $Background, $Record)) {
         if ((Test-Path -LiteralPath $path -PathType Container) -or (Test-Reparse $path)) {
             throw "$path is a link or a folder, so another installer may own it. It was left alone"
         }
     }
     if (Test-Path -LiteralPath $Dest) {
-        $why = Get-RecordMismatch $Record $Dest $Target
+        $why = Get-RecordMismatch $Record $Dest $Background $Target
         if ($why) {
-            throw "$Dest was not installed by this installer ($why), so it was left alone. To install here, remove $Dest and $Record yourself first"
+            throw "$Dest was not installed by this installer ($why), so it was left alone. To install here, remove $Dest, $Background and $Record yourself first"
         }
+    } elseif (Test-Path -LiteralPath $Background) {
+        throw "$Background is there without loadout.exe, so another installer may own it. It was left alone"
     }
 }
 
@@ -237,6 +267,56 @@ function Publish-StagedFile($Owned, [string]$Staged, [string]$Destination) {
         [IO.File]::Move($Staged, $Destination)
     }
     [void]$Owned.Remove($Staged)
+}
+
+# Windows can't overwrite a running executable, but it can rename one, so each existing binary is
+# first moved aside to `.<name>.old.<guid>`. If a later step fails, every completed move is undone
+# in reverse and the record is never touched. The binaries are not replaced as one atomic step.
+function Publish-Binaries($Owned, [object[]]$Pairs) {
+    $moves = New-Object Collections.Generic.List[object]
+    try {
+        foreach ($pair in $Pairs) {
+            $staged = $pair[0]
+            $dest = $pair[1]
+            if (Test-Path -LiteralPath $dest) {
+                $aside = Join-Path (Split-Path -Parent $dest) (".$(Split-Path -Leaf $dest).old." + [Guid]::NewGuid().ToString('N'))
+                [IO.File]::Move($dest, $aside)
+                $moves.Add(@($dest, $aside))
+            }
+            [IO.File]::Move($staged, $dest)
+            [void]$Owned.Remove($staged)
+            $moves.Add(@($staged, $dest))
+        }
+    } catch {
+        $failure = $_.Exception.Message
+        $restored = $true
+        for ($index = $moves.Count - 1; $index -ge 0; $index--) {
+            $from = $moves[$index][0]
+            $to = $moves[$index][1]
+            try {
+                [IO.File]::Move($to, $from)
+                if ($from -like '*.new.*') { $Owned.Add($from) }
+            } catch {
+                $restored = $false
+            }
+        }
+        if ($restored) {
+            throw "could not put the new binaries in place, so the previous ones are back ($failure)"
+        }
+        throw "could not put the new binaries in place, and the previous ones could not all be restored; reinstall with install.ps1 ($failure)"
+    }
+    foreach ($move in $moves) {
+        if ($move[1] -like '*.old.*') { Remove-Item -LiteralPath $move[1] -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Executables an earlier install or self-update moved aside, now that they may no longer run.
+function Remove-AsideBinaries([string]$Dir) {
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
+    foreach ($binary in $Binaries) {
+        Get-ChildItem -LiteralPath $Dir -Force -File -Filter ".$binary.old.*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 # Quotes one argument so CommandLineToArgvW, the MSVC runtime, and Rust's std::env::args all read it
@@ -310,9 +390,11 @@ function Install-Loadout {
     }
     $dir = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs\loadout'))
     $dest = Join-Path $dir 'loadout.exe'
+    $background = Join-Path $dir 'loadout-background.exe'
     $record = Join-Path $dir 'loadout.install.toml'
     [void](ConvertTo-TomlString $dest)
-    Assert-Destination $dest $record $target
+    [void](ConvertTo-TomlString $background)
+    Assert-Destination $dest $background $record $target
 
     $asset = "loadout-$target.zip"
     if ($BaseUrl) {
@@ -342,8 +424,11 @@ function Install-Loadout {
         if ($got -cne $want) { throw "checksum mismatch for ${asset}: expected $want, got $got" }
         Say "verified sha256 $got"
 
-        $new = Join-Path $tmp 'loadout.exe'
-        Export-ZipBinary $zip $target $new
+        $unpacked = Join-Path $tmp 'unpacked'
+        [void](New-Item -ItemType Directory -Path $unpacked)
+        $extracted = Export-ZipBinaries $zip $target $unpacked
+        $new = $extracted['loadout.exe']
+        $newBackground = $extracted['loadout-background.exe']
 
         # Windows PowerShell 5.1 turns redirected native stderr into errors that 'Stop' would throw.
         $ErrorActionPreference = 'Continue'
@@ -358,15 +443,23 @@ function Install-Loadout {
         if ($Version -ne 'latest' -and "v$installedVersion" -cne $Version) {
             throw "release $Version contains loadout $installedVersion"
         }
+        $ErrorActionPreference = 'Continue'
+        $launcherReported = (& $newBackground --version 2>$null | Out-String).TrimEnd()
+        $launcherExit = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($launcherExit -ne 0 -or $launcherReported -cne "loadout-background $installedVersion") {
+            throw "the downloaded loadout-background.exe printed '$launcherReported', not 'loadout-background $installedVersion'"
+        }
 
         [void](New-Item -ItemType Directory -Path $dir -Force)
-        Assert-Destination $dest $record $target
+        Assert-Destination $dest $background $record $target
+        Remove-AsideBinaries $dir
 
-        $bytes = [IO.File]::ReadAllBytes($new)
-        $staged = New-StagedFile $owned $dir '.loadout.exe.new.' $bytes
+        $staged = New-StagedFile $owned $dir '.loadout.exe.new.' ([IO.File]::ReadAllBytes($new))
+        $stagedBackground = New-StagedFile $owned $dir '.loadout-background.exe.new.' ([IO.File]::ReadAllBytes($newBackground))
         $lines = @(
             '# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.',
-            'schema = 1',
+            'schema = 2',
             'installer = "install.ps1"',
             "repository = `"$Repo`"",
             "source = $(ConvertTo-TomlString $url)",
@@ -374,22 +467,23 @@ function Install-Loadout {
             "version = `"$installedVersion`"",
             "archive_sha256 = `"$want`"",
             "binary = $(ConvertTo-TomlString $dest)",
-            "binary_sha256 = `"$(Get-Sha256 $staged)`""
+            "binary_sha256 = `"$(Get-Sha256 $staged)`"",
+            "background = $(ConvertTo-TomlString $background)",
+            "background_sha256 = `"$(Get-Sha256 $stagedBackground)`""
         )
         $recordBytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes(($lines -join "`n") + "`n")
         $stagedRecord = New-StagedFile $owned $dir '.loadout.install.toml.new.' $recordBytes
 
-        try {
-            Publish-StagedFile $owned $staged $dest
-        } catch {
-            throw "could not replace $dest, so the previous binary is unchanged. Close any running loadout and try again ($($_.Exception.Message))"
-        }
+        # The launcher first: until the record names it, a run that starts meanwhile finds a launcher
+        # of this release beside whichever loadout.exe is in place.
+        $pairs = @(@($stagedBackground, $background), @($staged, $dest))
+        Publish-Binaries $owned $pairs
         try {
             Publish-StagedFile $owned $stagedRecord $record
         } catch {
-            throw "installed $dest but could not write $record, so self-update will not replace this binary ($($_.Exception.Message))"
+            throw "installed $dest but could not write $record, so self-update will not replace these binaries ($($_.Exception.Message))"
         }
-        Say "installed loadout $installedVersion ($target) to $dest"
+        Say "installed loadout $installedVersion ($target) to $dest, with $background"
 
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         if (-not (($userPath -split ';') -contains $dir)) {

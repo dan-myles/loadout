@@ -19,6 +19,7 @@ import zipfile
 from pathlib import Path
 
 PACKAGE = "loadout"
+BACKGROUND = "loadout-background"
 
 
 class SmokeError(Exception):
@@ -52,7 +53,21 @@ def extract(archive, into):
         raise SmokeError(f"{prefix}/{exe} is missing from {archive.name}")
     if os.name != "nt" and not os.access(binary, os.X_OK):
         raise SmokeError(f"{prefix}/{exe} is not executable")
+    if archive.name.endswith(".zip") and not binary.with_name(BACKGROUND + ".exe").is_file():
+        raise SmokeError(f"{prefix}/{BACKGROUND}.exe is missing from {archive.name}")
     return binary
+
+
+def background_version(binary, version):
+    launcher = binary.with_name(BACKGROUND + ".exe")
+    result = subprocess.run(
+        [str(launcher), "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    expected = f"{BACKGROUND} {version}\n"
+    if result.returncode != 0 or result.stdout != expected:
+        raise SmokeError(f"{launcher.name} --version printed {result.stdout!r}, want {expected!r}")
+    print(f"PASS {launcher.name} --version")
 
 
 def expect(name, binary, args, code, env, contains=None):
@@ -100,7 +115,10 @@ def main(argv=None):
         env = dict(os.environ, LOADOUT_HOME=str(home), LOADOUT_STATE_DIR=str(state))
 
         expect("--help", binary, ["--help"], 0, env, contains="validate")
-        expect("unknown command", binary, ["apply"], 2, env)
+        version = expect("--version", binary, ["--version"], 0, env).split()[1]
+        if binary.name.endswith(".exe"):
+            background_version(binary, version)
+        expect("unknown command", binary, ["no-such-command"], 2, env)
         doctor(binary, env)
         expect("validate complete", binary, ["validate", str(fixtures / "complete")], 0, env,
                contains="valid: ")
