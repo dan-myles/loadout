@@ -19,6 +19,12 @@ pub enum Error {
     },
     #[error("{path} is invalid: {message}")]
     Invalid { path: PathBuf, message: String },
+    #[error("cannot write {path}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +69,88 @@ struct MachineFile {
     name: String,
     #[expect(dead_code, reason = "written by init; read by sync")]
     remote: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SavedFile<'a> {
+    name: &'a str,
+    remote: &'a str,
+}
+
+/// Saves this machine's name and its loadout's URL in `<state>/machine.toml` (init, U9). Once
+/// saved, the name no longer follows the hostname. The state dir must already exist (init takes
+/// the state lock first, which creates it). The file is written to a new name in the state dir,
+/// synced, and renamed over the old one, so a crash leaves the old file or the new one. Like
+/// [`name`], it refuses an existing `machine.toml` that is a link or not a regular file, and it
+/// refuses a remote that carries a password, because loadout stores no credentials.
+pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), Error> {
+    let path = context.machine_file();
+    let invalid = |message: &str| Error::Invalid {
+        path: path.clone(),
+        message: message.to_owned(),
+    };
+    if !crate::id::is_id(name) {
+        return Err(invalid(&format!(
+            "machine name {name:?} must be lowercase letters, digits, - or _"
+        )));
+    }
+    if has_password(remote) {
+        return Err(invalid(
+            "the loadout URL carries a password; loadout stores no credentials, so use your Git credential helper or SSH keys",
+        ));
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(invalid("must be a regular file, not a link or folder")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(Error::Read { path, source }),
+    }
+    let state = context.state.canonicalize().map_err(|source| Error::Read {
+        path: context.state.clone(),
+        source,
+    })?;
+    if !state.is_dir() {
+        return Err(invalid("the state dir is not a folder"));
+    }
+    let text = toml::to_string(&SavedFile { name, remote })
+        .map_err(|error| invalid(&format!("cannot encode it: {error}")))?;
+    write_new(&state, &state.join("machine.toml"), text.as_bytes()).map_err(|source| Error::Write {
+        path: path.clone(),
+        source,
+    })
+}
+
+/// Whether a URL's authority names a password, as in `https://user:token@host/repo`.
+fn has_password(remote: &str) -> bool {
+    remote
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .and_then(|authority| authority.rsplit_once('@'))
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+}
+
+fn write_new(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let temp = dir.join(format!(
+        ".machine.toml.new.{:x}{nanos:x}",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temp)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 pub fn name(context: &Context) -> Result<Name, Error> {
@@ -202,5 +290,70 @@ mod tests {
 
         fs::write(context.machine_file(), "name = \"Bad Name\"\n").unwrap();
         assert!(matches!(name(&context), Err(Error::Invalid { .. })));
+    }
+
+    #[test]
+    fn save_persists_the_name_and_remote_and_refuses_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::resolve(
+            Os::Linux,
+            |name| (name == "LOADOUT_STATE_DIR").then(|| dir.path().as_os_str().to_owned()),
+            Some("/home/a".into()),
+        )
+        .unwrap();
+        save(&context, "work-laptop", "git@github.com:me/loadout.git").unwrap();
+        assert_eq!(
+            name(&context).unwrap(),
+            Name {
+                name: "work-laptop".to_owned(),
+                source: NameSource::Saved
+            }
+        );
+        let text = fs::read_to_string(context.machine_file()).unwrap();
+        assert!(
+            text.contains("remote = \"git@github.com:me/loadout.git\""),
+            "{text}"
+        );
+        save(&context, "work-laptop", "https://github.com/me/loadout.git").unwrap();
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temporary file is left"
+        );
+
+        let before = fs::read(context.machine_file()).unwrap();
+        for (name_value, remote) in [
+            ("Bad Name", "https://github.com/me/loadout.git"),
+            ("work", "https://me:token@github.com/me/loadout.git"),
+        ] {
+            assert!(matches!(
+                save(&context, name_value, remote),
+                Err(Error::Invalid { .. })
+            ));
+        }
+        assert_eq!(fs::read(context.machine_file()).unwrap(), before);
+        assert!(!has_password("https://me@github.com/me/loadout.git"));
+        assert!(!has_password("git@github.com:me/loadout.git"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_linked_machine_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let context = Context::resolve(
+            Os::Linux,
+            |name| (name == "LOADOUT_STATE_DIR").then(|| dir.path().as_os_str().to_owned()),
+            Some("/home/a".into()),
+        )
+        .unwrap();
+        let target = outside.path().join("auth.json");
+        fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(&target, context.machine_file()).unwrap();
+        assert!(matches!(
+            save(&context, "box", "https://x/y.git"),
+            Err(Error::Invalid { .. })
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "secret");
     }
 }

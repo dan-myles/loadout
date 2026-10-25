@@ -12,6 +12,7 @@ pub mod plan;
 pub mod platform;
 pub mod process;
 pub mod programs;
+pub mod release;
 pub mod reserved;
 pub mod resolve;
 pub mod source;

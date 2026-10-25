@@ -28,7 +28,14 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         elevated: args.elevated,
         mode: Mode::Interactive,
     };
-    let report = match apply::run(context, &checkout, options) {
+    show(apply::run(context, &checkout, options))
+}
+
+/// Prints an apply's result the way `loadout apply` does and maps it to the exit code: invalid
+/// (3), blocked or unhealthy (4), failed actions (1). `init` and `update` share it so every apply
+/// reads the same.
+pub(crate) fn show(result: Result<apply::Report, apply::Error>) -> anyhow::Result<Exit> {
+    let report = match result {
         Ok(report) => report,
         Err(apply::Error::Plan(plan::Error::Invalid(diagnostics))) => {
             for diagnostic in diagnostics.iter() {
