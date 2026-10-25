@@ -108,46 +108,43 @@ pub(super) fn install(
     Ok(())
 }
 
-/// Disables the timer and removes both units. Every step must succeed before the files go: a
-/// failure (no user session included) leaves the files, and `service.toml`, in place.
-///
-/// With neither unit file there, systemd is still asked whether it has the timer loaded (from
-/// an install whose files were removed by hand): `not-found`, or no user manager to ask, is
-/// nothing to remove; a loaded timer is stopped and systemd reloaded.
+/// Stops the timer and removes both units. systemd is asked first whether it has the timer
+/// loaded, whichever unit files are still there (one may have been removed by hand): a timer
+/// file there is disabled and stopped, a timer loaded without its file is stopped, and only
+/// `not-found` is nothing to stop. A user manager that can't be reached is a failure, never
+/// taken as absence, so `service.toml` stays. A failure stops the removal there: units already
+/// removed stay removed, the rest stay in place.
 pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     let exists = |path: &PathBuf| std::fs::symlink_metadata(path).is_ok();
     let [service, timer] = [dir(context).join(SERVICE), dir(context).join(TIMER)];
-    if !exists(&service) && !exists(&timer) {
-        let args = ["--user", "show", "--property=LoadState", "--value", TIMER];
-        let shown = query(context, "systemctl", &args)?;
-        if !shown.success() {
-            if shown.stderr.contains("Failed to connect") {
-                return Ok(());
-            }
-            return Err(failed("systemctl", &args, &shown));
-        }
-        if shown.stdout.trim() == "not-found" {
-            return Ok(());
-        }
-        required(context, "systemctl", &["--user", "stop", TIMER])?;
-        required(context, "systemctl", &["--user", "daemon-reload"])?;
-        return Ok(());
-    }
+    let args = ["--user", "show", "--property=LoadState", "--value", TIMER];
+    let shown = manager(context, &args)?;
+    let loaded = shown.stdout.trim() != "not-found";
     if exists(&timer) {
-        let args = ["--user", "disable", "--now", TIMER];
-        let disabled = query(context, "systemctl", &args)?;
-        if !disabled.success() {
-            if disabled.stderr.contains("Failed to connect") {
-                return Err(Error::NoUserSession(disabled.stderr.trim().to_owned()));
-            }
-            return Err(failed("systemctl", &args, &disabled));
-        }
+        manager(context, &["--user", "disable", "--now", TIMER])?;
+    } else if loaded {
+        manager(context, &["--user", "stop", TIMER])?;
     }
+    let files = exists(&service) || exists(&timer);
     for path in [&service, &timer] {
         remove(path)?;
     }
-    required(context, "systemctl", &["--user", "daemon-reload"])?;
+    if files || loaded {
+        manager(context, &["--user", "daemon-reload"])?;
+    }
     Ok(())
+}
+
+/// A `systemctl` call that must succeed; no user manager to talk to is `NoUserSession`.
+fn manager(context: &Context, args: &[&str]) -> Result<crate::process::Captured, Error> {
+    let answer = query(context, "systemctl", args)?;
+    if answer.success() {
+        Ok(answer)
+    } else if answer.stderr.contains("Failed to connect") {
+        Err(Error::NoUserSession(answer.stderr.trim().to_owned()))
+    } else {
+        Err(failed("systemctl", args, &answer))
+    }
 }
 
 /// Whether systemd keeps this user's manager running after logout, from `loginctl`; `None` when

@@ -1133,6 +1133,56 @@ mod tests {
         assert!(calls.contains("--user daemon-reload"), "{calls}");
     }
 
+    /// Removal follows what systemd has loaded, not which unit files remain: a service file
+    /// without its timer file still has a loaded timer stopped, and a user manager that can't be
+    /// reached is a failure that keeps `service.toml`, never an absence.
+    #[cfg(unix)]
+    #[test]
+    fn systemd_uninstall_stops_a_loaded_timer_whatever_files_remain() {
+        let fakes = Fakes::new(Os::Linux);
+        let [service, timer] = [
+            systemd::files(&fakes.context)[0].clone(),
+            systemd::files(&fakes.context)[1].clone(),
+        ];
+        plant(&service);
+        fakes.tool("systemctl", "case \"$2\" in show) echo loaded;; esac");
+        systemd::uninstall(&fakes.context).unwrap();
+        let calls = fakes.calls("systemctl");
+        assert!(
+            calls.contains("--user stop loadout-update.timer"),
+            "the loaded timer is stopped though its file is gone: {calls}"
+        );
+        assert!(!calls.contains("disable"), "{calls}");
+        assert!(calls.contains("--user daemon-reload"), "{calls}");
+        assert!(!service.exists() && !timer.exists());
+
+        plant(&service);
+        fakes.tool(
+            "systemctl",
+            "case \"$2\" in show) echo loaded;; stop) echo 'Failed to stop: Access denied' >&2; exit 1;; esac",
+        );
+        let error = systemd::uninstall(&fakes.context).unwrap_err();
+        assert!(error.to_string().contains("Access denied"), "{error}");
+        assert!(service.exists(), "nothing is removed when the stop fails");
+
+        fs::remove_file(&service).unwrap();
+        fakes.record();
+        let record = Private::Service.path(&fakes.context);
+        fakes.tool(
+            "systemctl",
+            "echo 'Failed to connect to bus: No medium found' >&2; exit 1",
+        );
+        assert!(matches!(
+            systemd::uninstall(&fakes.context),
+            Err(Error::NoUserSession(_))
+        ));
+        assert!(uninstall(&fakes.context).is_err());
+        assert!(
+            record.exists(),
+            "an unreachable manager is not an absent timer, so service.toml stays"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn launchd_uninstall_tells_an_unloaded_agent_from_a_failure() {
