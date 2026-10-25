@@ -193,6 +193,52 @@ fn update_fetches_fast_forwards_and_applies_the_new_commit() {
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
 }
 
+/// Line endings in loadout's clone come from the repository, never from the git config it
+/// inherits. With a config asking for CRLF checkouts (`core.autocrlf = true`, `core.eol = crlf`;
+/// Git for Windows sets the first system-wide), the clone and a fast-forward keep a committed LF
+/// file LF and deploy it unchanged, while the repository's own `.gitattributes` still decide the
+/// files they name: `eol=crlf` is checked out CRLF, and a `-text` file keeps its exact bytes.
+#[test]
+fn inherited_line_ending_config_never_changes_what_the_clone_checks_out() {
+    let machine = Machine::new(LOADOUT);
+    let clone = machine.clone();
+    let notes = clone.join("files").join("notes");
+    assert_eq!(fs::read(&notes).unwrap(), b"first\n");
+
+    fs::write(
+        machine.work.join(".gitattributes"),
+        "crlf.txt eol=crlf\nraw.bin -text\n",
+    )
+    .unwrap();
+    fs::write(machine.work.join("crlf.txt"), "one\ntwo\n").unwrap();
+    fs::write(machine.work.join("raw.bin"), b"one\r\ntwo\n").unwrap();
+    fs::write(machine.work.join("files").join("notes"), "second\nline\n").unwrap();
+    git(&machine.work, &["add", "."]);
+    git(&machine.work, &["commit", "--quiet", "-m", "line endings"]);
+    git(&machine.work, &["push", "--quiet", "origin", "main"]);
+    let config = machine.home.with_file_name("crlf.gitconfig");
+    fs::write(&config, "[core]\n\tautocrlf = true\n\teol = crlf\n").unwrap();
+
+    let output = machine
+        .command(&["update"])
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        text(&output).contains("fetched: fast-forwarded"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(fs::read(&notes).unwrap(), b"second\nline\n");
+    assert_eq!(fs::read(clone.join("crlf.txt")).unwrap(), b"one\r\ntwo\r\n");
+    assert_eq!(fs::read(clone.join("raw.bin")).unwrap(), b"one\r\ntwo\n");
+    assert_eq!(
+        fs::read(machine.home.join("notes.md")).unwrap(),
+        b"second\nline\n"
+    );
+}
+
 /// Git variables in the caller's environment that would redirect git elsewhere (an index file,
 /// another repository) reach no git process: the planted ones keep every byte, and loadout's own
 /// clone advances with its own index.
