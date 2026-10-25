@@ -409,15 +409,28 @@ fn private_dir(context: &Context, file: Private) -> Result<Option<PathBuf>, Erro
     }
 }
 
-/// Reads one of the background update's files: `None` when it, or the state dir, doesn't exist.
-/// It must be a regular file that resolves inside the state dir, in folders that are real
-/// folders there; a link or anything else planted there is refused, never followed.
+/// Reads one of the background update's files: `None` when it, or the state dir, doesn't exist
+/// (only a missing path counts as absent; any other error is returned). It must be a regular
+/// file itself, never a link, even one to another file in the state dir, in folders that are
+/// real folders there.
 pub fn read_private(context: &Context, file: Private) -> Result<Option<Vec<u8>>, Error> {
     let Some(dir) = private_dir(context, file)? else {
         return Ok(None);
     };
     let (_, name) = file.parts();
-    disk::read_internal(&dir.join(name), &context.state)
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(disk::io("inspect", &path)(error)),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Invalid {
+                path,
+                message: "must be a regular file, not a link".to_owned(),
+            });
+        }
+        Ok(_) => {}
+    }
+    disk::read_internal(&path, &context.state)
 }
 
 /// Removes one of the background update's files, if it is there. Its folders must pass the same
@@ -844,6 +857,26 @@ mod tests {
         assert!(read_private(&context, Private::Supervisor).is_err());
         assert!(write_private(&context, Private::Supervisor, b"{}").is_err());
         assert!(!outside.join("supervisor.json").exists());
+    }
+
+    /// A link at the file itself is refused on read even when it leads to another regular file
+    /// inside the state dir; a missing file or folder reads as absent and creates nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_that_is_a_link_is_refused_even_inside_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = scratch_context(&dir.path().join("state"));
+        assert_eq!(read_private(&context, Private::LastRun).unwrap(), None);
+        assert!(!context.state.exists(), "a read creates nothing");
+        fs::create_dir_all(&context.state).unwrap();
+        assert_eq!(read_private(&context, Private::LastRun).unwrap(), None);
+        assert!(!context.state.join("background").exists(), "nor its folder");
+        remove_private(&context, Private::LastRun).unwrap();
+        assert!(!context.state.join("background").exists());
+
+        let supervisor = write_private(&context, Private::Supervisor, b"{}").unwrap();
+        std::os::unix::fs::symlink(&supervisor, Private::LastRun.path(&context)).unwrap();
+        assert!(read_private(&context, Private::LastRun).is_err());
     }
 
     /// A linked `background` folder that leads outside the state dir is refused before anything
