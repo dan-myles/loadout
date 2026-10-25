@@ -262,7 +262,7 @@ impl Run {
             .map(|()| Removal::Removed)
     }
 
-    /// One MCP server key, as one transaction (architecture section 5): the KeyMerge check, Grok's
+    /// One MCP server key, as one transaction (architecture section 5): the `KeyMerge` check, Grok's
     /// lock held to the end, one read, the key's prior, a backup of that key's value only, the
     /// edit, the staged document's hash journaled, then the atomic write that re-reads the whole
     /// document just before its rename.

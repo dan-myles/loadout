@@ -491,12 +491,13 @@ fn combined(context: &Context, undos: &[Undo]) -> Result<Vec<String>, Error> {
         let place = entry::place(&undo.entry.target)?;
         let physical = reserved::normalize(&undo.real).map_err(disk::io("resolve", &undo.real))?;
         let identity = reserved::identity(&physical, fold_case);
-        let position = match documents.iter().position(|(known, _)| *known == identity) {
-            Some(position) => position,
-            None => {
-                documents.push((identity, Some(read.clone())));
-                documents.len() - 1
-            }
+        let position = if let Some(position) =
+            documents.iter().position(|(known, _)| *known == identity)
+        {
+            position
+        } else {
+            documents.push((identity, Some(read.clone())));
+            documents.len() - 1
         };
         let Some(bytes) = &documents[position].1 else {
             continue;
