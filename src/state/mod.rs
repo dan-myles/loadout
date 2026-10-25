@@ -2,6 +2,7 @@
 //! sections 4 and 5).
 
 mod disk;
+mod entry;
 mod hash;
 mod journal;
 mod rollback;
@@ -15,6 +16,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::context::Context;
+use crate::manifest::McpFormat;
+use crate::mcp;
 use crate::plan::{Content, ItemRef, Observed, Target};
 use crate::platform::Os;
 use crate::reserved::{self, Use};
@@ -47,10 +50,20 @@ pub enum Error {
     NotUtf8 { path: PathBuf },
     #[error("{target} changed since it was planned; nothing was written to it")]
     Changed { target: String },
+    #[error("{target}: {source}")]
+    Mcp {
+        target: String,
+        #[source]
+        source: mcp::Error,
+    },
     #[error(
-        "{target} is an MCP entry; reading and writing entries needs the mcp module, which this build doesn't have yet"
+        "{path} is a folder, not the single file an MCP config must be; loadout never reads into it"
     )]
-    EntryNeedsMcp { target: String },
+    NotADocument { path: PathBuf },
+    #[error(
+        "{target} already holds an MCP server loadout doesn't own, with a different value; loadout never overwrites it"
+    )]
+    UnownedEntry { target: String },
     #[error("{target} is a program; programs are installed by the programs module, never written")]
     Program { target: String },
     #[error(
@@ -95,12 +108,34 @@ pub enum Error {
 
 impl Error {
     /// True for outcomes that block the machine rather than break the tool: a target that
-    /// changed under loadout, a rollback that would overwrite later changes, or a reserved path.
+    /// changed under loadout, a rollback that would overwrite later changes, a reserved path, or
+    /// an MCP config whose content or surroundings loadout won't edit (unparseable, duplicate or
+    /// unrepresentable keys, mixed newlines, a Muse schema or Pi name loadout can't write, a
+    /// folder in its place, or Grok holding its lock), or a server name that is taken by a value
+    /// loadout doesn't own. Contract and I/O faults are not.
     pub fn is_blocked(&self) -> bool {
-        matches!(
-            self,
-            Error::Changed { .. } | Error::RollbackBlocked { .. } | Error::Reserved { .. }
-        )
+        match self {
+            Error::Changed { .. }
+            | Error::RollbackBlocked { .. }
+            | Error::Reserved { .. }
+            | Error::NotADocument { .. }
+            | Error::UnownedEntry { .. } => true,
+            Error::Mcp { source, .. } => matches!(
+                source,
+                mcp::Error::NotUtf8
+                    | mcp::Error::Parse { .. }
+                    | mcp::Error::NotAnObject { .. }
+                    | mcp::Error::Duplicate { .. }
+                    | mcp::Error::Value { .. }
+                    | mcp::Error::MixedNewlines
+                    | mcp::Error::Schema { .. }
+                    | mcp::Error::Collision { .. }
+                    | mcp::Error::Reserved { .. }
+                    | mcp::Error::NotAFile { .. }
+                    | mcp::Error::Lock { .. }
+            ),
+            _ => false,
+        }
     }
 }
 
@@ -169,6 +204,8 @@ impl State {
         for record in file.records {
             let problem = if !target_shape(&record.target) {
                 Some("records a target that is not an absolute clean path")
+            } else if let Some(problem) = entry_problem(&record.target) {
+                Some(problem)
             } else if !valid_sha(&record.sha256) {
                 Some("records an invalid hash")
             } else if !journal::is_run_id(&record.run) {
@@ -227,6 +264,32 @@ impl State {
 pub struct Lock {
     _file: File,
     state: PathBuf,
+}
+
+impl Lock {
+    /// Whether this lock guards `context`'s state dir, compared the way `Run::begin` compares
+    /// them. Read-only: it creates no folder, opens no file, takes no lock, and the lock stays
+    /// held, so a caller can check the lock it was handed before work that may never begin a
+    /// `Run`. The configured state dir must already exist and resolve to a folder. An alias of
+    /// the locked dir passes; another dir is `Error::WrongLock`; a dir that is missing or can't
+    /// be resolved is an I/O error, and one that isn't a folder is `Error::Invalid`.
+    pub fn check(&self, context: &Context) -> Result<(), Error> {
+        let path = &context.state;
+        let state = path.canonicalize().map_err(disk::io("resolve", path))?;
+        if !fs::metadata(&state).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(Error::Invalid {
+                path: path.clone(),
+                message: "must be a folder".to_owned(),
+            });
+        }
+        if state != self.state {
+            return Err(Error::WrongLock {
+                locked: self.state.clone(),
+                state,
+            });
+        }
+        Ok(())
+    }
 }
 
 pub fn lock(context: &Context) -> Result<Lock, Error> {
@@ -335,6 +398,9 @@ fn tree_files(
 /// A symlinked target is followed to the real file or folder.
 pub fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, Error> {
     refuse_none(target, "observe")?;
+    if matches!(target, Target::Entry { .. }) {
+        return entry::observe(context, loadout, target);
+    }
     let path = check_target(context, target)?;
     check_reserved(context, loadout, path)?;
     Ok(observed(disk::read(&disk::real(path)?)?.as_ref()))
@@ -352,8 +418,11 @@ fn observed(disk: Option<&disk::Disk>) -> Observed {
 fn path_of(target: &Target) -> Result<&Path, Error> {
     match target {
         Target::Path { path } => Ok(path),
-        Target::Entry { .. } => Err(Error::EntryNeedsMcp {
-            target: label(target),
+        Target::Entry { .. } => Err(Error::InvalidContent {
+            message: format!(
+                "{} is an MCP entry, which state edits by key, never as a whole file",
+                label(target)
+            ),
         }),
         Target::Program { .. } => Err(Error::Program {
             target: label(target),
@@ -383,6 +452,31 @@ fn valid_observed(observed: &Observed) -> bool {
         Observed::Absent => true,
         Observed::Present { sha256 } => valid_sha(sha256),
         Observed::Installed => false,
+    }
+}
+
+/// What is wrong with an MCP entry target beyond its path: a pointer `mcp` can't use, an empty
+/// key, or a shape written in another format. `None` for a valid entry and for other targets.
+/// The shape itself is required by the record format, so an entry without one never loads.
+fn entry_problem(target: &Target) -> Option<&'static str> {
+    let Target::Entry {
+        format,
+        pointer,
+        key,
+        shape,
+        ..
+    } = target
+    else {
+        return None;
+    };
+    if mcp::parse(&[], *format, pointer).is_err() {
+        Some("records an MCP entry whose map pointer is invalid")
+    } else if key.is_empty() {
+        Some("records an MCP entry with an empty key")
+    } else if shape.is_toml() != (*format == McpFormat::Toml) {
+        Some("records an MCP entry whose shape and format disagree")
+    } else {
+        None
     }
 }
 
@@ -456,7 +550,7 @@ pub enum Health {
     Ok,
     Drifted,
     Missing,
-    /// Not checked: a reserved path, an unreadable target, or an entry this build can't read.
+    /// Not checked: a reserved path, an unreadable target, or an MCP config loadout can't parse.
     Unchecked(String),
 }
 

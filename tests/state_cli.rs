@@ -5,12 +5,13 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use loadout::context::Context;
+use loadout::manifest::{McpFormat, McpShape};
 use loadout::plan::{
     Action, Change, Content, FileContent, ItemKind, ItemRef, Observed, Plan, Target,
 };
 use loadout::platform::Os;
 use loadout::state::{self, Run, State};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Serializes spawning the CLI against holding a state lock in this process. A child forked by
 /// another test thread inherits every open descriptor until its exec closes the close-on-exec
@@ -412,4 +413,127 @@ fn a_junction_to_home_is_the_same_root() {
         path: alias.join(".gitconfig"),
     };
     assert!(state::observe(&machine.context, &machine.checkout(), &through).is_ok());
+}
+
+#[test]
+fn status_reports_an_mcp_entry_and_the_cli_rollback_removes_only_its_key() {
+    let machine = Machine::new();
+    let file = machine.home.join(".cursor/mcp.json");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        "{\"mcpServers\":{\"user\":{\"command\":\"mine\"}}}\n",
+    )
+    .unwrap();
+    let target = Target::Entry {
+        file: file.clone(),
+        format: McpFormat::Json,
+        pointer: "/mcpServers".to_owned(),
+        key: "github".to_owned(),
+        shape: McpShape::CursorJson,
+    };
+    let content = Content::Entry(json!({"url": "https://example.com/mcp"}));
+    {
+        let _forks = forks();
+        let action = Action {
+            item: ItemRef {
+                kind: ItemKind::Mcp,
+                id: "github".to_owned(),
+                agent: Some("cursor".to_owned()),
+            },
+            target: target.clone(),
+            change: Change::Create,
+            prior: state::observe(&machine.context, &machine.checkout(), &target).unwrap(),
+            content: Some(content.clone()),
+        };
+        let lock = state::lock(&machine.context).unwrap();
+        let mut state = State::load(&machine.context).unwrap();
+        let plan = Plan {
+            actions: vec![action.clone()],
+        };
+        let mut run =
+            Run::begin(&machine.context, &machine.checkout(), lock, &state, &plan).unwrap();
+        run.write(&action, &content).unwrap();
+        run.finish(&mut state).unwrap();
+    }
+    let output = machine.cli(&["status", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let report = json(&output);
+    assert_eq!(report["records"][0]["target"]["type"], "entry");
+    assert_eq!(report["records"][0]["health"], "ok");
+
+    let output = machine.cli(&["rollback"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let document: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert!(document["mcpServers"].get("github").is_none());
+    assert_eq!(document["mcpServers"]["user"], json!({"command": "mine"}));
+}
+
+/// Writes `value` to the Cursor key `key` in one finished run, the way U4 will; returns the run.
+fn entry_run(machine: &Machine, key: &str, value: &Value) -> (PathBuf, String) {
+    let file = machine.home.join(".cursor/mcp.json");
+    let target = Target::Entry {
+        file: file.clone(),
+        format: McpFormat::Json,
+        pointer: "/mcpServers".to_owned(),
+        key: key.to_owned(),
+        shape: McpShape::CursorJson,
+    };
+    let content = Content::Entry(value.clone());
+    let _forks = forks();
+    let action = Action {
+        item: ItemRef {
+            kind: ItemKind::Mcp,
+            id: key.to_owned(),
+            agent: Some("cursor".to_owned()),
+        },
+        target: target.clone(),
+        change: Change::Create,
+        prior: state::observe(&machine.context, &machine.checkout(), &target).unwrap(),
+        content: Some(content.clone()),
+    };
+    let lock = state::lock(&machine.context).unwrap();
+    let mut state = State::load(&machine.context).unwrap();
+    let plan = Plan {
+        actions: vec![action.clone()],
+    };
+    let mut run = Run::begin(&machine.context, &machine.checkout(), lock, &state, &plan).unwrap();
+    let id = run.id().to_owned();
+    run.write(&action, &content).unwrap();
+    run.finish(&mut state).unwrap();
+    (file, id)
+}
+
+// D4: a document loadout can't parse is a blocked fact (exit 4), never a crash or a pass.
+#[test]
+fn an_unparseable_recorded_document_is_unchecked_and_exits_4() {
+    let machine = Machine::new();
+    let (file, _) = entry_run(&machine, "github", &json!({"command": "x"}));
+    let duplicated = "{\"mcpServers\":{\"github\":{\"command\":\"x\"},\"github\":{}}}";
+    fs::write(&file, duplicated).unwrap();
+    let output = machine.cli(&["status", "--json"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let report = json(&output);
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["records"][0]["health"], "unchecked", "{report:#}");
+
+    let output = machine.cli(&["rollback"]);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert_eq!(fs::read_to_string(&file).unwrap(), duplicated);
+}
+
+// D4: a malformed journal is a contract fault (exit 1), not a blocked fact.
+#[test]
+fn a_journal_with_an_invalid_pointer_exits_1_and_changes_nothing() {
+    let machine = Machine::new();
+    let (file, run) = entry_run(&machine, "github", &json!({"command": "x"}));
+    let path = machine.state.join("runs").join(&run).join("journal.json");
+    let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    journal["entries"][0]["target"]["pointer"] = json!("mcpServers");
+    fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    let before = fs::read(&file).unwrap();
+    let output = machine.cli(&["rollback"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("invalid"), "{}", stderr(&output));
+    assert_eq!(fs::read(&file).unwrap(), before);
 }

@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::disk::{self, io};
-use super::{Error, Record, clean_absolute, label, target_shape, valid_observed, valid_sha};
+use super::{
+    Error, Record, clean_absolute, entry_problem, label, target_shape, valid_observed, valid_sha,
+};
 use crate::plan::{Change, ItemRef, Observed, Target};
 
 pub(super) const FILE: &str = "journal.json";
@@ -53,6 +55,18 @@ pub(super) enum BackupKind {
     Pending,
     File,
     Tree,
+    /// One MCP server's value as canonical JSON; never the shared document it came from.
+    Entry,
+}
+
+/// The whole-byte identity (`hash::document`) of a staged MCP config: the document bytes the
+/// edit was computed from, and the bytes staged to replace them. It lets rollback recognize its
+/// own staged scratch exactly. It verifies bytes against the recorded intent; it can't make a
+/// journal rewritten by the state dir's owner trustworthy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Staged {
+    pub(super) base: String,
+    pub(super) staged: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +85,13 @@ pub(super) struct Entry {
     pub(super) created: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
+    /// For an MCP entry that was edited: the forward transaction's staged document, recorded
+    /// before staging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) document: Option<Staged>,
+    /// For an MCP entry that rollback is restoring: its staged document, recorded before staging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) rollback: Option<Staged>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +225,7 @@ impl Entry {
             (Observed::Absent, None) => {}
             _ => return Err("its backup slot doesn't match its prior".to_owned()),
         }
+        self.validate_entry()?;
         if let Some(outermost) = self.created.first() {
             let chain = self
                 .created
@@ -214,6 +236,69 @@ impl Entry {
                 return Err(
                     "its created folders are not one chain of clean absolute paths".to_owned(),
                 );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Entry {
+    /// Whether the action really edited its target: it started, failed after starting, or
+    /// finished with a result other than what was there. A done action whose result equals its
+    /// prior (an equal adopt) wrote nothing.
+    fn wrote(&self) -> bool {
+        match self.step {
+            Step::Started | Step::Failed => true,
+            Step::Done => self.after.as_ref() != Some(&self.prior),
+            Step::Pending | Step::Released => false,
+        }
+    }
+
+    /// An MCP entry's own rules, as a state machine over its step, result, backup, and staged
+    /// document hashes. An edit that really happened journaled its forward `document` intent
+    /// before staging, and backed up the key's old value when it had one. An equal adopt that
+    /// wrote nothing, a pending action, and a release carry neither. A rollback intent belongs
+    /// only to an edit that happened. A path or tree entry carries none of these.
+    fn validate_entry(&self) -> Result<(), String> {
+        let is_entry = matches!(self.target, Target::Entry { .. });
+        let staged = [self.document.as_ref(), self.rollback.as_ref()];
+        if staged
+            .iter()
+            .flatten()
+            .any(|staged| !valid_sha(&staged.base) || !valid_sha(&staged.staged))
+        {
+            return Err("has an invalid staged document hash".to_owned());
+        }
+        let backup_kind = self.backup.as_ref().map(|backup| backup.kind);
+        if !is_entry {
+            if staged.iter().any(Option::is_some) {
+                return Err("records MCP document hashes on a path".to_owned());
+            }
+            if backup_kind == Some(BackupKind::Entry) {
+                return Err("records an MCP key backup for a path".to_owned());
+            }
+            return Ok(());
+        }
+        if let Some(problem) = entry_problem(&self.target) {
+            return Err(problem.to_owned());
+        }
+        if matches!(backup_kind, Some(BackupKind::File | BackupKind::Tree)) {
+            return Err("records a file or folder backup for an MCP key".to_owned());
+        }
+        let had_value = matches!(self.prior, Observed::Present { .. });
+        if self.wrote() {
+            if self.document.is_none() {
+                return Err("an MCP edit that happened has no staged document hash".to_owned());
+            }
+            if had_value && backup_kind != Some(BackupKind::Entry) {
+                return Err("an MCP edit that replaced a value has no backup of it".to_owned());
+            }
+        } else {
+            if staged.iter().any(Option::is_some) {
+                return Err("an MCP action that wrote nothing records staged documents".to_owned());
+            }
+            if backup_kind == Some(BackupKind::Entry) {
+                return Err("an MCP action that wrote nothing records a backup".to_owned());
             }
         }
         Ok(())
@@ -247,6 +332,13 @@ impl Backup {
             }
             BackupKind::Tree => disk::check_tree(&self.dirs, &self.modes)
                 .map_err(|error| format!("its tree backup: {error}")),
+            BackupKind::Entry => {
+                if self.modes.is_empty() && self.dirs.is_empty() {
+                    Ok(())
+                } else {
+                    Err("its MCP key backup lists file or folder modes".to_owned())
+                }
+            }
         }
     }
 }

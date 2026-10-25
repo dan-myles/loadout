@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 const FILE: &[u8] = b"loadout:file:v1\n";
 const TREE: &[u8] = b"loadout:tree:v1\n";
 const ENTRY: &[u8] = b"loadout:mcp-entry:v1\n";
+const DOCUMENT: &[u8] = b"loadout:document:v1\n";
 
 pub(super) struct Blob<'a> {
     pub(super) bytes: &'a [u8],
@@ -54,6 +55,16 @@ pub(super) fn tree<'a>(files: impl IntoIterator<Item = (&'a str, Blob<'a>)>) -> 
         hasher.update(length(blob.bytes));
         hasher.update(blob.bytes);
     }
+    hex(&hasher.finalize())
+}
+
+/// The exact bytes of a whole shared document, such as a staged MCP config. Only scratch
+/// identity uses it; ownership of an MCP server stays per key (`entry`).
+pub(super) fn document(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DOCUMENT);
+    hasher.update(length(bytes));
+    hasher.update(bytes);
     hex(&hasher.finalize())
 }
 
@@ -168,9 +179,23 @@ mod tests {
             bytes: b"",
             executable: false,
         };
-        let digests = [file(&empty), tree([]), entry(&json!(""))];
-        assert_ne!(digests[0], digests[1]);
-        assert_ne!(digests[1], digests[2]);
-        assert_ne!(digests[0], digests[2]);
+        let digests = [file(&empty), tree([]), entry(&json!("")), document(b"")];
+        for (index, digest) in digests.iter().enumerate() {
+            for other in &digests[index + 1..] {
+                assert_ne!(digest, other);
+            }
+        }
+    }
+
+    #[test]
+    fn document_hash_follows_the_documented_byte_layout() {
+        let bytes = b"{\"mcpServers\":{}}\n";
+        let expected = sha(&[
+            b"loadout:document:v1\n",
+            &u64::try_from(bytes.len()).unwrap().to_be_bytes(),
+            bytes,
+        ]);
+        assert_eq!(document(bytes), expected);
+        assert_ne!(document(b"a"), document(b"a\n"));
     }
 }

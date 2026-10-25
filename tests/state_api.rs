@@ -621,7 +621,7 @@ fn reserved_targets_are_never_observed_or_written() {
 }
 
 #[test]
-fn mcp_entries_are_refused_until_the_mcp_module_lands() {
+fn an_mcp_entry_is_written_by_key_and_rolled_back() {
     let machine = Machine::new();
     let entry = Target::Entry {
         file: machine.path(".cursor/mcp.json"),
@@ -630,8 +630,10 @@ fn mcp_entries_are_refused_until_the_mcp_module_lands() {
         key: "github".to_owned(),
         shape: McpShape::CursorJson,
     };
-    let error = state::observe(&machine.context, &machine.loadout, &entry).unwrap_err();
-    assert!(matches!(error, Error::EntryNeedsMcp { .. }), "{error}");
+    assert_eq!(
+        state::observe(&machine.context, &machine.loadout, &entry).unwrap(),
+        Observed::Absent
+    );
 
     let content = Content::Entry(json!({"url": "https://example.com/mcp"}));
     let action = Action {
@@ -640,17 +642,24 @@ fn mcp_entries_are_refused_until_the_mcp_module_lands() {
             id: "github".to_owned(),
             agent: Some("cursor".to_owned()),
         },
-        target: entry,
+        target: entry.clone(),
         change: Change::Create,
         prior: Observed::Absent,
         content: Some(content.clone()),
     };
     let mut run = machine.begin(vec![action.clone()]);
-    assert!(matches!(
-        run.write(&action, &content),
-        Err(Error::EntryNeedsMcp { .. })
-    ));
-    assert!(!machine.path(".cursor").exists());
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    run.finish(&mut state).unwrap();
+    assert_eq!(
+        state::observe(&machine.context, &machine.loadout, &entry).unwrap(),
+        state::digest(&content).unwrap()
+    );
+    machine.rollback(None).unwrap();
+    assert_eq!(
+        state::observe(&machine.context, &machine.loadout, &entry).unwrap(),
+        Observed::Absent
+    );
 }
 
 #[test]
@@ -1755,4 +1764,171 @@ fn a_none_target_in_the_state_file_or_a_journal_is_invalid() {
     let error = machine.rollback(None).unwrap_err();
     assert!(matches!(error, Error::Invalid { .. }), "{error}");
     assert_eq!(read(&path), "x", "the destination is untouched");
+}
+
+// U4 seam: the caller keeps the state lock after finishing, whether or not finishing worked.
+#[test]
+fn finish_with_lock_hands_back_the_held_lock_on_success() {
+    let machine = Machine::new();
+    let path = machine.path(".one");
+    let content = file("one\n", false);
+    let action = machine.action(&path, content.clone());
+    let mut run = machine.begin(vec![action.clone()]);
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    let (lock, result) = run.finish_with_lock(&mut state);
+    result.unwrap();
+    assert!(matches!(
+        state::lock(&machine.context),
+        Err(Error::Locked { .. })
+    ));
+    assert!(machine.state().record(&target(&path)).is_some());
+    assert_eq!(
+        state::runs(&machine.context).unwrap()[0].status,
+        Some(RunStatus::Finished)
+    );
+    drop(lock);
+    drop(state::lock(&machine.context).unwrap());
+}
+
+#[test]
+fn finish_with_lock_hands_back_the_held_lock_when_saving_fails() {
+    let machine = Machine::new();
+    let path = machine.path(".one");
+    let content = file("one\n", false);
+    let action = machine.action(&path, content.clone());
+    let mut run = machine.begin(vec![action.clone()]);
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    let state_file = machine.context.state.join("state.json");
+    let _ = fs::remove_file(&state_file);
+    fs::create_dir(&state_file).unwrap();
+    fs::write(state_file.join("occupant"), "x").unwrap();
+    let (lock, result) = run.finish_with_lock(&mut state);
+    assert!(result.is_err());
+    assert!(matches!(
+        state::lock(&machine.context),
+        Err(Error::Locked { .. })
+    ));
+    assert_eq!(
+        state::runs(&machine.context).unwrap()[0].status,
+        Some(RunStatus::InProgress),
+        "the journal still says running, and the lock is still held"
+    );
+    drop(lock);
+    assert_eq!(
+        state::runs(&machine.context).unwrap()[0].status,
+        Some(RunStatus::Interrupted)
+    );
+}
+
+#[test]
+fn finish_still_releases_the_lock() {
+    let machine = Machine::new();
+    machine.apply(&machine.path(".one"), &file("one\n", false));
+    drop(state::lock(&machine.context).unwrap());
+}
+
+// U4 seam: the state file saves, then the journal can't be replaced; the lock still comes back.
+#[test]
+fn finish_with_lock_hands_back_the_held_lock_when_the_journal_save_fails() {
+    let machine = Machine::new();
+    let path = machine.path(".one");
+    let content = file("one\n", false);
+    let action = machine.action(&path, content.clone());
+    let mut run = machine.begin(vec![action.clone()]);
+    let id = run.id().to_owned();
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    let journal = machine.run_dir(&id).join("journal.json");
+    fs::remove_file(&journal).unwrap();
+    fs::create_dir(&journal).unwrap();
+    fs::write(journal.join("occupant"), "x").unwrap();
+    let (lock, result) = run.finish_with_lock(&mut state);
+    assert!(result.is_err());
+    assert!(matches!(
+        state::lock(&machine.context),
+        Err(Error::Locked { .. })
+    ));
+    assert!(
+        machine.state().record(&target(&path)).is_some(),
+        "the state file was saved before the journal"
+    );
+    assert!(
+        journal.join("occupant").exists(),
+        "the journal was never replaced by a finished one"
+    );
+    assert_ne!(
+        state::runs(&machine.context).unwrap()[0].status,
+        Some(RunStatus::Finished)
+    );
+    lock.check(&machine.context).unwrap();
+    drop(lock);
+    drop(state::lock(&machine.context).unwrap());
+}
+
+// U4 seam: a held lock checked against a context, read-only.
+#[test]
+fn lock_check_admits_the_locked_state_dir_and_its_aliases_and_nothing_else() {
+    let machine = Machine::new();
+    let lock = state::lock(&machine.context).unwrap();
+    lock.check(&machine.context).unwrap();
+    assert!(
+        matches!(state::lock(&machine.context), Err(Error::Locked { .. })),
+        "checking keeps the lock held"
+    );
+
+    let other_dir = machine.path(".local/state/other");
+    let other = isolated(&machine.home, &other_dir);
+    drop(state::lock(&other).unwrap());
+    assert!(matches!(lock.check(&other), Err(Error::WrongLock { .. })));
+
+    let absent_dir = machine.path(".local/state/absent");
+    assert!(matches!(
+        lock.check(&isolated(&machine.home, &absent_dir)),
+        Err(Error::Io { .. })
+    ));
+    assert!(!absent_dir.exists(), "checking never creates the state dir");
+
+    let file_dir = machine.path(".local/state/file");
+    fs::write(&file_dir, "").unwrap();
+    assert!(matches!(
+        lock.check(&isolated(&machine.home, &file_dir)),
+        Err(Error::Invalid { .. })
+    ));
+
+    #[cfg(unix)]
+    {
+        let alias = machine.path("state-alias");
+        std::os::unix::fs::symlink(&machine.context.state, &alias).unwrap();
+        lock.check(&isolated(&machine.home, &alias)).unwrap();
+        let dangling = machine.path("state-dangling");
+        std::os::unix::fs::symlink(machine.path("nowhere"), &dangling).unwrap();
+        assert!(matches!(
+            lock.check(&isolated(&machine.home, &dangling)),
+            Err(Error::Io { .. })
+        ));
+        assert!(!machine.path("nowhere").exists());
+    }
+
+    let path = machine.path(".one");
+    let content = file("one\n", false);
+    let action = machine.action(&path, content.clone());
+    let mut run = Run::begin(
+        &machine.context,
+        &machine.loadout,
+        lock,
+        &machine.state(),
+        &Plan {
+            actions: vec![action.clone()],
+        },
+    )
+    .unwrap();
+    run.write(&action, &content).unwrap();
+    let mut state = machine.state();
+    run.finish(&mut state).unwrap();
+    assert!(
+        machine.state().record(&target(&path)).is_some(),
+        "the checked lock still begins an ordinary run"
+    );
 }
