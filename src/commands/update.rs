@@ -28,6 +28,9 @@ pub struct Args {
     /// The supervised worker of a background run; only `loadout update --background` starts it
     #[arg(long, hide = true, requires = "background")]
     pub worker: bool,
+    /// The supervisor run this worker belongs to, recorded with what the worker did
+    #[arg(long, hide = true, requires = "worker", value_name = "ID")]
+    pub run: Option<String>,
 }
 
 /// `loadout update`: takes the lock, refuses on an unfinished run, fetches and fast-forwards
@@ -111,6 +114,7 @@ fn worker(args: &Args, ambient: &Context) -> anyhow::Result<Exit> {
     }
     .supervised(supervised);
     let mut record = LastRun::new(sync::now(), RunResult::Failed, 1);
+    record.supervisor.clone_from(&args.run);
     let result = background_update(&context, &mut record);
     record.ended = sync::now();
     match &result {

@@ -305,6 +305,11 @@ fn a_background_run_is_supervised_applies_and_leaves_its_records() {
     assert_eq!(run["result"], "applied", "{run}");
     assert_eq!(run["fetched"]["result"], "advanced", "{run}");
     assert_eq!(run["exit"], 0, "{run}");
+    assert!(supervisor["run"].is_string(), "{supervisor}");
+    assert_eq!(
+        run["supervisor"], supervisor["run"],
+        "the worker record is this run's"
+    );
     let log = fs::read_to_string(machine.state.join("background").join("worker.log")).unwrap();
     assert!(log.contains("fetched: fast-forwarded"), "{log}");
     assert!(

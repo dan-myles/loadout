@@ -38,9 +38,13 @@ pub struct Worker<'a> {
 /// How the supervisor ended the run, as `supervisor.json` records it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorRecord {
+    /// This supervisor run's own id. Its worker records the same id in `last-run.json`, so a
+    /// worker record from an earlier run is never read as this run's.
+    pub run: String,
     pub started: u64,
     pub ended: u64,
-    /// `exited`, `timed-out`, `lost`, or `not-started`.
+    /// `running` (written before the worker starts, and left so if the supervisor itself dies),
+    /// then `exited`, `timed-out`, `lost`, or `not-started`.
     pub outcome: String,
     /// The worker's exit code, when it exited by itself.
     pub code: Option<i32>,
@@ -70,8 +74,23 @@ pub fn supervise(context: &Context, worker: &Worker<'_>) -> Result<u8, Error> {
 /// does, and nothing the loadout or the environment says can change them.
 pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) -> Result<u8, Error> {
     let started = now();
+    let run = format!("{started}-{}-{}", std::process::id(), super::stamp_nanos());
+    save(
+        context,
+        &SupervisorRecord {
+            run: run.clone(),
+            started,
+            ended: started,
+            outcome: "running".to_owned(),
+            code: None,
+            cancelled: false,
+            problem: None,
+            log_complete: false,
+            log_dropped: 0,
+        },
+    )?;
     let mut command = Command::new(worker.exe);
-    command.args(["update", "--background", "--worker"]);
+    command.args(["update", "--background", "--worker", "--run", &run]);
     if let Some((path, recorded)) = worker.service {
         command
             .arg("--service")
@@ -106,6 +125,7 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
                 _ => 1,
             };
             let record = SupervisorRecord {
+                run: run.clone(),
                 started,
                 ended: now(),
                 outcome: name.to_owned(),
@@ -119,6 +139,7 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
         }
         Err(error) => {
             let record = SupervisorRecord {
+                run: run.clone(),
                 started,
                 ended: now(),
                 outcome: "not-started".to_owned(),
@@ -131,15 +152,20 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
             (record, None, 1)
         }
     };
-    let json = serde_json::to_vec_pretty(&record).map_err(|error| state::Error::Invalid {
-        path: Private::Supervisor.path(context),
-        message: error.to_string(),
-    })?;
-    state::write_private(context, Private::Supervisor, &json)?;
+    save(context, &record)?;
     if let Some(log) = log {
         state::write_private(context, Private::WorkerLog, &log)?;
     }
     Ok(exit)
+}
+
+fn save(context: &Context, record: &SupervisorRecord) -> Result<(), Error> {
+    let json = serde_json::to_vec_pretty(record).map_err(|error| state::Error::Invalid {
+        path: Private::Supervisor.path(context),
+        message: error.to_string(),
+    })?;
+    state::write_private(context, Private::Supervisor, &json)?;
+    Ok(())
 }
 
 /// The Windows launcher, `loadout-background.exe`, given its arguments: `--version`, or
@@ -214,6 +240,8 @@ pub enum RunResult {
 /// What the worker did, without any content: `last-run.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastRun {
+    /// The id of the supervisor run that started this worker (`SupervisorRecord::run`).
+    pub supervisor: Option<String>,
     pub started: u64,
     pub ended: u64,
     pub result: RunResult,
@@ -231,6 +259,7 @@ pub struct LastRun {
 impl LastRun {
     pub fn new(started: u64, result: RunResult, exit: u8) -> Self {
         Self {
+            supervisor: None,
             started,
             ended: started,
             result,
@@ -272,14 +301,38 @@ pub struct Summary {
     /// A record that exists but can't be read.
     pub problem: Option<String>,
     pub log: Option<PathBuf>,
+    /// The supervisor record says `running` and another process holds the state lock: a run is
+    /// going right now.
+    pub in_progress: bool,
 }
 
 impl Summary {
-    /// No background run yet, or the last one ended cleanly and left the machine healthy.
+    /// The worker record that belongs to the supervisor's run, if there is one: a record left by
+    /// an earlier run, or by no supervisor at all, never counts.
+    fn worker(&self) -> Option<&LastRun> {
+        let supervisor = self.supervisor.as_ref()?;
+        self.last_run
+            .as_ref()
+            .filter(|run| run.supervisor.as_deref() == Some(supervisor.run.as_str()))
+    }
+
+    /// No background run yet, a run going right now, or a last run whose supervisor confirmed
+    /// its worker exited and its tree stopped, whose own worker record says the machine is
+    /// healthy, and whose exit code is the one that record gives.
     pub fn healthy(&self) -> bool {
-        self.problem.is_none()
-            && self.supervisor.as_ref().is_none_or(SupervisorRecord::clean)
-            && self.last_run.as_ref().is_none_or(LastRun::healthy)
+        if self.problem.is_some() {
+            return false;
+        }
+        let Some(supervisor) = &self.supervisor else {
+            return self.last_run.is_none();
+        };
+        if self.in_progress {
+            return true;
+        }
+        supervisor.clean()
+            && self
+                .worker()
+                .is_some_and(|run| run.healthy() && supervisor.code == Some(i32::from(run.exit)))
     }
 
     /// One line on why it isn't healthy, or what happened.
@@ -288,7 +341,10 @@ impl Summary {
             return problem.clone();
         }
         let supervisor = self.supervisor.as_ref().map(|record| {
-            if record.clean() {
+            if record.outcome == "running" {
+                "never finished: the supervisor stopped before it recorded how the run ended"
+                    .to_owned()
+            } else if record.clean() {
                 format!("exited {}", record.code.unwrap_or(1))
             } else {
                 let mut text = record.outcome.clone();
@@ -313,12 +369,22 @@ impl Summary {
                 None => result,
             }
         });
+        if self.in_progress {
+            return "a background run is going now".to_owned();
+        }
+        let worker = if self.supervisor.is_some() && self.worker().is_none() {
+            None
+        } else {
+            worker
+        };
         match (supervisor, worker) {
             (None, None) => "no background run yet".to_owned(),
             (Some(supervisor), None) => {
-                format!("supervisor {supervisor}; the worker left no record")
+                format!("supervisor {supervisor}; the worker left no record of this run")
             }
-            (None, Some(worker)) => format!("worker {worker}"),
+            (None, Some(worker)) => {
+                format!("worker {worker}, but no supervisor recorded that run")
+            }
             (Some(supervisor), Some(worker)) => format!("worker {worker}; supervisor {supervisor}"),
         }
     }
@@ -337,13 +403,19 @@ pub fn summary(context: &Context) -> Summary {
     let supervisor_bytes = read(Private::Supervisor);
     let run_bytes = read(Private::LastRun);
     let log = read(Private::WorkerLog).map(|_| Private::WorkerLog.path(context));
-    let supervisor = parse(context, supervisor_bytes, Private::Supervisor, &mut problem);
+    let supervisor: Option<SupervisorRecord> =
+        parse(context, supervisor_bytes, Private::Supervisor, &mut problem);
     let last_run = parse(context, run_bytes, Private::LastRun, &mut problem);
+    let in_progress = supervisor
+        .as_ref()
+        .is_some_and(|record| record.outcome == "running")
+        && matches!(state::busy(context), Ok(true));
     Summary {
         supervisor,
         last_run,
         problem,
         log,
+        in_progress,
     }
 }
 
@@ -384,8 +456,14 @@ pub(super) fn check(context: &Context) -> Check {
 mod tests {
     use super::*;
 
-    fn supervisor(outcome: &str, code: Option<i32>, problem: Option<&str>) -> SupervisorRecord {
+    fn supervisor(
+        run: &str,
+        outcome: &str,
+        code: Option<i32>,
+        problem: Option<&str>,
+    ) -> SupervisorRecord {
         SupervisorRecord {
+            run: run.to_owned(),
             started: 1,
             ended: 2,
             outcome: outcome.to_owned(),
@@ -397,49 +475,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_blocked_timed_out_or_uncontained_run_is_not_healthy() {
-        let applied = LastRun::new(1, RunResult::Applied, 0);
-        let clean = Summary {
-            supervisor: Some(supervisor("exited", Some(0), None)),
-            last_run: Some(applied.clone()),
+    fn worker(run: &str, result: RunResult, exit: u8) -> LastRun {
+        let mut record = LastRun::new(1, result, exit);
+        record.supervisor = Some(run.to_owned());
+        record
+    }
+
+    fn summary(supervisor: Option<SupervisorRecord>, last_run: Option<LastRun>) -> Summary {
+        Summary {
+            supervisor,
+            last_run,
             problem: None,
             log: None,
-        };
-        assert!(clean.healthy(), "{}", clean.describe());
+            in_progress: false,
+        }
+    }
 
-        let blocked = Summary {
-            last_run: Some(LastRun::new(1, RunResult::Blocked, 4)),
-            ..clean.clone()
-        };
-        assert!(!blocked.healthy());
-
-        let timed_out = Summary {
-            supervisor: Some(supervisor("timed-out", None, None)),
-            ..clean.clone()
-        };
-        assert!(!timed_out.healthy());
-
-        let uncontained = Summary {
-            supervisor: Some(supervisor(
-                "exited",
-                Some(0),
-                Some("processes it started are still running"),
-            )),
-            ..clean.clone()
-        };
-        assert!(!uncontained.healthy());
-        assert!(
-            uncontained.describe().contains("still running"),
-            "{}",
-            uncontained.describe()
+    #[test]
+    fn only_a_clean_supervisor_with_its_own_healthy_worker_record_is_healthy() {
+        let success = summary(
+            Some(supervisor("B", "exited", Some(0), None)),
+            Some(worker("B", RunResult::Applied, 0)),
         );
+        assert!(success.healthy(), "{}", success.describe());
+        let disabled = summary(
+            Some(supervisor("B", "exited", Some(0), None)),
+            Some(worker("B", RunResult::Disabled, 0)),
+        );
+        assert!(disabled.healthy(), "{}", disabled.describe());
+        assert!(summary(None, None).healthy(), "no background run yet");
+    }
 
-        let disabled = Summary {
-            last_run: Some(LastRun::new(1, RunResult::Disabled, 0)),
-            ..clean
+    #[test]
+    fn a_failed_supervisor_with_no_worker_record_is_not_healthy() {
+        let failed = summary(Some(supervisor("B", "exited", Some(1), None)), None);
+        assert!(!failed.healthy());
+        assert!(
+            failed.describe().contains("no record of this run"),
+            "{}",
+            failed.describe()
+        );
+        let never = summary(
+            Some(supervisor(
+                "B",
+                "not-started",
+                None,
+                Some("cannot start it"),
+            )),
+            None,
+        );
+        assert!(!never.healthy());
+    }
+
+    #[test]
+    fn an_earlier_successful_worker_record_never_masks_a_new_failure() {
+        let stale = summary(
+            Some(supervisor("B", "exited", Some(1), None)),
+            Some(worker("A", RunResult::Applied, 0)),
+        );
+        assert!(!stale.healthy(), "{}", stale.describe());
+        assert!(
+            stale.describe().contains("no record of this run"),
+            "{}",
+            stale.describe()
+        );
+        let unlabelled = summary(
+            Some(supervisor("B", "exited", Some(0), None)),
+            Some(LastRun::new(1, RunResult::Applied, 0)),
+        );
+        assert!(
+            !unlabelled.healthy(),
+            "a record from no supervisor run doesn't count"
+        );
+        let mismatch = summary(
+            Some(supervisor("B", "exited", Some(1), None)),
+            Some(worker("B", RunResult::Applied, 0)),
+        );
+        assert!(
+            !mismatch.healthy(),
+            "the exit code must be the one the record gives"
+        );
+        let orphan = summary(None, Some(worker("A", RunResult::Applied, 0)));
+        assert!(!orphan.healthy());
+    }
+
+    #[test]
+    fn a_timed_out_uncontained_blocked_or_unfinished_run_is_not_healthy() {
+        let run = || Some(worker("B", RunResult::Applied, 0));
+        for unhealthy in [
+            summary(Some(supervisor("B", "timed-out", None, None)), run()),
+            summary(
+                Some(supervisor(
+                    "B",
+                    "exited",
+                    Some(0),
+                    Some("processes it started are still running"),
+                )),
+                run(),
+            ),
+            summary(Some(supervisor("B", "running", None, None)), run()),
+            summary(
+                Some(supervisor("B", "exited", Some(4), None)),
+                Some(worker("B", RunResult::Blocked, 4)),
+            ),
+        ] {
+            assert!(!unhealthy.healthy(), "{}", unhealthy.describe());
+        }
+        let mut uncomplete = supervisor("B", "exited", Some(0), None);
+        uncomplete.log_complete = false;
+        assert!(!summary(Some(uncomplete), run()).healthy());
+        let going = Summary {
+            in_progress: true,
+            ..summary(Some(supervisor("B", "running", None, None)), None)
         };
-        assert!(disabled.healthy());
+        assert!(going.healthy(), "a run going right now is not a failure");
     }
 
     #[test]
