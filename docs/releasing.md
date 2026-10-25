@@ -287,7 +287,11 @@ exactly the rule above, with no token:
 - **Latest tag.** It reads the tag from the `releases/latest` redirect.
 - **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
   the exact sidecar and a matching hash.
-- **Archive.** It reads the expected binaries from memory, checking each name, type and size.
+- **Archive.** It reads the expected binaries from memory, checking each name, type and size. A
+  `.tar.gz` is read entry by raw entry, so every header, metadata included, counts against the entry,
+  size and total limits before any content is read. Only USTAR folder and regular-file entries are
+  accepted; a GNU long-name or PAX entry is refused from its header, since `package.py` writes plain
+  USTAR.
 - **Lock.** It takes the install folder's lock as the scripts do, without waiting; a held lock is
   reported (`Busy`) and nothing changes.
 - **Staging.** Under the lock it stages each binary with `create_new`, and requires its exact

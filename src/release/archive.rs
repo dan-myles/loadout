@@ -3,7 +3,8 @@
 //! Nothing is extracted to disk here: every entry's name and type is checked first, only the
 //! expected binaries are read, and each read is bounded. A release archive holds exactly
 //! `loadout-<target>/`, the expected binaries, and optionally `README.md` and `LICENSE*`, all as
-//! plain names directly inside that folder (see `scripts/release/package.py`).
+//! plain names directly inside that folder (see `scripts/release/package.py`). A `.tar.gz` is
+//! plain USTAR, with no GNU or PAX extension entries.
 
 use std::io::Read;
 
@@ -13,6 +14,10 @@ const BINARY_LIMIT: u64 = 128 * 1024 * 1024;
 /// The sum of the sizes every entry declares; an archive claiming more is refused before any of
 /// its content is decompressed.
 const DECLARED_LIMIT: u64 = 1024 * 1024 * 1024;
+/// All the decompressed tar stream an archive within the limits above can need: every entry's
+/// header and padded content, and the end-of-archive blocks.
+#[cfg(not(windows))]
+const STREAM_LIMIT: u64 = DECLARED_LIMIT + (MAX_ENTRIES as u64 + 2) * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Binary {
@@ -89,10 +94,11 @@ impl Collect {
         }
     }
 
+    /// Counts one physical entry, before any of its content is read.
     fn count(&mut self, size: u64) -> Result<(), String> {
         self.entries += 1;
         self.declared = self.declared.saturating_add(size);
-        if self.entries > MAX_ENTRIES || self.declared > DECLARED_LIMIT {
+        if self.entries > MAX_ENTRIES || size > BINARY_LIMIT || self.declared > DECLARED_LIMIT {
             return Err("the archive is larger than any loadout release".to_owned());
         }
         Ok(())
@@ -152,22 +158,46 @@ pub(super) fn read(archive: &[u8], target: &str) -> Result<Vec<Binary>, String> 
 
 #[cfg(not(windows))]
 fn read_tar_gz(archive: &[u8], target: &str, windows: bool) -> Result<Vec<Binary>, String> {
+    read_tar(
+        flate2::read::GzDecoder::new(archive).take(STREAM_LIMIT),
+        target,
+        windows,
+    )
+}
+
+/// Reads the tar's physical entries raw. The tar crate's default iterator reads a GNU long name or
+/// long link, or a PAX header, into memory with no bound before yielding the entry it describes,
+/// so those would escape every limit here. Raw, each header is counted against the limits and
+/// refused unless it is a USTAR folder or regular file, before any of its content is read.
+#[cfg(not(windows))]
+fn read_tar(stream: impl Read, target: &str, windows: bool) -> Result<Vec<Binary>, String> {
     let unreadable = |error: std::io::Error| format!("cannot read the archive: {error}");
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let mut tar = tar::Archive::new(stream);
     let mut collect = Collect::new(windows);
-    for entry in tar.entries().map_err(unreadable)? {
+    for entry in tar.entries().map_err(unreadable)?.raw(true) {
         let entry = entry.map_err(unreadable)?;
         let size = entry.size();
         collect.count(size)?;
-        let kind = entry.header().entry_type();
+        let header = entry.header();
+        let kind = header.entry_type();
         let raw = entry.path_bytes().into_owned();
+        let shown = String::from_utf8_lossy(&raw).into_owned();
+        if !(kind.is_dir() || kind.is_file()) {
+            return Err(format!(
+                "entry {shown:?} is a {kind:?}, but a release holds only regular files and its folder"
+            ));
+        }
+        if header.as_ustar().is_none() {
+            return Err(format!(
+                "entry {shown:?} is not a USTAR entry, but a release archive is plain USTAR"
+            ));
+        }
         match place(&raw, target)? {
-            Place::Folder if kind.is_dir() => {}
+            Place::Folder if kind.is_dir() && size == 0 => {}
             Place::Leaf(leaf) if kind.is_file() => collect.file(leaf, size, entry)?,
             _ => {
                 return Err(format!(
-                    "entry {:?} is a {kind:?}, but a release holds only regular files and its folder",
-                    String::from_utf8_lossy(&raw)
+                    "entry {shown:?} is a {kind:?}, but a release holds only regular files and its folder"
                 ));
             }
         }
@@ -392,6 +422,187 @@ mod tests {
                 );
             }
             assert!(read(b"not gzip at all", TARGET).is_err());
+        }
+
+        const BINARY: &str = "loadout-x86_64-unknown-linux-musl/loadout";
+        const EXTENSIONS: [tar::EntryType; 5] = [
+            tar::EntryType::GNULongName,
+            tar::EntryType::GNULongLink,
+            tar::EntryType::XHeader,
+            tar::EntryType::XGlobalHeader,
+            tar::EntryType::GNUSparse,
+        ];
+
+        /// One raw header block, with whatever size it claims.
+        fn header(name: &str, kind: tar::EntryType, size: u64) -> Vec<u8> {
+            let mut header = tar::Header::new_ustar();
+            header.set_path(name).unwrap();
+            header.set_entry_type(kind);
+            header.set_mode(0o644);
+            header.set_size(size);
+            header.set_cksum();
+            header.as_bytes().to_vec()
+        }
+
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        /// A tar stream that never ends, and how much of it was read.
+        struct Endless {
+            start: std::io::Cursor<Vec<u8>>,
+            read: std::rc::Rc<std::cell::Cell<u64>>,
+        }
+
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let mut read = self.start.read(buf)?;
+                if read == 0 {
+                    buf.fill(b'a');
+                    read = buf.len();
+                }
+                self.read.set(self.read.get() + read as u64);
+                Ok(read)
+            }
+        }
+
+        /// Reads `start` followed by endless content, returning the error and the bytes read.
+        fn refused_after(start: Vec<u8>) -> (String, u64) {
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let stream = Endless {
+                start: std::io::Cursor::new(start),
+                read: std::rc::Rc::clone(&read),
+            };
+            let error = read_tar(stream, TARGET, false).unwrap_err();
+            (error, read.get())
+        }
+
+        #[test]
+        fn huge_gnu_and_pax_metadata_is_refused_from_its_header_alone() {
+            for kind in EXTENSIONS {
+                for size in [BINARY_LIMIT + 1, 1 << 40] {
+                    let (error, read) = refused_after(header(BINARY, kind, size));
+                    assert!(
+                        error.contains("larger than any loadout release"),
+                        "{kind:?} {size}: {error}"
+                    );
+                    assert_eq!(read, 512, "{kind:?} {size}: only its header is read");
+                }
+            }
+        }
+
+        #[test]
+        fn small_or_truncated_gnu_and_pax_metadata_is_refused_unread() {
+            for kind in EXTENSIONS {
+                let (error, read) = refused_after(header(BINARY, kind, 30));
+                assert!(
+                    error.contains("a release holds only regular files"),
+                    "{kind:?}: {error}"
+                );
+                assert_eq!(read, 512, "{kind:?}: only its header is read");
+
+                // Declares 1000 bytes and ends after 100: still refused from the header.
+                let mut truncated = header(BINARY, kind, 1000);
+                truncated.extend_from_slice(&[b'a'; 100]);
+                let error = read(&gzip(&truncated), TARGET).unwrap_err();
+                assert!(
+                    error.contains("a release holds only regular files"),
+                    "{kind:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn compressed_metadata_far_larger_than_the_limits_is_refused() {
+            // A small gzip whose first entry claims 2 GiB of long name, with 8 MiB of it present.
+            let mut tar = header(BINARY, tar::EntryType::GNULongName, 2 << 30);
+            tar.resize(tar.len() + (8 << 20), b'a');
+            let compressed = gzip(&tar);
+            assert!(compressed.len() < tar.len() / 100);
+            let error = read(&compressed, TARGET).unwrap_err();
+            assert!(error.contains("larger than any loadout release"), "{error}");
+
+            // A well-formed PAX header before an otherwise valid binary entry.
+            let record = b"30 path=loadout-x/loadout-two\n";
+            let mut pax = header(BINARY, tar::EntryType::XHeader, record.len() as u64);
+            pax.extend_from_slice(record);
+            pax.resize(1024, 0);
+            pax.extend_from_slice(&header(BINARY, tar::EntryType::Regular, 3));
+            pax.extend_from_slice(b"bin");
+            pax.resize(1536 + 1024, 0);
+            let error = read(&gzip(&pax), TARGET).unwrap_err();
+            assert!(
+                error.contains("a release holds only regular files"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn every_entry_is_held_to_the_size_limit_and_read_exactly() {
+            let (error, read) = refused_after(header(
+                "loadout-x86_64-unknown-linux-musl/README.md",
+                tar::EntryType::Regular,
+                BINARY_LIMIT + 1,
+            ));
+            assert!(error.contains("larger than any loadout release"), "{error}");
+            assert_eq!(read, 512);
+
+            // A binary whose content ends before its declared size.
+            let mut short = header(BINARY, tar::EntryType::Regular, 100);
+            short.extend_from_slice(&[b'a'; 10]);
+            assert!(read_tar(short.as_slice(), TARGET, false).is_err());
+
+            // A header block cut short.
+            let cut = header(BINARY, tar::EntryType::Regular, 0)[..300].to_vec();
+            assert!(
+                read_tar(cut.as_slice(), TARGET, false)
+                    .unwrap_err()
+                    .contains("cannot read the archive")
+            );
+
+            // A folder entry that claims content.
+            let mut folder = header(
+                "loadout-x86_64-unknown-linux-musl",
+                tar::EntryType::Directory,
+                512,
+            );
+            folder.resize(1024, 0);
+            assert!(read_tar(folder.as_slice(), TARGET, false).is_err());
+        }
+
+        #[test]
+        fn only_ustar_headers_are_accepted() {
+            let mut gnu = tar::Header::new_gnu();
+            gnu.set_path(BINARY).unwrap();
+            gnu.set_entry_type(tar::EntryType::Regular);
+            gnu.set_mode(0o755);
+            gnu.set_size(3);
+            gnu.set_cksum();
+            let mut stream = gnu.as_bytes().to_vec();
+            stream.extend_from_slice(b"bin");
+            stream.resize(1024 + 1024, 0);
+            let error = read_tar(stream.as_slice(), TARGET, false).unwrap_err();
+            assert!(error.contains("USTAR"), "{error}");
+        }
+
+        #[test]
+        fn too_many_entries_are_refused() {
+            let mut entries = good();
+            for _ in 0..MAX_ENTRIES {
+                entries.push((
+                    "loadout-x86_64-unknown-linux-musl/README.md",
+                    Kind::File(b""),
+                ));
+            }
+            assert!(
+                read(&archive(&entries), TARGET)
+                    .unwrap_err()
+                    .contains("larger than any loadout release")
+            );
         }
     }
 }

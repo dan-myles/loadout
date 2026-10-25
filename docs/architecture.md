@@ -1797,7 +1797,9 @@ Automatic updates are required, so they are on by default.
   - **Replacing it.**
     - The archive and sidecar come over HTTPS only (max 5 redirects, size limits). The sidecar must
       be the exact line, and the hash must match.
-    - The expected binaries are read from memory after name, type and size checks.
+    - The expected binaries are read from memory after name, type and size checks. Tar entries are
+      read raw: every header, GNU and PAX metadata included, counts against the limits before any
+      content is read, and only USTAR folders and regular files are accepted.
     - Then it takes the install folder's lock, `.loadout.install.lock`, which install.sh and
       install.ps1 take too (flock on Unix, an unshared open on Windows), without waiting. Under it,
       each binary is staged with `create_new` beside its destination and must print exactly

@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import importlib.util
 import os
@@ -49,6 +50,20 @@ class ArchiveTest(unittest.TestCase):
             for info in infos.values():
                 self.assertEqual((info.mtime, info.uid, info.gid, info.uname), (EPOCH, 0, 0, ""))
             self.assertEqual(tar.extractfile("loadout-t/loadout").read(), b"\x7fELF binary")
+
+    def test_tar_is_plain_ustar_with_no_extension_entries(self):
+        # Self-update reads release archives raw and refuses GNU and PAX entries, so every header
+        # here must be a USTAR folder ('5') or regular file ('0').
+        archive, _ = self.build("x86_64-unknown-linux-musl", "a")
+        raw = gzip.decompress(archive.read_bytes())
+        offset, types = 0, []
+        while raw[offset:offset + 512].strip(b"\0"):
+            block = raw[offset:offset + 512]
+            self.assertEqual(block[257:265], b"ustar\x0000")
+            types.append(block[156:157])
+            size = int(block[124:136].strip(b"\0 ") or b"0", 8)
+            offset += 512 + (size + 511) // 512 * 512
+        self.assertEqual(types, [b"5", b"0", b"0"])
 
     def test_zip_members_keep_unix_modes(self):
         archive, _ = self.build("aarch64-pc-windows-msvc", "a")
