@@ -18,6 +18,18 @@ type Snapshot = BTreeMap<PathBuf, (String, Vec<u8>, u32)>;
 /// What a snapshot records for a file it must not read: kind, length, and Unix mode.
 type Shape = (String, u64, u32);
 
+/// Whether an `mcp::Error` is the refusal a case expects.
+type ErrorCheck = fn(&mcp::Error) -> bool;
+
+/// A shared document case: its target, the text written to it, and the refusal it must cause.
+type DocumentCase = (Target, &'static str, ErrorCheck);
+
+/// A way to make document A uneditable after the run: its name, how to target A, and the edit.
+type DocumentBreak = (&'static str, fn(&Machine) -> Target, fn(&Target));
+
+/// A named corruption of a run journal.
+type JournalEdit = (&'static str, fn(&mut Value));
+
 struct Machine {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -773,7 +785,7 @@ fn grok_s_lock_is_honored_on_write_and_never_taken_by_observe() {
 #[test]
 fn unparseable_documents_are_typed_blocked_errors() {
     let machine = Machine::new();
-    let cases: [(Target, &str, fn(&mcp::Error) -> bool); 3] = [
+    let cases: [DocumentCase; 3] = [
         (
             cursor(&machine, "x"),
             "{\"mcpServers\":{\"a\":{},\"a\":{}}}",
@@ -806,7 +818,7 @@ fn unparseable_documents_are_typed_blocked_errors() {
 #[test]
 fn documents_loadout_will_not_edit_are_refused_without_a_write() {
     let machine = Machine::new();
-    let cases: [(Target, &str, fn(&mcp::Error) -> bool); 3] = [
+    let cases: [DocumentCase; 3] = [
         (
             codex(&machine, "x"),
             "[mcp_servers.a]\r\ncommand = \"a\"\nargs = []\r\n",
@@ -1041,9 +1053,15 @@ enum Occupant {
 // 20
 #[test]
 fn a_foreign_occupant_of_a_s_rollback_staging_name_blocks_b_too() {
-    let mut occupants = vec![Occupant::SameKeyDocument, Occupant::Folder];
     #[cfg(unix)]
-    occupants.extend([Occupant::Link, Occupant::Socket]);
+    let occupants = vec![
+        Occupant::SameKeyDocument,
+        Occupant::Folder,
+        Occupant::Link,
+        Occupant::Socket,
+    ];
+    #[cfg(not(unix))]
+    let occupants = vec![Occupant::SameKeyDocument, Occupant::Folder];
     for occupant in occupants {
         #[cfg(unix)]
         let machine = Machine::short();
@@ -1374,7 +1392,7 @@ fn set_json(target: &Target, edit: impl FnOnce(&mut Value)) {
 // E1 (groups 4, 10)
 #[test]
 fn an_uneditable_document_blocks_rollback_before_b_is_restored() {
-    let breaks: [(&str, fn(&Machine) -> Target, fn(&Target)); 4] = [
+    let breaks: [DocumentBreak; 4] = [
         (
             "muse schema 2, SetKey",
             |machine| muse(machine, "a"),
@@ -1454,7 +1472,7 @@ fn editable_documents_restore_including_muse_at_schema_1() {
     let b = claude(&machine, "b");
     owned_updates(&machine, &a, &b);
     set_json(&b, |document| {
-        document["theme"] = json!("unrelated, edited after the run")
+        document["theme"] = json!("unrelated, edited after the run");
     });
     machine.rollback().unwrap();
     assert_eq!(servers(&a).get("a"), Some(&server("a1")));
@@ -1624,7 +1642,7 @@ fn an_equal_adopt_writes_nothing_and_backs_up_nothing() {
 // E3 (groups 12, 22)
 #[test]
 fn entry_journals_must_match_what_actually_happened() {
-    let edits: [(&str, fn(&mut Value)); 8] = [
+    let edits: [JournalEdit; 8] = [
         ("written done without its document", |journal| {
             journal["entries"][0]
                 .as_object_mut()
