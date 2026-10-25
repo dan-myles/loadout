@@ -183,6 +183,16 @@ pub(super) struct Failure {
     pub(super) restored: bool,
 }
 
+/// What a binary's destination held when the installed files were last checked, under the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Prior {
+    /// The installed binary its record names, which is replaced.
+    Installed,
+    /// Nothing: a binary the record doesn't name yet, the launcher a schema-1 Windows install gains.
+    /// It goes in only where nothing is, never over a file that has appeared since.
+    Nothing,
+}
+
 /// Publishes the staged binaries over their destinations, in order, then the record.
 ///
 /// On Unix each binary is one atomic rename over the old file, which a running process keeps
@@ -197,13 +207,17 @@ pub(super) struct Failure {
 /// fails, the new binaries stay and the old record no longer matches them, which fails closed.
 /// Only after the record is in place are moved-aside executables deleted (see `settle_asides`).
 pub(super) fn publish(
-    binaries: Vec<(Staged, PathBuf)>,
+    binaries: Vec<(Staged, PathBuf, Prior)>,
     record: (Staged, PathBuf),
 ) -> Result<(), Failure> {
     let mut done: Vec<Move> = Vec::new();
     let mut published: Vec<Staged> = Vec::new();
-    for (mut staged, dest) in binaries {
-        if let Err(detail) = place(&staged, &dest, &mut done) {
+    for (mut staged, dest, prior) in binaries {
+        let placed = match prior {
+            Prior::Installed => place(&staged, &dest, &mut done),
+            Prior::Nothing => place_new(&staged, &dest, &mut done),
+        };
+        if let Err(detail) = placed {
             let failed = undo(&done);
             for staged in &mut published {
                 staged.published = failed.iter().any(|(step, _)| step.from == staged.path);
@@ -280,6 +294,31 @@ fn place(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), Strin
     }
     fs::rename(&staged.path, dest)
         .map_err(|error| format!("cannot put the new {} in place: {error}", dest.display()))?;
+    done.push(Move {
+        from: staged.path.clone(),
+        to: dest.to_path_buf(),
+        aside: false,
+    });
+    Ok(())
+}
+
+/// Puts a staged binary where nothing is: a hard link, which fails if anything is there, then the
+/// staging name is dropped. Undone like a rename, by moving it back to the staging name.
+fn place_new(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), String> {
+    fs::hard_link(&staged.path, dest).map_err(|error| {
+        format!(
+            "cannot put the new {} where nothing was: {error}",
+            dest.display()
+        )
+    })?;
+    if let Err(error) = fs::remove_file(&staged.path) {
+        // The staging name still holds the file, so the link just made is the one to drop.
+        let _ = fs::remove_file(dest);
+        return Err(format!(
+            "cannot drop the staging name {}: {error}",
+            staged.path.display()
+        ));
+    }
     done.push(Move {
         from: staged.path.clone(),
         to: dest.to_path_buf(),
@@ -430,7 +469,7 @@ mod tests {
         let staged_record =
             stage(dir.path(), "loadout.install.toml", "", b"new record", false).unwrap();
         publish(
-            vec![(binary, dest.clone())],
+            vec![(binary, dest.clone(), Prior::Installed)],
             (staged_record, record.clone()),
         )
         .unwrap();
@@ -465,7 +504,7 @@ mod tests {
         let staged_record =
             stage(dir.path(), "loadout.install.toml", "", b"new record", false).unwrap();
         let failure = publish(
-            vec![(binary, blocked.clone())],
+            vec![(binary, blocked.clone(), Prior::Installed)],
             (staged_record, record.clone()),
         )
         .unwrap_err();
@@ -480,6 +519,59 @@ mod tests {
             names.len(),
             2,
             "only the record and the folder remain: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_binary_new_to_the_record_goes_only_where_nothing_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"launcher", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        publish(
+            vec![(
+                launcher,
+                path.join("loadout-background.exe"),
+                Prior::Nothing,
+            )],
+            (record, path.join("loadout.install.toml")),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(path.join("loadout-background.exe")).unwrap(),
+            b"launcher"
+        );
+        assert_eq!(
+            names(path),
+            ["loadout-background.exe", "loadout.install.toml"]
+        );
+
+        // Something appeared there since the last check: it is left alone, and nothing changes.
+        fs::write(path.join("loadout-background.exe"), b"someone else's").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"launcher", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"newer record", false).unwrap();
+        let failure = publish(
+            vec![(
+                launcher,
+                path.join("loadout-background.exe"),
+                Prior::Nothing,
+            )],
+            (record, path.join("loadout.install.toml")),
+        )
+        .unwrap_err();
+        assert!(failure.restored, "{}", failure.detail);
+        assert_eq!(
+            fs::read(path.join("loadout-background.exe")).unwrap(),
+            b"someone else's"
+        );
+        assert_eq!(
+            fs::read(path.join("loadout.install.toml")).unwrap(),
+            b"new record"
+        );
+        assert_eq!(
+            names(path),
+            ["loadout-background.exe", "loadout.install.toml"]
         );
     }
 
@@ -544,7 +636,10 @@ mod tests {
         let second = stage(path, "second", "", b"new second", true).unwrap();
         let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
         let failure = publish(
-            vec![(first, path.join("first")), (second, path.join("second"))],
+            vec![
+                (first, path.join("first"), Prior::Installed),
+                (second, path.join("second"), Prior::Installed),
+            ],
             (record, path.join("loadout.install.toml")),
         )
         .unwrap_err();
@@ -575,8 +670,12 @@ mod tests {
         fs::remove_file(main.path()).unwrap();
         let failure = publish(
             vec![
-                (launcher, path.join("loadout-background.exe")),
-                (main, path.join("loadout.exe")),
+                (
+                    launcher,
+                    path.join("loadout-background.exe"),
+                    Prior::Installed,
+                ),
+                (main, path.join("loadout.exe"), Prior::Installed),
             ],
             (record, path.join("loadout.install.toml")),
         )
@@ -746,8 +845,12 @@ mod tests {
         let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
         publish(
             vec![
-                (launcher, path.join("loadout-background.exe")),
-                (main, path.join("loadout.exe")),
+                (
+                    launcher,
+                    path.join("loadout-background.exe"),
+                    Prior::Installed,
+                ),
+                (main, path.join("loadout.exe"), Prior::Installed),
             ],
             (record, path.join("loadout.install.toml")),
         )

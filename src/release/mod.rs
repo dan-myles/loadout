@@ -486,7 +486,13 @@ fn replace(release: &Release) -> Result<(), Error> {
         let file = publish::stage(&install.dir, stem, suffix, &binary.bytes, true)
             .map_err(io_error("stage", &install.dir.join(binary.name)))?;
         smoke(file.path(), stem, &release.version, &release.containment).map_err(verify)?;
-        staged.push((file, install.dir.join(binary.name)));
+        // Only a launcher the record names is replaced; a schema-1 install's goes where none is.
+        let prior = if binary.name == archive::expected(true)[1] && install.background.is_none() {
+            publish::Prior::Nothing
+        } else {
+            publish::Prior::Installed
+        };
+        staged.push((file, install.dir.join(binary.name), prior));
     }
 
     let main = &binaries[0];
