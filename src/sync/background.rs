@@ -301,9 +301,10 @@ pub struct Summary {
     /// A record that exists but can't be read.
     pub problem: Option<String>,
     pub log: Option<PathBuf>,
-    /// The supervisor record says `running` and another process holds the state lock: a run is
-    /// going right now.
-    pub in_progress: bool,
+    /// The supervisor record says `running` and the state lock is held. That run may still be
+    /// going, or it stopped without a record and another loadout command holds the lock: the
+    /// lock doesn't say which, so it never makes the run healthy.
+    pub lock_held: bool,
 }
 
 impl Summary {
@@ -316,9 +317,9 @@ impl Summary {
             .filter(|run| run.supervisor.as_deref() == Some(supervisor.run.as_str()))
     }
 
-    /// No background run yet, a run going right now, or a last run whose supervisor confirmed
-    /// its worker exited and its tree stopped, whose own worker record says the machine is
-    /// healthy, and whose exit code is the one that record gives.
+    /// No background run yet, or a last run whose supervisor confirmed its worker exited and its
+    /// tree stopped, whose own worker record says the machine is healthy, and whose exit code is
+    /// the one that record gives. A `running` record is never healthy, whoever holds the lock.
     pub fn healthy(&self) -> bool {
         if self.problem.is_some() {
             return false;
@@ -326,9 +327,6 @@ impl Summary {
         let Some(supervisor) = &self.supervisor else {
             return self.last_run.is_none();
         };
-        if self.in_progress {
-            return true;
-        }
         supervisor.clean()
             && self
                 .worker()
@@ -348,7 +346,9 @@ impl Summary {
             return problem.clone();
         }
         let supervisor = self.supervisor.as_ref().map(|record| {
-            if record.outcome == "running" {
+            if record.outcome == "running" && self.lock_held {
+                "has not recorded how the run ended, and the state lock is held: by this run if it is still going, or by another loadout command".to_owned()
+            } else if record.outcome == "running" {
                 "never finished: the supervisor stopped before it recorded how the run ended"
                     .to_owned()
             } else if record.clean() {
@@ -376,9 +376,6 @@ impl Summary {
                 None => result,
             }
         });
-        if self.in_progress {
-            return "a background run is going now".to_owned();
-        }
         let worker = if self.supervisor.is_some() && self.worker().is_none() {
             None
         } else {
@@ -413,7 +410,7 @@ pub fn summary(context: &Context) -> Summary {
     let supervisor: Option<SupervisorRecord> =
         parse(context, supervisor_bytes, Private::Supervisor, &mut problem);
     let last_run = parse(context, run_bytes, Private::LastRun, &mut problem);
-    let in_progress = supervisor
+    let lock_held = supervisor
         .as_ref()
         .is_some_and(|record| record.outcome == "running")
         && matches!(state::busy(context), Ok(true));
@@ -422,7 +419,7 @@ pub fn summary(context: &Context) -> Summary {
         last_run,
         problem,
         log,
-        in_progress,
+        lock_held,
     }
 }
 
@@ -494,7 +491,7 @@ mod tests {
             last_run,
             problem: None,
             log: None,
-            in_progress: false,
+            lock_held: false,
         }
     }
 
@@ -596,11 +593,35 @@ mod tests {
         let mut uncomplete = supervisor("B", "exited", Some(0), None);
         uncomplete.log_complete = false;
         assert!(!summary(Some(uncomplete), run()).healthy());
-        let going = Summary {
-            in_progress: true,
-            ..summary(Some(supervisor("B", "running", None, None)), None)
-        };
-        assert!(going.healthy(), "a run going right now is not a failure");
+    }
+
+    /// A supervisor that died leaving its `running` record, while an unrelated foreground run
+    /// holds the state lock: the held lock is no proof that run is going, so it stays unhealthy
+    /// and is never described as a run in progress.
+    #[test]
+    fn a_held_lock_never_revives_a_stale_running_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("home")).unwrap();
+        let state_dir = dir.path().join("state").into_os_string();
+        let context = Context::resolve(
+            crate::platform::Os::current().unwrap(),
+            |name| (name == "LOADOUT_STATE_DIR").then(|| state_dir.clone()),
+            Some(dir.path().join("home")),
+        )
+        .unwrap();
+        save(&context, &supervisor("B", "running", None, None)).unwrap();
+        let unrelated = state::lock(&context).unwrap();
+        let held = summary(&context);
+        assert!(held.lock_held, "{}", held.describe());
+        assert!(!held.healthy(), "{}", held.describe());
+        assert!(
+            held.describe().contains("another loadout command"),
+            "{}",
+            held.describe()
+        );
+        drop(unrelated);
+        let released = summary(&context);
+        assert!(!released.healthy(), "{}", released.describe());
     }
 
     #[test]
