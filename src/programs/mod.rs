@@ -243,11 +243,21 @@ fn observe(package: &Package, containment: &Containment) -> Result<Observation, 
 }
 
 fn classify(package: &Package, containment: &Containment) -> Result<Observation, String> {
-    if detect::installed(containment, package.manager, &package.executable, &package.id)? {
+    if detect::installed(
+        containment,
+        package.manager,
+        &package.executable,
+        &package.id,
+    )? {
         return Ok(Observation::Installed);
     }
     Ok(
-        match detect::eligibility(containment, package.manager, &package.executable, &package.id)? {
+        match detect::eligibility(
+            containment,
+            package.manager,
+            &package.executable,
+            &package.id,
+        )? {
             Eligibility::Scope(scope) => Observation::Missing(scope),
             Eligibility::Unsupported(reason) => Observation::Unsupported(reason),
         },
@@ -415,11 +425,12 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
         invocation
     };
     let command = invocation.display();
-    let output = process::install(&invocation, &missing.containment).map_err(|source| Error::Spawn {
-        program: program.to_owned(),
-        command: command.clone(),
-        source,
-    })?;
+    let output =
+        process::install(&invocation, &missing.containment).map_err(|source| Error::Spawn {
+            program: program.to_owned(),
+            command: command.clone(),
+            source,
+        })?;
     if !output
         .code
         .is_some_and(|code| manager::install_succeeded(manager, code))
@@ -892,7 +903,10 @@ mod tests {
                 &containment,
                 detect::eligibility(&containment, Manager::Winget, &winget, "A.B"),
             );
-            assert!(matches!(answer, Ok(Eligibility::Unsupported(_))), "{answer:?}");
+            assert!(
+                matches!(answer, Ok(Eligibility::Unsupported(_))),
+                "{answer:?}"
+            );
             assert!(!containment.is_cancelled());
         }
 
@@ -932,7 +946,9 @@ mod tests {
             ]);
             let found = steps(&programs, &facts, &context).unwrap();
             assert!(
-                found.iter().all(|step| matches!(step.state, State::Missing(_))),
+                found
+                    .iter()
+                    .all(|step| matches!(step.state, State::Missing(_))),
                 "{found:?}"
             );
             std::fs::write(dir.join("fail"), "").unwrap();
@@ -1020,7 +1036,10 @@ mod tests {
                 panic!("injected: failure right after the spawn");
             }));
             assert!(failed.is_err());
-            assert!(record.lock().unwrap().exit.is_some(), "the held producer was not stopped");
+            assert!(
+                record.lock().unwrap().exit.is_some(),
+                "the held producer was not stopped"
+            );
 
             let mut flow = producer(dir.path(), &bin, true);
             flow.inject(Faults {
@@ -1030,7 +1049,10 @@ mod tests {
             let detail = flow
                 .finish_within(Duration::from_secs(60), Duration::from_secs(10))
                 .unwrap_err();
-            assert!(detail.contains("cannot observe the child: injected"), "{detail}");
+            assert!(
+                detail.contains("cannot observe the child: injected"),
+                "{detail}"
+            );
             assert!(detail.ends_with("it was stopped"), "{detail}");
             assert_eq!(flow.kills(), 1);
 
@@ -1043,11 +1065,18 @@ mod tests {
             let detail = flow
                 .finish_within(Duration::from_millis(500), Duration::from_secs(1))
                 .unwrap_err();
-            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
             assert!(detail.contains("did not exit within"), "{detail}");
             assert!(detail.contains("could not be killed"), "{detail}");
             assert!(detail.contains("has not exited"), "{detail}");
-            assert!(flow.observe().unwrap().is_none(), "the held producer still runs");
+            assert!(
+                flow.observe().unwrap().is_none(),
+                "the held producer still runs"
+            );
             flow.inject(Faults::default());
             assert_eq!(flow.stop(Duration::from_secs(10)), Ok(()));
         }

@@ -180,7 +180,9 @@ impl Owned {
         }
         let answer = if self.faults.os_error > 0 {
             self.faults.os_error -= 1;
-            Err(io::Error::other("injected: the OS could not report on the child"))
+            Err(io::Error::other(
+                "injected: the OS could not report on the child",
+            ))
         } else {
             self.polls += 1;
             let answer = self.os().try_wait();
@@ -310,7 +312,9 @@ impl Owned {
         };
         match self.stop(cleanup) {
             Ok(()) => Err(format!("{primary}; it was stopped")),
-            Err(detail) => Err(format!("{primary}; it could not be confirmed stopped: {detail}")),
+            Err(detail) => Err(format!(
+                "{primary}; it could not be confirmed stopped: {detail}"
+            )),
         }
     }
 }
@@ -390,7 +394,10 @@ mod tests {
         }));
         assert!(failed.is_err());
         let record = recorded(&record);
-        assert!(record.exit.is_some(), "the child must have been killed and its exit confirmed");
+        assert!(
+            record.exit.is_some(),
+            "the child must have been killed and its exit confirmed"
+        );
         assert_eq!(record.kills, 1);
     }
 
@@ -422,7 +429,10 @@ mod tests {
         assert!(!detail.contains("has not exited"), "{detail}");
         assert!(!owned.lost());
         assert_eq!(owned.kills(), 1);
-        assert!(owned.observe().unwrap().is_some(), "the child must have exited");
+        assert!(
+            owned.observe().unwrap().is_some(),
+            "the child must have exited"
+        );
     }
 
     /// Unix: an OS observation error may mean the child was reaped elsewhere, so the guard
@@ -441,17 +451,30 @@ mod tests {
         });
         let started = Instant::now();
         let detail = owned.stop(Duration::from_secs(10)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(1), "no wait follows a lost identity");
-        assert!(detail.starts_with("cannot check the child: injected: the OS"), "{detail}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no wait follows a lost identity"
+        );
+        assert!(
+            detail.starts_with("cannot check the child: injected: the OS"),
+            "{detail}"
+        );
         assert!(detail.ends_with("cleanup unconfirmed"), "{detail}");
         assert!(owned.lost());
-        assert!(owned.stop(Duration::from_secs(10)).is_err(), "a retry stays refused");
+        assert!(
+            owned.stop(Duration::from_secs(10)).is_err(),
+            "a retry stays refused"
+        );
         assert!(owned.wait_within(Duration::from_secs(1)).is_err());
         let before_drop = recorded(&record);
         assert_eq!((before_drop.polls, before_drop.kills), (0, 0));
         drop(owned);
         let after_drop = recorded(&record);
-        assert_eq!((after_drop.polls, after_drop.kills), (0, 0), "Drop must not touch it");
+        assert_eq!(
+            (after_drop.polls, after_drop.kills),
+            (0, 0),
+            "Drop must not touch it"
+        );
         assert!(after_drop.exit.is_none());
     }
 
@@ -471,15 +494,29 @@ mod tests {
         });
         let started = Instant::now();
         let detail = owned.stop(Duration::from_secs(10)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
         let parts: Vec<&str> = detail.split("; ").collect();
         assert!(parts[0].contains("before polling"), "{detail}");
-        assert!(parts[1].contains("cannot kill the child: injected"), "{detail}");
-        assert!(parts[2].starts_with("cannot reap the child: injected: the OS"), "{detail}");
+        assert!(
+            parts[1].contains("cannot kill the child: injected"),
+            "{detail}"
+        );
+        assert!(
+            parts[2].starts_with("cannot reap the child: injected: the OS"),
+            "{detail}"
+        );
         assert!(detail.ends_with("cleanup unconfirmed"), "{detail}");
         drop(owned);
         let record = recorded(&record);
-        assert_eq!((record.polls, record.kills), (0, 1), "only the one synthetic kill");
+        assert_eq!(
+            (record.polls, record.kills),
+            (0, 1),
+            "only the one synthetic kill"
+        );
     }
 
     /// Windows: the retained handle still pins the process after an OS observation error, so
@@ -493,11 +530,17 @@ mod tests {
             ..Faults::default()
         });
         let detail = owned.stop(Duration::from_secs(10)).unwrap_err();
-        assert!(detail.starts_with("cannot check the child: injected: the OS"), "{detail}");
+        assert!(
+            detail.starts_with("cannot check the child: injected: the OS"),
+            "{detail}"
+        );
         assert!(!detail.contains("has not exited"), "{detail}");
         assert!(!owned.lost());
         assert_eq!(owned.kills(), 1);
-        assert!(owned.observe().unwrap().is_some(), "the child must have exited");
+        assert!(
+            owned.observe().unwrap().is_some(),
+            "the child must have exited"
+        );
     }
 
     #[test]
@@ -510,7 +553,10 @@ mod tests {
         let detail = owned
             .finish_within(Duration::from_secs(5), Duration::from_secs(10))
             .unwrap_err();
-        assert!(detail.contains("cannot observe the child: injected"), "{detail}");
+        assert!(
+            detail.contains("cannot observe the child: injected"),
+            "{detail}"
+        );
         assert!(detail.ends_with("it was stopped"), "{detail}");
         assert!(owned.observe().unwrap().is_some());
     }
@@ -528,9 +574,16 @@ mod tests {
         let detail = owned
             .finish_within(Duration::from_millis(200), Duration::from_secs(1))
             .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(detail.contains("did not exit within"), "{detail}");
-        assert!(detail.contains("injected: the child could not be killed"), "{detail}");
+        assert!(
+            detail.contains("injected: the child could not be killed"),
+            "{detail}"
+        );
         assert!(detail.contains("has not exited"), "{detail}");
         assert!(owned.observe().unwrap().is_none(), "the child still runs");
         owned.inject(Faults::default());
@@ -542,7 +595,12 @@ mod tests {
     fn a_child_that_already_exited_is_not_killed() {
         let record = Arc::new(Mutex::new(Record::default()));
         let mut owned = Owned::new(quick().spawn().unwrap()).recording(&record);
-        assert!(owned.wait_within(Duration::from_secs(20)).unwrap().is_some());
+        assert!(
+            owned
+                .wait_within(Duration::from_secs(20))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(owned.stop(Duration::from_secs(10)), Ok(()));
         drop(owned);
         assert_eq!(recorded(&record).kills, 0);

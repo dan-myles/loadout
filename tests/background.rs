@@ -148,7 +148,10 @@ fn start_descendant(dir: &Path, stdout: Stdio) {
     drop(descendant);
     let until = Instant::now() + Duration::from_secs(30);
     while !dir.join("descendant.ready").exists() {
-        assert!(Instant::now() < until, "the descendant never reported ready");
+        assert!(
+            Instant::now() < until,
+            "the descendant never reported ready"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -158,7 +161,10 @@ fn start_descendant(dir: &Path, stdout: Stdio) {
 fn released(dir: &Path, name: &str) -> Result<bool, String> {
     let ready = dir.join(format!("{name}.ready"));
     if !ready.is_file() {
-        return Err(format!("{} is missing, so nothing can be concluded", ready.display()));
+        return Err(format!(
+            "{} is missing, so nothing can be concluded",
+            ready.display()
+        ));
     }
     let path = dir.join(format!("{name}.lock"));
     let lock = OpenOptions::new()
@@ -212,7 +218,13 @@ fn supervisor() {
 fn fixture(test: &str, role: &str, dir: &Path) -> Command {
     let mut command = Command::new(env::current_exe().unwrap());
     command
-        .args(["--exact", test, "--ignored", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(ROLE, role)
         .env(DIR, dir);
     command
@@ -344,7 +356,9 @@ impl Owned {
         }
         let answer = if self.os_errors > 0 {
             self.os_errors -= 1;
-            Err(io::Error::other("injected: the OS could not report on the child"))
+            Err(io::Error::other(
+                "injected: the OS could not report on the child",
+            ))
         } else {
             self.note(|record| record.polls += 1);
             self.child.try_wait()
@@ -623,26 +637,45 @@ fn the_lock_observer_never_mistakes_silence_or_absence_for_death() {
         dir.path().join("descendant.ready"),
         dir.path().join("descendant.lock"),
     );
-    assert!(released(dir.path(), "descendant").is_err(), "absence must not count");
+    assert!(
+        released(dir.path(), "descendant").is_err(),
+        "absence must not count"
+    );
     std::fs::write(&ready, "ready").unwrap();
-    assert!(released(dir.path(), "descendant").is_err(), "a missing lock must not count");
+    assert!(
+        released(dir.path(), "descendant").is_err(),
+        "a missing lock must not count"
+    );
     std::fs::create_dir(&lock).unwrap();
-    assert!(released(dir.path(), "descendant").is_err(), "a lock error must not count");
+    assert!(
+        released(dir.path(), "descendant").is_err(),
+        "a lock error must not count"
+    );
     std::fs::remove_dir(&lock).unwrap();
     std::fs::remove_file(&ready).unwrap();
 
-    let mut fixture_process = Owned::spawn(
-        fixture("descendant", "descendant", dir.path()).stdin(Stdio::null()),
-    );
+    let mut fixture_process =
+        Owned::spawn(fixture("descendant", "descendant", dir.path()).stdin(Stdio::null()));
     let until = Instant::now() + Duration::from_secs(60);
     while !ready.exists() {
-        assert!(fixture_process.alive(), "the fixture exited before it became ready");
+        assert!(
+            fixture_process.alive(),
+            "the fixture exited before it became ready"
+        );
         assert!(Instant::now() < until, "the fixture never became ready");
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(released(dir.path(), "descendant"), Ok(false), "a silent live fixture holds it");
+    assert_eq!(
+        released(dir.path(), "descendant"),
+        Ok(false),
+        "a silent live fixture holds it"
+    );
     assert!(fixture_process.alive());
-    assert_eq!(fixture_process.stop(), Ok(()), "the owned handle must confirm the exit");
+    assert_eq!(
+        fixture_process.stop(),
+        Ok(()),
+        "the owned handle must confirm the exit"
+    );
     assert_eq!(eventually_released(dir.path(), "descendant"), Ok(true));
 }
 
@@ -661,7 +694,10 @@ fn a_worker_that_exits_by_itself_is_reported_and_its_tree_confirmed_gone() {
     assert_eq!(outcome.cleanup, Ok(()));
     assert!(outcome.log.complete);
     assert!(outcome.log.bytes.len() <= LOG_CAP);
-    assert!(outside.alive(), "a process outside the supervised tree was affected");
+    assert!(
+        outside.alive(),
+        "a process outside the supervised tree was affected"
+    );
 }
 
 #[test]
@@ -713,7 +749,11 @@ fn a_descendant_holding_the_output_is_stopped_after_the_worker_exits() {
     assert_eq!(outcome.cleanup, Ok(()));
     assert!(outcome.log.complete);
     #[cfg(unix)]
-    assert_eq!(at_return, Ok(true), "the holder must have ended when supervise returns");
+    assert_eq!(
+        at_return,
+        Ok(true),
+        "the holder must have ended when supervise returns"
+    );
     #[cfg(windows)]
     {
         assert!(at_return.is_ok(), "{at_return:?}");
@@ -726,7 +766,11 @@ fn worker_output_is_kept_within_the_cap() {
     let dir = tempfile::tempdir().unwrap();
     let outcome = supervised("flood", dir.path(), short(60, 120));
     assert_eq!(outcome.cleanup, Ok(()));
-    assert!(outcome.log.dropped >= 2 * 1024 * 1024, "{}", outcome.log.dropped);
+    assert!(
+        outcome.log.dropped >= 2 * 1024 * 1024,
+        "{}",
+        outcome.log.dropped
+    );
     assert!(outcome.log.bytes.len() <= LOG_CAP + 100);
     assert!(
         String::from_utf8_lossy(&outcome.log.bytes[..100])
@@ -769,7 +813,10 @@ fn invalid_limits_start_nothing() {
         let mut worker = fixture("worker", "exit", dir.path());
         worker.env(STARTED, &marker);
         let refused = process::supervise(worker, limits);
-        assert!(matches!(refused, Err(Error::InvalidLimits(_))), "{limits:?}: {refused:?}");
+        assert!(
+            matches!(refused, Err(Error::InvalidLimits(_))),
+            "{limits:?}: {refused:?}"
+        );
         assert!(!marker.exists(), "{limits:?} started the worker");
     }
     let _watchdog = Watchdog::new(Duration::from_secs(120), "the valid positive");
@@ -798,8 +845,16 @@ fn a_worker_whose_supervisor_dies_does_not_outlive_it() {
         thread::sleep(Duration::from_millis(50));
     }
     // The worker writes its ready file only once its descendant is ready too.
-    assert_eq!(released(dir.path(), "root"), Ok(false), "the worker must run before the kill");
-    assert_eq!(released(dir.path(), "descendant"), Ok(false), "so must its descendant");
+    assert_eq!(
+        released(dir.path(), "root"),
+        Ok(false),
+        "the worker must run before the kill"
+    );
+    assert_eq!(
+        released(dir.path(), "descendant"),
+        Ok(false),
+        "so must its descendant"
+    );
     supervisor.kill().unwrap();
     supervisor.exit_within(Duration::from_secs(10));
     assert_eq!(
@@ -812,7 +867,10 @@ fn a_worker_whose_supervisor_dies_does_not_outlive_it() {
         Ok(true),
         "the worker's descendant kept running after the supervisor died"
     );
-    assert!(outside.alive(), "a process outside the supervised tree was affected");
+    assert!(
+        outside.alive(),
+        "a process outside the supervised tree was affected"
+    );
 }
 
 /// Workers started any other way than by `supervise` refuse before they lock, write, or signal
@@ -862,8 +920,14 @@ mod refusals {
     #[test]
     fn without_a_nonce_or_a_pipe_the_worker_refuses() {
         let mut canary = Canary::new();
-        assert_eq!(direct(Some(canary.group()), None, None).code(), Some(REFUSED));
-        assert_eq!(direct(Some(canary.group()), None, Some(A_NONCE)).code(), Some(REFUSED));
+        assert_eq!(
+            direct(Some(canary.group()), None, None).code(),
+            Some(REFUSED)
+        );
+        assert_eq!(
+            direct(Some(canary.group()), None, Some(A_NONCE)).code(),
+            Some(REFUSED)
+        );
         assert!(canary.alive());
     }
 
@@ -1065,7 +1129,11 @@ mod refusals {
         let in_job = loadout_winproc::current_process_in_job().unwrap();
         let status = direct(Stdio::piped(), Some(&line()));
         if in_job {
-            assert_eq!(status.code(), Some(7), "some job, not the supervisor's, passes");
+            assert_eq!(
+                status.code(),
+                Some(7),
+                "some job, not the supervisor's, passes"
+            );
         } else {
             assert_eq!(status.code(), Some(REFUSED), "a jobless worker must refuse");
         }

@@ -40,12 +40,20 @@ pub(super) fn installed(
 ) -> Result<bool, String> {
     match manager {
         Manager::Brew => brew(
-            &query(containment, program, ["info", "--json=v2", "--formula", package])?,
+            &query(
+                containment,
+                program,
+                ["info", "--json=v2", "--formula", package],
+            )?,
             package,
             false,
         ),
         Manager::Cask => brew(
-            &query(containment, program, ["info", "--json=v2", "--cask", package])?,
+            &query(
+                containment,
+                program,
+                ["info", "--json=v2", "--cask", package],
+            )?,
             package,
             true,
         ),
@@ -86,13 +94,25 @@ pub(super) fn installed(
                 "--disable-interactivity",
             ],
         )?),
-        Manager::Scoop => scoop(&query(containment, program, ["prefix", scoop_app(package)])?),
+        Manager::Scoop => scoop(&query(
+            containment,
+            program,
+            ["prefix", scoop_app(package)],
+        )?),
         Manager::Choco => choco(
-            &query(containment, program, ["list", "--exact", package, "--limit-output"])?,
+            &query(
+                containment,
+                program,
+                ["list", "--exact", package, "--limit-output"],
+            )?,
             package,
         ),
         Manager::Npm => match npm(
-            &query(containment, program, ["ls", "--global", "--depth=0", "--json", package])?,
+            &query(
+                containment,
+                program,
+                ["ls", "--global", "--depth=0", "--json", package],
+            )?,
             package,
         )? {
             Npm::Answered(installed) => Ok(installed),
@@ -102,11 +122,21 @@ pub(super) fn installed(
             }
         },
         Manager::Pnpm => pnpm(
-            &query(containment, program, ["ls", "--global", "--depth=0", "--json", package])?,
+            &query(
+                containment,
+                program,
+                ["ls", "--global", "--depth=0", "--json", package],
+            )?,
             package,
         ),
-        Manager::Bun => bun(&query(containment, program, ["pm", "ls", "--global"])?, package),
-        Manager::Cargo => cargo(&query(containment, program, ["install", "--list"])?, package),
+        Manager::Bun => bun(
+            &query(containment, program, ["pm", "ls", "--global"])?,
+            package,
+        ),
+        Manager::Cargo => cargo(
+            &query(containment, program, ["install", "--list"])?,
+            package,
+        ),
         Manager::Uv => uv(&query(containment, program, ["tool", "list"])?, package),
         Manager::Pipx => pipx(&query(containment, program, ["list", "--json"])?, package),
         Manager::Go => go(containment, program, package),

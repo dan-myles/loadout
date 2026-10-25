@@ -283,10 +283,7 @@ fn disposing(_setup: Instant, _limit: Instant) {}
 fn from_query(error: QueryError) -> Error {
     match error {
         QueryError::Cleanup { cause, detail } => Error::Cleanup {
-            cause: cause.map_or_else(
-                || "it did not start".to_owned(),
-                |cause| cause.to_string(),
-            ),
+            cause: cause.map_or_else(|| "it did not start".to_owned(), |cause| cause.to_string()),
             detail,
         },
         other => Error::Setup(other.to_string()),
@@ -471,7 +468,11 @@ fn settle_job(
         "processes the worker started are still running in its job",
     );
     let drained = until(limit, || Ok(finished(sink)));
-    first(&mut problem, drained, "the worker's output is still held open");
+    first(
+        &mut problem,
+        drained,
+        "the worker's output is still held open",
+    );
     settled(problem, grace)
 }
 
@@ -535,10 +536,7 @@ fn send(control: &mut Option<ChildStdin>, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn handshake_line(nonce: &str, group: i32) -> String {
-    format!(
-        "{MAGIC} {VERSION} {nonce} {group} {}\n",
-        std::process::id()
-    )
+    format!("{MAGIC} {VERSION} {nonce} {group} {}\n", std::process::id())
 }
 
 /// 32 bytes from the OS's random source, as lowercase hex. It ties the worker's environment to
@@ -732,8 +730,8 @@ fn log(sink: &Mutex<Sink>) -> Log {
 ///
 /// `Refused` for any check that fails. Nothing was locked, written, or signalled.
 pub fn handshake() -> Result<Arc<Supervised>, Refused> {
-    let expected = std::env::var(WORKER_NONCE)
-        .map_err(|_| Refused(format!("{WORKER_NONCE} is not set")))?;
+    let expected =
+        std::env::var(WORKER_NONCE).map_err(|_| Refused(format!("{WORKER_NONCE} is not set")))?;
     if !is_nonce(&expected) {
         return Err(Refused(format!("{WORKER_NONCE} is not a loadout nonce")));
     }
@@ -768,9 +766,8 @@ pub fn handshake() -> Result<Arc<Supervised>, Refused> {
         }
     };
     let supervised = Arc::new(supervised);
-    arm.send(Arc::clone(&supervised)).map_err(|_| {
-        Refused("the control pipe closed during the handshake".to_owned())
-    })?;
+    arm.send(Arc::clone(&supervised))
+        .map_err(|_| Refused("the control pipe closed during the handshake".to_owned()))?;
     Ok(supervised)
 }
 
@@ -870,7 +867,9 @@ fn verified_group(line: &Line) -> Result<Pid, Refused> {
 #[cfg(windows)]
 fn verified_job(line: &Line) -> Result<(), Refused> {
     if line.group != 0 || line.supervisor <= 0 {
-        return Err(Refused("the handshake line is not a Windows one".to_owned()));
+        return Err(Refused(
+            "the handshake line is not a Windows one".to_owned(),
+        ));
     }
     match loadout_winproc::current_process_in_job() {
         Ok(true) => Ok(()),
@@ -1230,13 +1229,35 @@ mod tests {
         };
         assert_eq!(valid.check(now), Ok(()));
         for invalid in [
-            Limits { soft: Duration::MAX, ..valid },
-            Limits { hard: Duration::MAX, ..valid },
-            Limits { settle: Duration::MAX, ..valid },
-            Limits { soft: Duration::from_secs(3), ..valid },
-            Limits { soft: Duration::ZERO, ..valid },
-            Limits { hard: Duration::ZERO, soft: Duration::ZERO, ..valid },
-            Limits { settle: Duration::ZERO, ..valid },
+            Limits {
+                soft: Duration::MAX,
+                ..valid
+            },
+            Limits {
+                hard: Duration::MAX,
+                ..valid
+            },
+            Limits {
+                settle: Duration::MAX,
+                ..valid
+            },
+            Limits {
+                soft: Duration::from_secs(3),
+                ..valid
+            },
+            Limits {
+                soft: Duration::ZERO,
+                ..valid
+            },
+            Limits {
+                hard: Duration::ZERO,
+                soft: Duration::ZERO,
+                ..valid
+            },
+            Limits {
+                settle: Duration::ZERO,
+                ..valid
+            },
         ] {
             assert!(invalid.check(now).is_err(), "{invalid:?}");
         }
@@ -1256,7 +1277,11 @@ mod tests {
         let failed = drain(Some(io::Cursor::new(b"unread".to_vec())), &sink);
         seam::set(None);
         assert!(failed.unwrap_err().contains("injected"));
-        assert_eq!(lock(&sink).open, 0, "a drainer that never started must not stay counted");
+        assert_eq!(
+            lock(&sink).open,
+            0,
+            "a drainer that never started must not stay counted"
+        );
         assert!(finished(&sink));
 
         drain(Some(io::Cursor::new(b"read".to_vec())), &sink).unwrap();
@@ -1307,7 +1332,10 @@ mod tests {
                     drop(descendant);
                     let ready = dir.join("descendant.ready");
                     while !ready.exists() {
-                        assert!(Instant::now() < until, "the descendant never reported ready");
+                        assert!(
+                            Instant::now() < until,
+                            "the descendant never reported ready"
+                        );
                         thread::sleep(Duration::from_millis(20));
                     }
                 }
@@ -1435,7 +1463,10 @@ mod tests {
         pub(in super::super) fn released(dir: &Path, name: &str) -> Result<bool, String> {
             let ready = dir.join(format!("{name}.ready"));
             if !ready.is_file() {
-                return Err(format!("{} is missing, so nothing can be concluded", ready.display()));
+                return Err(format!(
+                    "{} is missing, so nothing can be concluded",
+                    ready.display()
+                ));
             }
             let path = dir.join(format!("{name}.lock"));
             let lock = OpenOptions::new()
@@ -1445,7 +1476,8 @@ mod tests {
                 .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
             match lock.try_lock() {
                 Ok(()) => {
-                    lock.unlock().map_err(|error| format!("cannot unlock: {error}"))?;
+                    lock.unlock()
+                        .map_err(|error| format!("cannot unlock: {error}"))?;
                     Ok(true)
                 }
                 Err(TryLockError::WouldBlock) => Ok(false),
@@ -1509,7 +1541,10 @@ mod tests {
         /// A setup failure's disposal was given the original setup deadline, not a new one.
         fn disposed_within_setup() {
             let (setup, limit) = seam::limits().expect("the run recorded its deadlines");
-            assert_eq!(limit, setup, "a setup failure's cleanup got a renewed budget");
+            assert_eq!(
+                limit, setup,
+                "a setup failure's cleanup got a renewed budget"
+            );
         }
 
         /// With a confirmed disposal (`Setup`), a fixture that was ready has released its lock
@@ -1550,7 +1585,11 @@ mod tests {
                 |dir| holder(dir, false),
                 Duration::from_secs(10),
             );
-            assert!(cause(&run.result).contains("BetweenDrainers"), "{:?}", run.result);
+            assert!(
+                cause(&run.result).contains("BetweenDrainers"),
+                "{:?}",
+                run.result
+            );
             disposed_within_setup();
             // Unix: it may not have become ready before the failure; Windows: it never ran.
             #[cfg(windows)]
@@ -1621,7 +1660,11 @@ mod tests {
                 |dir| sleeper(dir, 4000),
                 settle,
             );
-            assert!(cause(&run.result).contains("setup limit"), "{:?}", run.result);
+            assert!(
+                cause(&run.result).contains("setup limit"),
+                "{:?}",
+                run.result
+            );
             assert_eq!(
                 seam::reached(),
                 vec![Point::BeforeStart],
@@ -1640,11 +1683,7 @@ mod tests {
         #[test]
         fn an_ordinary_worker_may_outlast_the_setup_budget() {
             let settle = Duration::from_secs(2);
-            let run = inject(
-                None,
-                |dir| sleeper(dir, 4000),
-                settle,
-            );
+            let run = inject(None, |dir| sleeper(dir, 4000), settle);
             let outcome = run.result.unwrap();
             assert_eq!(
                 outcome.ended,
@@ -1654,9 +1693,15 @@ mod tests {
                 }
             );
             assert_eq!(outcome.cleanup, Ok(()));
-            assert!(run.elapsed > settle, "the worker should outlast the setup budget");
+            assert!(
+                run.elapsed > settle,
+                "the worker should outlast the setup budget"
+            );
             let (setup, limit) = seam::limits().unwrap();
-            assert!(limit > setup, "a normal run's cleanup gets its own fresh limit");
+            assert!(
+                limit > setup,
+                "a normal run's cleanup gets its own fresh limit"
+            );
         }
 
         #[test]
@@ -1666,7 +1711,11 @@ mod tests {
             let point = Point::BeforeSend;
             #[cfg(windows)]
             let point = Point::AfterMembership;
-            let run = inject(Some(Fault::ExhaustThenFail(point)), |dir| holder(dir, false), settle);
+            let run = inject(
+                Some(Fault::ExhaustThenFail(point)),
+                |dir| holder(dir, false),
+                settle,
+            );
             assert!(cause(&run.result).contains("injected"), "{:?}", run.result);
             disposed_within_setup();
             assert!(
@@ -1686,7 +1735,11 @@ mod tests {
                 |dir| holder(dir, false),
                 Duration::from_secs(10),
             );
-            assert!(matches!(run.result, Err(Error::Setup(_))), "{:?}", run.result);
+            assert!(
+                matches!(run.result, Err(Error::Setup(_))),
+                "{:?}",
+                run.result
+            );
             assert!(never_ran(run.dir.path()));
         }
 
@@ -1715,8 +1768,15 @@ mod tests {
             let detail = stopped.unwrap_err();
             assert!(detail.contains("injected"), "{detail}");
             assert!(!detail.contains("has not exited"), "{detail}");
-            assert!(worker.observe().unwrap().is_some(), "the worker must be reaped");
-            assert_eq!(worker.kills(), 0, "nothing was left for the test's own guard to stop");
+            assert!(
+                worker.observe().unwrap().is_some(),
+                "the worker must be reaped"
+            );
+            assert_eq!(
+                worker.kills(),
+                0,
+                "nothing was left for the test's own guard to stop"
+            );
             assert!(never_ran(dir.path()));
         }
 
@@ -1728,7 +1788,11 @@ mod tests {
                 |dir| holder(dir, false),
                 Duration::from_secs(10),
             );
-            assert!(matches!(run.result, Err(Error::Setup(_))), "{:?}", run.result);
+            assert!(
+                matches!(run.result, Err(Error::Setup(_))),
+                "{:?}",
+                run.result
+            );
             assert!(never_ran(run.dir.path()));
         }
 
@@ -1791,17 +1855,34 @@ mod tests {
         fn the_lock_observer_never_mistakes_silence_or_absence_for_death() {
             let dir = tempfile::tempdir().unwrap();
             let (ready, lock) = (dir.path().join("root.ready"), dir.path().join("root.lock"));
-            assert!(released(dir.path(), "root").is_err(), "absence must not count");
+            assert!(
+                released(dir.path(), "root").is_err(),
+                "absence must not count"
+            );
             std::fs::write(&ready, "ready").unwrap();
-            assert!(released(dir.path(), "root").is_err(), "a missing lock must not count");
+            assert!(
+                released(dir.path(), "root").is_err(),
+                "a missing lock must not count"
+            );
             std::fs::create_dir(&lock).unwrap();
-            assert!(released(dir.path(), "root").is_err(), "a lock error must not count");
+            assert!(
+                released(dir.path(), "root").is_err(),
+                "a lock error must not count"
+            );
             std::fs::remove_dir(&lock).unwrap();
             std::fs::remove_file(&ready).unwrap();
 
             let mut root = Owned::new(holder(dir.path(), false).spawn().unwrap());
-            assert_eq!(appeared_while_running(&mut root, &ready), Ok(true), "never ready");
-            assert_eq!(released(dir.path(), "root"), Ok(false), "a silent live fixture holds it");
+            assert_eq!(
+                appeared_while_running(&mut root, &ready),
+                Ok(true),
+                "never ready"
+            );
+            assert_eq!(
+                released(dir.path(), "root"),
+                Ok(false),
+                "a silent live fixture holds it"
+            );
             assert!(root.observe().unwrap().is_none());
             assert_eq!(
                 root.stop(Duration::from_secs(10)),
@@ -1822,7 +1903,10 @@ mod tests {
             let marker = dir.path().join("root.released");
             assert_eq!(appeared_while_running(&mut early, &marker), Ok(true));
             assert_eq!(released(dir.path(), "root"), Ok(true), "its lock is free");
-            assert!(early.observe().unwrap().is_none(), "yet the process still runs");
+            assert!(
+                early.observe().unwrap().is_none(),
+                "yet the process still runs"
+            );
             assert_eq!(early.stop(Duration::from_secs(10)), Ok(()));
         }
     }

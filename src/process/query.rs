@@ -1019,7 +1019,11 @@ fn dispose_never_run(root: &Mutex<Child>, limit: Instant) -> Result<(), String> 
             .map(|status| status.is_some())
             .map_err(|error| format!("cannot reap the query loadout created: {error}"))
     });
-    first(&mut reap, reaped, "the query loadout created has not exited");
+    first(
+        &mut reap,
+        reaped,
+        "the query loadout created has not exited",
+    );
     problems.extend(reap);
     if problems.is_empty() {
         Ok(())
@@ -1807,11 +1811,11 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (lock, ready) = (dir.path().join("escapee.lock"), dir.path().join("escapee.ready"));
-        let script = format!(
-            "{} & sleep 0.5; echo done",
-            escapee(&lock, &ready, 3)
+        let (lock, ready) = (
+            dir.path().join("escapee.lock"),
+            dir.path().join("escapee.ready"),
         );
+        let script = format!("{} & sleep 0.5; echo done", escapee(&lock, &ready, 3));
         let started = Instant::now();
         let result = run_query_with(
             &sh(&script),
@@ -1850,7 +1854,10 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (lock, ready) = (dir.path().join("escapee.lock"), dir.path().join("escapee.ready"));
+        let (lock, ready) = (
+            dir.path().join("escapee.lock"),
+            dir.path().join("escapee.ready"),
+        );
         let script = format!("{}; echo done", escapee(&lock, &ready, 0));
         let captured = run_query(&sh(&script), Duration::from_secs(20), 1024).unwrap();
         assert_eq!(captured.code, Some(0));
@@ -1868,7 +1875,10 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (lock, ready) = (dir.path().join("holder.lock"), dir.path().join("holder.ready"));
+        let (lock, ready) = (
+            dir.path().join("holder.lock"),
+            dir.path().join("holder.ready"),
+        );
         let mut holder = fixture::Owned::new(
             Command::new("python3")
                 .args(["-c", &escapee_code(false, 30)])
@@ -1880,11 +1890,21 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        let became_ready = until(Instant::now() + Duration::from_secs(20), || Ok(ready.exists()));
+        let became_ready = until(Instant::now() + Duration::from_secs(20), || {
+            Ok(ready.exists())
+        });
         let alive_while_owned = released(&lock);
         let stopped = holder.stop(Duration::from_secs(10));
-        assert_eq!(became_ready, Ok(true), "the owned holder never became ready");
-        assert_eq!(alive_while_owned, Ok(false), "a live holder must count as running");
+        assert_eq!(
+            became_ready,
+            Ok(true),
+            "the owned holder never became ready"
+        );
+        assert_eq!(
+            alive_while_owned,
+            Ok(false),
+            "a live holder must count as running"
+        );
         assert_eq!(stopped, Ok(()), "the owned handle must confirm the exit");
         assert_eq!(
             released_after_ready(&lock, &ready, Duration::from_secs(10)),
@@ -2557,9 +2577,20 @@ mod windows_tests {
         );
         assert!(!detail.contains("has not exited"), "{detail}");
         assert_eq!(kills, 1, "the kill must follow a failed observation");
-        let status = root.observe().unwrap().expect("the query must have been reaped");
-        assert_ne!(status.code(), Some(7), "the never-resumed query must not have run");
-        assert_eq!(root.kills(), 0, "nothing was left for the test's own guard to stop");
+        let status = root
+            .observe()
+            .unwrap()
+            .expect("the query must have been reaped");
+        assert_ne!(
+            status.code(),
+            Some(7),
+            "the never-resumed query must not have run"
+        );
+        assert_eq!(
+            root.kills(),
+            0,
+            "nothing was left for the test's own guard to stop"
+        );
     }
 
     #[test]
@@ -2570,8 +2601,15 @@ mod windows_tests {
         let kills = seam::kills();
         assert_eq!(disposed, Ok(()));
         assert_eq!(kills, 1);
-        let status = root.observe().unwrap().expect("the query must have been reaped");
-        assert_ne!(status.code(), Some(7), "the never-resumed query must not have run");
+        let status = root
+            .observe()
+            .unwrap()
+            .expect("the query must have been reaped");
+        assert_ne!(
+            status.code(),
+            Some(7),
+            "the never-resumed query must not have run"
+        );
     }
 
     /// The negative: a process that has positively exited is not killed.
@@ -3056,8 +3094,8 @@ mod inherited_tests {
             Duration::from_millis(500),
         );
         let elapsed = started.elapsed();
-        let gone = written_pid(&pid_file)
-            .is_none_or(|pid| exits_by_itself(pid, Duration::from_secs(20)));
+        let gone =
+            written_pid(&pid_file).is_none_or(|pid| exits_by_itself(pid, Duration::from_secs(20)));
         let error = result.unwrap_err();
         assert!(
             matches!(&error, QueryError::Cleanup { cause: None, .. }),
@@ -3110,7 +3148,10 @@ mod inherited_tests {
         ));
         let installed = install(&touch, &containment).unwrap_err();
         assert_eq!(installed.kind(), io::ErrorKind::Interrupted);
-        assert!(!ran.exists(), "a cancelled run must start no query or installer");
+        assert!(
+            !ran.exists(),
+            "a cancelled run must start no query or installer"
+        );
     }
 
     #[test]
