@@ -28,7 +28,13 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         elevated: args.elevated,
         mode: Mode::Interactive,
     };
-    match apply::run(context, &checkout, options) {
+    show(apply::run(context, &checkout, options))
+}
+
+/// Prints an apply's result and maps it to the exit code, the same for `apply`, `init`, and
+/// `update`: `refused` for a run that couldn't start, `print` for one that did.
+pub(crate) fn show(result: Result<apply::Report, apply::Error>) -> anyhow::Result<Exit> {
+    match result {
         Ok(report) => print(&report),
         Err(error) => refused(error),
     }

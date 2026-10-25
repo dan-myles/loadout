@@ -10,7 +10,7 @@ use crate::machine::{self, NameSource};
 use crate::manifest::Manager;
 use crate::platform::{Arch, Os};
 use crate::programs;
-use crate::sync;
+use crate::{release, sync};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -31,6 +31,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         agents::checks(context),
         programs::checks(context),
         sync::checks(context),
+        release::checks(context),
     ]
     .concat();
 

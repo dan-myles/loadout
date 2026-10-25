@@ -13,22 +13,29 @@ members = ["crates/loadout-winproc"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 gethostname = "1"
 jsonc-parser = { version = "0.34", features = ["cst"] }
 minijinja = { version = "=3.0.3", default-features = false, features = ["builtins", "debug", "unstable_machinery"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 thiserror = "2"
 toml = "1.1"
 toml_edit = "0.25"
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
 
+[target.'cfg(not(windows))'.dependencies]
+tar = { version = "0.4.46", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 loadout-winproc = { path = "crates/loadout-winproc" }
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }
+zip = { version = "9.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tempfile = "3"

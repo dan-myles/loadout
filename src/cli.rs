@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{apply, doctor, plan, rollback, service, status, update, validate};
+use crate::commands::{apply, doctor, init, plan, rollback, service, status, update, validate};
 use crate::context::Context;
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,8 @@ pub enum Command {
     Update(update::Args),
     /// Install, remove, or check the scheduled background update
     Service(service::Args),
+    /// Set this machine up from a loadout: clone it, name the machine, apply, and keep it updated
+    Init(init::Args),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,5 +85,6 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
         Command::Apply(args) => apply::run(&args, &context),
         Command::Update(args) => update::run(&args, &context),
         Command::Service(args) => service::run(&args, &context),
+        Command::Init(args) => init::run(&args, &context),
     }
 }

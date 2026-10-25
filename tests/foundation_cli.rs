@@ -66,14 +66,13 @@ fn help_lists_only_working_commands() {
     assert!(help.contains("rollback"), "{help}");
     assert!(help.contains("plan"), "{help}");
     assert!(help.contains("apply"), "{help}");
-    assert!(help.contains("update"), "{help}");
-    assert!(help.contains("service"), "{help}");
-    assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("init")),
-        "init must not be advertised before it works:\n{help}"
-    );
+    for command in ["update", "service", "init"] {
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "{command} must be advertised:\n{help}"
+        );
+    }
 }
 
 #[test]

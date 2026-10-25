@@ -34,6 +34,13 @@ downloads and `target/`. Release builds start clean so a poisoned cache can't re
 | `x86_64-pc-windows-msvc` | windows-2025 |
 | `aarch64-pc-windows-msvc` | windows-11-arm |
 
+The Windows targets build and ship two binaries: `loadout.exe` and `loadout-background.exe`,
+the windowless launcher U8's scheduled task starts (`cargo build --bin loadout --bin
+loadout-background`). `package.py` requires `loadout-background --version` to print exactly
+`loadout-background <version>`, and `smoke.py` checks it again from the archive. The musl jobs
+install `musl-tools` and set `CC_<target>=musl-gcc`, because `ring` (the crypto behind rustls,
+which self-update uses) compiles C.
+
 Every target builds natively on the matching architecture, using only
 [standard GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 which are free for public repositories. No larger runners are used. Every build runs
@@ -91,6 +98,223 @@ Triggers:
 3. Wait for the Release workflow to finish. Review the draft release on GitHub, then publish it.
    Self-update and `releases/latest` only see published, non-prerelease releases. Don't untick
    "pre-release" on a beta draft.
+
+## Installing from a release
+
+`scripts/release/install.sh` (macOS, Linux) and `scripts/release/install.ps1` (Windows) install a
+published release. Until one is published, the default download fails with an HTTP error and
+nothing is installed.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh \
+  | sh -s -- https://github.com/you/your-loadout.git --name laptop
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1))) `
+  -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+```
+
+Prerequisites:
+- `install.sh` needs `git`, `curl`, `tar`, `cmp`, `sha256sum` or `shasum`, and `flock` or `perl` (to
+  lock the install folder; Linux has `flock`, macOS has `perl`). It needs `iconv` only when the home
+  path or an existing install record isn't plain ASCII.
+- `install.ps1` needs `git`, plus Windows PowerShell 5.1 on .NET Framework 4.7.2 or later, or
+  PowerShell 7.
+
+Neither script installs git; each names the per-OS command instead.
+
+### What each script does
+
+1. **Target.** On macOS and Linux, `uname -s`/`uname -m` pick it, and a shell running under Rosetta
+   gets the aarch64 build. On Windows, the registry's native `PROCESSOR_ARCHITECTURE` picks it, so
+   x64 PowerShell emulated on ARM64 gets the ARM64 build. Any other OS or CPU is refused.
+2. **Destination check, before downloading** (repeated under the install lock, step 7).
+   - A destination that is a symlink, junction, or folder is refused, and so is a record that is one.
+   - An existing binary is replaced only if the install record next to it matches (see below).
+   - With no binary there, a leftover record is simply overwritten.
+3. **Download, https at every hop.**
+   - Sources: `releases/latest/download/` by default, `releases/download/vX.Y.Z/` with
+     `--version`/`-Version`, or `--base-url`/`-BaseUrl` for a mirror.
+   - The archive and its `.sha256` come over https only, with at most 5 redirects, each of them
+     https. `curl` runs with `-q` (ignore `~/.curlrc`), `--proto =https --proto-redir =https
+     --tlsv1.2`.
+   - `install.ps1` turns off automatic redirects and checks every hop itself. It adds TLS 1.2 to the
+     process's allowed protocols (older .NET Framework defaults lack it); it doesn't force it
+     exclusively.
+   - wget is not a fallback, because it can't refuse an http redirect.
+   - The one exception is a `--base-url` on `http://127.0.0.1`, `http://localhost`, or `http://[::1]`
+     (any port), for tests. It gets plain http and no redirects at all.
+   - Base URLs with credentials, a query, a fragment, spaces, or quotes are refused, as are http
+     hosts that merely start with a loopback name.
+4. **Checksum.** The `.sha256` file must be exactly the ASCII bytes `<64 lowercase hex>  <asset>`
+   followed by one LF. That excludes a byte order mark, UTF-16, CR, NUL, extra lines, and other
+   names. `install.sh` compares it byte for byte with `cmp`; `install.ps1` checks the raw bytes
+   before decoding them. The archive's sha256 must equal that value before anything is extracted or
+   run.
+5. **Archive layout.** The archive is checked before extraction. Every entry must be
+   `loadout-<target>/` or a plain name directly inside it (letters, digits, `.`, `_`, `-`), and
+   there must be exactly one `loadout-<target>/loadout`. A Windows zip must hold exactly one
+   `loadout.exe` and exactly one `loadout-background.exe`; besides `README.md` and `LICENSE*`,
+   any other entry is refused rather than ignored.
+   - Only the binaries are extracted, into the script's own temporary directory.
+   - Tar: every entry's type must be a regular file or a directory. `install.sh` reads the type
+     from the first character of `tar -tv` output, which GNU and BSD tar print ls-style (`h` hard
+     link, `l` symlink), so links and devices are refused before extraction. That check depends on
+     those tar implementations' listing format and hasn't been run on either yet. As a second check,
+     the extracted binary must be a regular file and not a symlink.
+   - Zip: `install.ps1` refuses the binary entry if its Unix mode bits mark anything other than a
+     regular file, and other entries are never extracted.
+   - This is a layout check for official release archives, not a sandbox for hostile archives.
+6. **Version check.** The extracted binary must print `loadout <version>` from `--version`. With a
+   requested tag, `v<version>` must equal it exactly, case-sensitively. On Windows,
+   `loadout-background.exe --version` must then print exactly `loadout-background <version>`.
+7. **Lock and final check.** The script takes the install folder's lock, `.loadout.install.lock`,
+   without waiting, and holds it until the record is in place and its own staging files are gone.
+   `install.sh` takes `flock(2)` on the file through `flock` or else `perl`, on file descriptor 9;
+   `install.ps1` opens it unshared. Loadout self-update takes the same lock the same way. If another
+   writer holds it, nothing changes and the script says so. Under the lock the destination check
+   runs again, and the binaries and record must also still be exactly what the first check saw
+   (their sha256, or absent): an install that finished during this one's download is never
+   overwritten. The lock file stays in place.
+8. **Staging.** Each staging file is created exclusively, under a fresh unique name in the
+   destination directory: `mktemp` for `.loadout.new.XXXXXX` and `.loadout.install.toml.new.XXXXXX`,
+   or a GUID name opened with `CreateNew`.
+   - The script deletes only names it created and hasn't yet published.
+   - Other files, including other runs' staging files, are never overwritten or deleted.
+   - No backup file is kept.
+9. **Publishing.** The binary is published first, with a same-directory rename (`mv -f`). Then the
+   record is published the same way. Every failure before the first rename leaves the previous
+   binary and record untouched.
+   - On Windows the launcher goes first, then `loadout.exe`. Each existing binary, which may be
+     running, is first moved aside to `.<name>.old.<guid>`, and if a later move fails every
+     completed move is undone in reverse, each attempted even when another can't be. Files that
+     can't be moved back stay where they are and are named in the error. Then the record is
+     replaced (`File.Replace`, no backup).
+   - The script deletes its own aside copies once the record is in place. One that is still
+     running can't be deleted and stays; the script never deletes an aside it didn't make in that
+     run, whatever its name. Self-update keeps a ledger of its own (below).
+10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
+    shell profiles or `PATH`.
+11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
+    remaining arguments. The URL must not start with `-`. The script's own message shows the URL
+    with any userinfo as `***`, as loadout does, and never the init arguments; `init` itself
+    refuses a URL carrying a password before showing anything.
+    - `install.sh` passes `"$@"`.
+    - `install.ps1` encodes each `-InitArgs` element as exactly one argument, using the
+      `CommandLineToArgvW` / MSVC / Rust rules: quotes, backslashes before a quote or at the end,
+      empty strings, whitespace, and Unicode all round-trip.
+    - It starts the binary through `ProcessStartInfo` (no shell, `UseShellExecute = $false`, same
+      console) and returns its exit code.
+    - NUL can't appear on a Windows command line, so it is refused before installing.
+    - If the binary can't be started or waited on (for example, the command line is longer than
+      Windows allows), the script reports the error and completes with exit code 1. It never leaves
+      an earlier `$LASTEXITCODE` standing.
+
+Writers that take the lock are serialized: of two installs or self-updates that both downloaded,
+the second to take the lock finds the files changed and replaces nothing. A writer that doesn't
+take it (a hand copy, another tool, or a copy of either script from before the lock) is not
+serialized, so it can still race one publication. If that leaves a record describing another
+binary, the hash fails, and self-update and both installers refuse to replace that binary until the
+user removes the binary and the record and installs again. There is no automatic adopt or force
+option.
+
+When the script runs as an in-memory script block, it never calls `exit`, so the console stays
+open; it sets `$LASTEXITCODE` instead. Run with `-File`, it exits with the code. It decides which
+from its own `$MyInvocation`, never from `$PSCommandPath`, which a script block could inherit from
+a calling script.
+
+### Install record, schemas 1 and 2 (read by self-update)
+
+The record sits next to the binary as `loadout.install.toml`: `~/.local/bin/loadout.install.toml`
+on macOS and Linux, `%LOCALAPPDATA%\Programs\loadout\loadout.install.toml` on Windows. Producers
+write exactly this, in UTF-8 with no byte order mark, `\n` line endings, and a final newline:
+
+```toml
+# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.
+schema = 1
+installer = "install.sh"
+repository = "dan-myles/loadout"
+source = "https://github.com/dan-myles/loadout/releases/latest/download/loadout-x86_64-unknown-linux-musl.tar.gz"
+target = "x86_64-unknown-linux-musl"
+version = "0.1.0"
+archive_sha256 = "<the verified archive's sha256>"
+binary = "/home/me/.local/bin/loadout"
+binary_sha256 = "<sha256 of that binary>"
+```
+
+- **Framing.** The whole file is UTF-8 with no byte order mark, no NUL or other control bytes
+  except LF, and a final LF.
+- **Lines.** Each line is a `#` comment, exactly `schema = 1` or `schema = 2` (an integer, never a
+  string), or `<key> = "<value>"`. The keys are exactly
+  `installer` (`"install.sh"` or `"install.ps1"`), `repository`, `source`, `target`, `version`,
+  `archive_sha256`, `binary` and `binary_sha256`, each once.
+- **Schema 2** (Windows) adds exactly `background`, the launcher's path written like `binary`, and
+  `background_sha256`. `install.ps1` and Windows self-update write schema 2. `install.sh` and Unix
+  self-update write schema 1. A Windows schema-1 record, from the one-binary `install.ps1`, is still
+  read: it is managed only while no `loadout-background.exe` sits beside it, and the next install
+  or self-update upgrades it to schema 2 with the launcher.
+- **Values.** They never contain control characters, and only `\\` and `\"` are escaped.
+  Producers refuse a value they can't encode that way before changing anything: a control
+  character, invalid UTF-8, or an unpaired UTF-16 surrogate. So the file is always valid TOML.
+- **`binary`.**
+  - `install.sh` writes the physical path: `pwd -P` of `~/.local/bin`, plus `/loadout`.
+  - `install.ps1` writes `GetFullPath` of `%LOCALAPPDATA%\Programs\loadout\loadout.exe`. It doesn't
+    resolve junctions, and Windows compares it case-insensitively.
+  - Consumers must canonicalize both this path and their own executable before comparing.
+- **Anything else is invalid.** That includes unknown keys, duplicates, a quoted or other schema,
+  CR, a BOM, invalid UTF-8, a missing final LF, or other TOML syntax. Both installers read the record as data only, with no `eval` and no
+  dot-sourcing.
+
+**When a binary counts as installer-managed:**
+- the record is valid
+- `installer` names this platform's script
+- `target` equals the target being installed or running
+- `binary` names the same file
+- that file's current sha256 equals `binary_sha256`
+- for schema 2, `background` names the `loadout-background.exe` beside it, and that file's current
+  sha256 equals `background_sha256`
+
+If any check fails, the binary is unmanaged. Both installers refuse to replace an unmanaged binary
+and give no force option. To reinstall, the user removes the binary and record themselves.
+
+The files are not published as one atomic step, and the binaries and record are separate
+renames. A failure or power loss between them leaves new binaries with the previous record, or
+with no record, and the hash check then fails closed: the binaries are unmanaged until the user
+reinstalls them.
+
+### Self-update (`src/release/`)
+
+`loadout update` (U8) calls `release::latest` after its apply when the resolved `[update] cli` is
+true, then `release::install` when a strictly newer stable release exists. Self-update applies
+exactly the rule above, with no token:
+- **Latest tag.** It reads the tag from the `releases/latest` redirect.
+- **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
+  the exact sidecar and a matching hash.
+- **Archive.** It reads the expected binaries from memory, checking each name, type and size. A
+  `.tar.gz` is read entry by raw entry, so every header, metadata included, counts against the entry,
+  size and total limits before any content is read. Only USTAR folder and regular-file entries are
+  accepted; a GNU long-name or PAX entry is refused from its header, since `package.py` writes plain
+  USTAR.
+- **Lock.** It takes the install folder's lock as the scripts do, without waiting; a held lock is
+  reported (`Busy`) and nothing changes.
+- **Staging.** Under the lock it stages each binary with `create_new`, and requires its exact
+  `--version` line.
+- **Final check.** Still under the lock, the binaries and record must be exactly the ones it checked
+  when it found the release. Otherwise it replaces nothing (`Changed`).
+- **Publishing.** It publishes the binaries as above, then rewrites the record in the same schema
+  rules, and releases the lock after its own cleanup.
+- **Moved-aside executables (Windows).** Once the record is in place it deletes the executables it
+  moved aside. The running `loadout.exe` can't be deleted, so it is listed in
+  `.loadout.install.asides` with its sha256, and a later completed self-update deletes it, under the
+  lock, only if a regular file with exactly that name and sha256 is still there. Nothing else is
+  ever deleted, whatever its name: not another writer's aside, not a file merely named like one. A
+  malformed or linked ledger is left alone and lists nothing.
+
+Anything else, such as `cargo install`, a package manager, a hand copy, or a `LOADOUT_HOME`
+isolated run, is never replaced. `doctor` reports which case applies (`cli install`).
 
 ## Building a release archive locally
 
