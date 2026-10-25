@@ -335,6 +335,13 @@ impl Summary {
                 .is_some_and(|run| run.healthy() && supervisor.code == Some(i32::from(run.exit)))
     }
 
+    /// The last run did nothing because the loadout sets `[update] auto = false`: healthy, but
+    /// worth a visible warning while a job still wakes up for it.
+    pub fn disabled(&self) -> bool {
+        self.worker()
+            .is_some_and(|run| run.result == RunResult::Disabled)
+    }
+
     /// One line on why it isn't healthy, or what happened.
     pub fn describe(&self) -> String {
         if let Some(problem) = &self.problem {
@@ -444,7 +451,7 @@ pub(super) fn check(context: &Context) -> Check {
         && summary.problem.is_none()
     {
         CheckStatus::Info
-    } else if summary.healthy() {
+    } else if summary.healthy() && !summary.disabled() {
         CheckStatus::Pass
     } else {
         CheckStatus::Warn
@@ -503,6 +510,11 @@ mod tests {
             Some(worker("B", RunResult::Disabled, 0)),
         );
         assert!(disabled.healthy(), "{}", disabled.describe());
+        assert!(
+            disabled.disabled(),
+            "doctor warns while the job still wakes up for nothing"
+        );
+        assert!(!success.disabled());
         assert!(summary(None, None).healthy(), "no background run yet");
     }
 

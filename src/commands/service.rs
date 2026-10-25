@@ -134,6 +134,9 @@ fn status(context: &Context, json: bool) -> anyhow::Result<Exit> {
         if let Some(scheduler) = &status.scheduler {
             println!("{:<10} {}", "scheduler", scheduler.detail);
         }
+        for advice in &status.advice {
+            println!("{:<10} {advice}", "advice");
+        }
         println!("{:<10} {}", "last run", summary.describe());
         if let Some(log) = &summary.log {
             println!("{:<10} {}", "log", log.display());

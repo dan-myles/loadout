@@ -150,6 +150,32 @@ pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
+/// Whether systemd keeps this user's manager running after logout, from `loginctl`; `None` when
+/// it can't tell. Read-only.
+pub(super) fn linger(context: &Context) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata(&context.home).ok()?.uid().to_string();
+        let answer = query(
+            context,
+            "loginctl",
+            &["show-user", &uid, "--property=Linger", "--value"],
+        )
+        .ok()?;
+        match (answer.success(), answer.stdout.trim()) {
+            (true, "yes") => Some(true),
+            (true, "no") => Some(false),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = context;
+        None
+    }
+}
+
 /// How the unit files differ from the ones `install` would write for this record, if they do.
 pub(super) fn differs(
     context: &Context,

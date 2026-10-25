@@ -361,6 +361,10 @@ pub struct Status {
     /// executable, another `service.toml` (another state dir), another interval, or a missing
     /// Windows launcher.
     pub mismatch: Option<String>,
+    /// Things worth acting on that don't make the job unhealthy: the loadout now asks for
+    /// another interval, or turned automatic updates off; on Linux, no systemd user session, or
+    /// linger off. Read-only; loadout never changes them itself.
+    pub advice: Vec<String>,
 }
 
 impl Status {
@@ -449,6 +453,10 @@ pub fn status(context: &Context) -> Result<Status, Error> {
         (Some(recorded), None) => mismatch(context, recorded),
         _ => None,
     };
+    let advice = recorded
+        .as_ref()
+        .map(|recorded| advice(context, recorded))
+        .unwrap_or_default();
     Ok(Status {
         recorded,
         problem,
@@ -456,7 +464,39 @@ pub fn status(context: &Context) -> Result<Status, Error> {
         scheduler,
         exe_current,
         mismatch,
+        advice,
     })
+}
+
+/// Read-only advice for an installed job: the loadout's `[update]` against the record, and on
+/// Linux (outside isolation) the systemd user session and linger.
+fn advice(context: &Context, recorded: &Recorded) -> Vec<String> {
+    let mut advice = Vec::new();
+    match super::settings(context, &super::checkout(context)) {
+        Ok(update) if !update.auto => advice.push(
+            "the loadout sets [update] auto = false, so each scheduled run does nothing; `loadout service uninstall` removes the job".to_owned(),
+        ),
+        Ok(update) if update.interval_minutes != recorded.interval_minutes => {
+            advice.push(format!(
+                "the loadout now asks for an update every {} minutes, but the job runs every {}; `loadout service install` changes it",
+                update.interval_minutes, recorded.interval_minutes
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => advice.push(format!(
+            "cannot read the loadout's [update] settings to compare with the job: {error}"
+        )),
+    }
+    if context.os == Os::Linux && !context.isolated {
+        if let Err(error) = systemd::session(context) {
+            advice.push(format!("{error}; the timer can't run without one"));
+        } else if systemd::linger(context) == Some(false) {
+            advice.push(
+                "linger is off for this user, so the timer runs only while you are logged in; `loginctl enable-linger` changes that (loadout never does)".to_owned(),
+            );
+        }
+    }
+    advice
 }
 
 /// The program a scheduler starts for `exe`: the launcher beside it on Windows, else `exe`.
@@ -516,13 +556,15 @@ pub(super) fn checks(context: &Context) -> Vec<Check> {
             CheckStatus::Info,
             "no background update is installed; `loadout service install` adds one",
         )
-    } else if status.healthy() {
+    } else if status.healthy() && status.advice.is_empty() {
         let every = status
             .recorded
             .as_ref()
             .map(|recorded| format!("every {} minutes", recorded.interval_minutes))
             .unwrap_or_default();
         Check::new(name, CheckStatus::Pass, format!("installed, {every}"))
+    } else if status.healthy() {
+        Check::new(name, CheckStatus::Warn, status.advice.join("; "))
     } else {
         Check::new(name, CheckStatus::Warn, describe(&status))
     };
@@ -997,7 +1039,9 @@ mod tests {
             )
             .unwrap();
             assert!(!context.isolated);
-            Self { dir, context }
+            let fakes = Self { dir, context };
+            fakes.tool("loginctl", "echo yes");
+            fakes
         }
 
         /// Puts a fake `program` in place: it logs its arguments, then runs `body`.
@@ -1210,7 +1254,7 @@ mod tests {
     #[test]
     fn status_reports_a_job_installed_for_another_record_as_a_mismatch() {
         let fakes = Fakes::new(Os::Linux);
-        fakes.tool("systemctl", "echo enabled");
+        fakes.tool("systemctl", SYSTEMD_RUNNING);
         let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
         let exe_text = exe.to_str().unwrap();
         record_for(&fakes, &exe);
@@ -1257,6 +1301,92 @@ mod tests {
             "{}",
             describe(&folder)
         );
+    }
+
+    /// A fake `systemctl` with a running user manager and the timer enabled.
+    #[cfg(unix)]
+    const SYSTEMD_RUNNING: &str =
+        "case \"$2\" in is-system-running) echo running;; is-enabled) echo enabled;; esac";
+
+    /// Read-only advice: the loadout's interval or `auto = false` against the record, no user
+    /// session, linger off. None of it makes the job unhealthy, and doctor shows it as a warning.
+    #[cfg(unix)]
+    #[test]
+    fn status_advises_on_changed_settings_and_the_linux_session() {
+        let fakes = Fakes::new(Os::Linux);
+        fakes.tool("systemctl", SYSTEMD_RUNNING);
+        let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
+        record_for(&fakes, &exe);
+        let own = Private::Service.path(&fakes.context);
+        let units = systemd::files(&fakes.context);
+        fakes.plant(&units[0]);
+        fs::write(
+            &units[0],
+            systemd::service_unit(exe.to_str().unwrap(), own.to_str().unwrap()),
+        )
+        .unwrap();
+        fs::write(&units[1], systemd::timer_unit(60)).unwrap();
+        let manifest = super::super::checkout(&fakes.context).join("loadout.toml");
+        fakes.plant(&manifest);
+
+        fs::write(
+            &manifest,
+            "[loadout]\nversion = 1\n[update]\ninterval_minutes = 30\n",
+        )
+        .unwrap();
+        let advice = status(&fakes.context).unwrap().advice.join("\n");
+        assert!(advice.contains("every 30 minutes"), "{advice}");
+
+        fs::write(
+            &manifest,
+            "[loadout]\nversion = 1\n[update]\nauto = false\n",
+        )
+        .unwrap();
+        let advice = status(&fakes.context).unwrap().advice.join("\n");
+        assert!(advice.contains("auto = false"), "{advice}");
+        let disabled = status(&fakes.context).unwrap();
+        assert!(
+            disabled.healthy(),
+            "advice alone never makes the job unhealthy"
+        );
+        let check = &checks(&fakes.context)[0];
+        assert_eq!(check.status, CheckStatus::Warn, "{}", check.detail);
+        assert!(check.detail.contains("auto = false"), "{}", check.detail);
+
+        fs::write(&manifest, "[loadout]\nversion = 1\n").unwrap();
+        assert!(status(&fakes.context).unwrap().advice.is_empty());
+
+        fakes.tool(
+            "systemctl",
+            "case \"$2\" in is-system-running) echo offline;; esac",
+        );
+        let advice = status(&fakes.context).unwrap().advice.join("\n");
+        assert!(advice.contains("no systemd user session"), "{advice}");
+
+        fakes.tool("systemctl", SYSTEMD_RUNNING);
+        fakes.tool("loginctl", "echo no");
+        let advice = status(&fakes.context).unwrap().advice.join("\n");
+        assert!(advice.contains("linger is off"), "{advice}");
+        assert!(
+            fakes.calls("loginctl").contains("--property=Linger"),
+            "read-only query"
+        );
+    }
+
+    /// A registered Windows task whose launcher was removed from beside loadout.exe is not
+    /// healthy.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_windows_launcher_is_reported() {
+        let fakes = Fakes::new(Os::Windows);
+        fakes.tool("schtasks", "exit 0");
+        let exe = fakes.dir.path().join("bin").join("loadout.exe");
+        fakes.plant(&exe);
+        record_for(&fakes, &exe);
+        let status = status(&fakes.context).unwrap();
+        let mismatch = status.mismatch.clone().unwrap_or_default();
+        assert!(mismatch.contains("loadout-background.exe"), "{mismatch}");
+        assert!(!status.healthy());
     }
 
     /// `service.toml` and the scheduler files stay until the scheduler's removal succeeds.
