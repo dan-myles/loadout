@@ -7,11 +7,15 @@
 //! (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) is kept, since it can carry a credential helper
 //! or a URL rewrite; the `-c` settings below come after it and win. It runs with hooks pointed at
 //! a folder that never exists, no fsmonitor, no submodule recursion, and no `ext::` transport (a
-//! URL that would run a command). Local reads go through the bounded query path loadout uses for
-//! package managers. Clone, fetch and merge talk to the remote or change the checkout: in the
-//! foreground they inherit the terminal, so the user's credential helper or SSH key can ask for a
-//! passphrase; in a supervised background run they get no terminal and every prompt git and its
-//! helpers honour is turned off.
+//! URL that would run a command). Line endings in the clone come from the repository alone:
+//! `core.autocrlf=false` and `core.eol=lf` on every call, so a user's or the system's git config
+//! (Git for Windows sets `core.autocrlf=true`) never turns a committed LF file into CRLF, while the
+//! repository's own `.gitattributes` (`eol=crlf`, `-text`) still decide the files they name.
+//!
+//! Local reads go through the bounded query path loadout uses for package managers. Clone, fetch
+//! and merge talk to the remote or change the checkout: in the foreground they inherit the
+//! terminal, so the user's credential helper or SSH key can ask for a passphrase; in a supervised
+//! background run they get no terminal and every prompt git and its helpers honour is turned off.
 
 use std::ffi::OsString;
 use std::io;
@@ -112,6 +116,8 @@ impl<'a> Git<'a> {
             OsString::from("core.fsmonitor=false"),
             OsString::from("submodule.recurse=false"),
             OsString::from("protocol.ext.allow=never"),
+            OsString::from("core.autocrlf=false"),
+            OsString::from("core.eol=lf"),
         ] {
             args.push(OsString::from("-c"));
             args.push(setting);
