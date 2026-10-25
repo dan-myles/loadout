@@ -150,33 +150,36 @@ pub fn clone(url: &str, context: &Context, lock: &state::Lock) -> Result<(), Err
     if fs::symlink_metadata(&temp).is_ok() {
         return Err(Error::Exists { path: temp });
     }
-    let cloned = (|| {
-        git.change(
-            None,
-            &[
-                "clone".into(),
-                "--no-recurse-submodules".into(),
-                "--origin".into(),
-                "origin".into(),
-                "--".into(),
-                url.into(),
-                temp.clone().into_os_string(),
-            ],
-        )?;
-        let branch = git.read(&temp, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        if !branch.ok() {
-            return Err(Error::Detached);
-        }
-        fs::rename(&temp, &destination).map_err(|source| Error::Io {
-            action: "move the clone into",
-            path: destination.clone(),
-            source,
-        })
-    })();
+    let cloned = clone_into(&git, url, &temp, &destination);
     if cloned.is_err() && fs::symlink_metadata(&temp).is_ok_and(|metadata| metadata.is_dir()) {
         let _ = fs::remove_dir_all(&temp);
     }
     cloned
+}
+
+/// The clone itself, into `temp`, then renamed to `destination` once it has a branch.
+fn clone_into(git: &Git<'_>, url: &str, temp: &Path, destination: &Path) -> Result<(), Error> {
+    git.change(
+        None,
+        &[
+            "clone".into(),
+            "--no-recurse-submodules".into(),
+            "--origin".into(),
+            "origin".into(),
+            "--".into(),
+            url.into(),
+            temp.as_os_str().to_owned(),
+        ],
+    )?;
+    let branch = git.read(temp, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if !branch.ok() {
+        return Err(Error::Detached);
+    }
+    fs::rename(temp, destination).map_err(|source| Error::Io {
+        action: "move the clone into",
+        path: destination.to_path_buf(),
+        source,
+    })
 }
 
 /// Fetches origin and fast-forwards the clone's branch to its upstream. Anything that would
@@ -192,35 +195,8 @@ pub fn fetch(context: &Context, lock: &state::Lock) -> Result<Fetched, Error> {
     let git = Git::find(context, &state)?;
     let blocked = |reason| Ok(Fetched::Blocked { reason });
 
-    if !git
-        .read(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
-        .ok()
-    {
-        return blocked(Blocked::Detached);
-    }
-    let upstream = git.read(
-        &repo,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )?;
-    if !upstream.ok() || !upstream.line().starts_with("origin/") {
-        return blocked(Blocked::NoUpstream);
-    }
-    if in_progress(&repo) {
-        return blocked(Blocked::InProgress);
-    }
-    let status = [
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        "--ignored=no",
-    ];
-    let changes = git.read(&repo, &status)?;
-    if !changes.ok() {
-        return Err(git::failed(&status, &changes));
-    }
-    if !changes.stdout.is_empty() {
-        return blocked(Blocked::Dirty);
+    if let Some(reason) = local_block(&git, &repo)? {
+        return blocked(reason);
     }
 
     git.change(
@@ -337,35 +313,7 @@ fn checkout_check(context: &Context) -> Check {
         .ok()
         .filter(git::Answer::ok)
         .map_or_else(|| "no origin".to_owned(), |answer| redact(answer.line()));
-    let local = (|| -> Result<Option<Blocked>, Error> {
-        if !git
-            .read(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
-            .ok()
-        {
-            return Ok(Some(Blocked::Detached));
-        }
-        let upstream = git.read(
-            &repo,
-            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        )?;
-        if !upstream.ok() || !upstream.line().starts_with("origin/") {
-            return Ok(Some(Blocked::NoUpstream));
-        }
-        if in_progress(&repo) {
-            return Ok(Some(Blocked::InProgress));
-        }
-        let changes = git.read(
-            &repo,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignored=no",
-            ],
-        )?;
-        Ok((changes.ok() && !changes.stdout.is_empty()).then_some(Blocked::Dirty))
-    })();
+    let local = local_block(&git, &repo);
     match local {
         Ok(None) => Check::new(
             name,
@@ -382,6 +330,39 @@ fn checkout_check(context: &Context) -> Check {
         ),
         Err(error) => Check::new(name, CheckStatus::Warn, error.to_string()),
     }
+}
+
+/// What blocks a fetch before it starts, from local state only (no fetch, no index refresh), in
+/// order: no branch, no upstream on origin, an unfinished merge or similar, local changes.
+fn local_block(git: &Git<'_>, repo: &Path) -> Result<Option<Blocked>, Error> {
+    if !git
+        .read(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
+        .ok()
+    {
+        return Ok(Some(Blocked::Detached));
+    }
+    let upstream = git.read(
+        repo,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )?;
+    if !upstream.ok() || !upstream.line().starts_with("origin/") {
+        return Ok(Some(Blocked::NoUpstream));
+    }
+    if in_progress(repo) {
+        return Ok(Some(Blocked::InProgress));
+    }
+    let status = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignored=no",
+    ];
+    let changes = git.read(repo, &status)?;
+    if !changes.ok() {
+        return Err(git::failed(&status, &changes));
+    }
+    Ok((!changes.stdout.is_empty()).then_some(Blocked::Dirty))
 }
 
 /// The canonical state dir, which a held lock guarantees exists.
