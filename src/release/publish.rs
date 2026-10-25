@@ -212,6 +212,8 @@ pub(super) fn publish(
 ) -> Result<(), Failure> {
     let mut done: Vec<Move> = Vec::new();
     let mut published: Vec<Staged> = Vec::new();
+    // A Unix rename over an installed binary, which no undo can reverse, has happened.
+    let mut irreversible = false;
     for (mut staged, dest, prior) in binaries {
         let placed = match prior {
             Prior::Installed => place(&staged, &dest, &mut done),
@@ -222,7 +224,7 @@ pub(super) fn publish(
             for staged in &mut published {
                 staged.published = failed.iter().any(|(step, _)| step.from == staged.path);
             }
-            let restored = failed.is_empty() && (cfg!(windows) || published.is_empty());
+            let restored = failed.is_empty() && !irreversible;
             let detail = if failed.is_empty() {
                 detail
             } else {
@@ -240,6 +242,7 @@ pub(super) fn publish(
             };
             return Err(Failure { detail, restored });
         }
+        irreversible |= !cfg!(windows) && prior == Prior::Installed;
         staged.published = true;
         published.push(staged);
     }
