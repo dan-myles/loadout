@@ -215,6 +215,55 @@ fn inherited_git_redirections_never_touch_another_index_or_repository() {
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
 }
 
+/// An unfinished run blocks `update` before it fetches, in the foreground and under the
+/// supervisor: exit 4, the clone's branch and its view of origin don't move, and nothing is
+/// applied. The run is seeded through the public `Run::begin` and left unfinished.
+#[test]
+fn an_interrupted_run_blocks_update_before_the_fetch() {
+    let machine = Machine::new(LOADOUT);
+    let clone = machine.clone();
+    let context = machine.context();
+    let lock = state::lock(&context).unwrap();
+    let run = state::Run::begin(
+        &context,
+        &clone,
+        lock,
+        &state::State::load(&context).unwrap(),
+        &loadout::plan::Plan::default(),
+    )
+    .unwrap();
+    drop(run);
+    let head = git(&clone, &["rev-parse", "HEAD"]);
+    let tracking = git(&clone, &["rev-parse", "refs/remotes/origin/main"]);
+    machine.push("second\n");
+
+    let foreground = machine.run(&["update"]);
+    assert_eq!(foreground.status.code(), Some(4), "{}", text(&foreground));
+    assert!(
+        text(&foreground).contains("didn't finish"),
+        "{}",
+        text(&foreground)
+    );
+
+    let background = machine.run(&["update", "--background"]);
+    assert_eq!(background.status.code(), Some(4), "{}", text(&background));
+    let record = machine.record("last-run.json");
+    assert_eq!(record["result"], "blocked", "{record}");
+    assert_eq!(
+        record["fetched"],
+        serde_json::Value::Null,
+        "no fetch: {record}"
+    );
+
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(&clone, &["rev-parse", "refs/remotes/origin/main"]),
+        tracking,
+        "nothing was fetched"
+    );
+    assert!(machine.notes().is_none(), "nothing may be applied");
+}
+
 #[test]
 fn a_dirty_clone_blocks_update_and_nothing_is_applied() {
     let machine = Machine::new(LOADOUT);
