@@ -210,21 +210,31 @@ pub(super) fn publish(
     binaries: Vec<(Staged, PathBuf, Prior)>,
     record: (Staged, PathBuf),
 ) -> Result<(), Failure> {
+    publish_with(binaries, record, delete_file)
+}
+
+/// [`publish`], deleting files with `delete`, which tests replace to make a removal fail.
+fn publish_with(
+    binaries: Vec<(Staged, PathBuf, Prior)>,
+    record: (Staged, PathBuf),
+    delete: fn(&Path) -> io::Result<()>,
+) -> Result<(), Failure> {
     let mut done: Vec<Move> = Vec::new();
     let mut published: Vec<Staged> = Vec::new();
     // A Unix rename over an installed binary, which no undo can reverse, has happened.
     let mut irreversible = false;
     for (mut staged, dest, prior) in binaries {
         let placed = match prior {
-            Prior::Installed => place(&staged, &dest, &mut done),
-            Prior::Nothing => place_new(&staged, &dest, &mut done),
+            Prior::Installed => place(&staged, &dest, &mut done).map_err(Unplaced::from),
+            Prior::Nothing => place_new(&staged, &dest, &mut done, delete),
         };
-        if let Err(detail) = placed {
+        if let Err(Unplaced { detail, left }) = placed {
             let failed = undo(&done);
             for staged in &mut published {
                 staged.published = failed.iter().any(|(step, _)| step.from == staged.path);
             }
-            let restored = failed.is_empty() && !irreversible;
+            // A file left at a destination that no undo covers means nothing is as it was.
+            let restored = failed.is_empty() && !irreversible && left.is_none();
             let detail = if failed.is_empty() {
                 detail
             } else {
@@ -259,9 +269,23 @@ pub(super) fn publish(
     staged.published = true;
     sync_dir(&dest);
     if let Some(dir) = dest.parent() {
-        settle_asides(dir, &done, delete_file);
+        settle_asides(dir, &done, delete);
     }
     Ok(())
+}
+
+/// Why a binary couldn't be placed, and a file that attempt left at its destination, outside any
+/// completed move that undo could reverse.
+#[derive(Debug)]
+struct Unplaced {
+    detail: String,
+    left: Option<PathBuf>,
+}
+
+impl From<String> for Unplaced {
+    fn from(detail: String) -> Self {
+        Unplaced { detail, left: None }
+    }
 }
 
 /// One completed rename, which [`undo`] reverses. `aside` marks an existing destination this run
@@ -307,20 +331,40 @@ fn place(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), Strin
 
 /// Puts a staged binary where nothing is: a hard link, which fails if anything is there, then the
 /// staging name is dropped. Undone like a rename, by moving it back to the staging name.
-fn place_new(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), String> {
+///
+/// If the staging name can't be dropped, the staged file is still this run's, so the link just
+/// made is removed again. If that fails too, the new binary stays at `dest`, which no move
+/// records; the failure names it and says so.
+fn place_new(
+    staged: &Staged,
+    dest: &Path,
+    done: &mut Vec<Move>,
+    delete: fn(&Path) -> io::Result<()>,
+) -> Result<(), Unplaced> {
     fs::hard_link(&staged.path, dest).map_err(|error| {
-        format!(
+        Unplaced::from(format!(
             "cannot put the new {} where nothing was: {error}",
             dest.display()
-        )
+        ))
     })?;
-    if let Err(error) = fs::remove_file(&staged.path) {
-        // The staging name still holds the file, so the link just made is the one to drop.
-        let _ = fs::remove_file(dest);
-        return Err(format!(
-            "cannot drop the staging name {}: {error}",
+    if let Err(error) = delete(&staged.path) {
+        let staging = format!(
+            "cannot drop the staging name {} ({error})",
             staged.path.display()
-        ));
+        );
+        return Err(match delete(dest) {
+            Ok(()) => Unplaced::from(format!(
+                "{staging}; the new {} was removed again",
+                dest.display()
+            )),
+            Err(second) => Unplaced {
+                detail: format!(
+                    "{staging}, and the new {} linked in its place could not be removed ({second}), so it is left there for recovery",
+                    dest.display()
+                ),
+                left: Some(dest.to_path_buf()),
+            },
+        });
     }
     done.push(Move {
         from: staged.path.clone(),
@@ -575,6 +619,83 @@ mod tests {
         assert_eq!(
             names(path),
             ["loadout-background.exe", "loadout.install.toml"]
+        );
+    }
+
+    /// Refuses to remove a staging file (`.<name>.new.<nonce>`); removes anything else.
+    fn keep_staging(path: &Path) -> io::Result<()> {
+        let staging = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".new."));
+        if staging {
+            Err(io::Error::other("injected: staging name kept"))
+        } else {
+            fs::remove_file(path)
+        }
+    }
+
+    fn remove_nothing(_path: &Path) -> io::Result<()> {
+        Err(io::Error::other("injected: nothing can be removed"))
+    }
+
+    #[test]
+    fn a_new_binary_whose_staging_name_stays_is_removed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"launcher", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        let failure = publish_with(
+            vec![(
+                launcher,
+                path.join("loadout-background.exe"),
+                Prior::Nothing,
+            )],
+            (record, path.join("loadout.install.toml")),
+            keep_staging,
+        )
+        .unwrap_err();
+        assert!(failure.restored, "{}", failure.detail);
+        assert!(
+            failure.detail.contains("removed again"),
+            "{}",
+            failure.detail
+        );
+        assert!(!path.join("loadout-background.exe").exists());
+        assert_eq!(
+            fs::read(path.join("loadout.install.toml")).unwrap(),
+            b"old record"
+        );
+        // The staging file stayed this run's, so dropping it removed it.
+        assert_eq!(names(path), ["loadout.install.toml"]);
+    }
+
+    #[test]
+    fn a_new_binary_that_cannot_be_removed_again_is_never_called_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"launcher", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        let dest = path.join("loadout-background.exe");
+        let failure = publish_with(
+            vec![(launcher, dest.clone(), Prior::Nothing)],
+            (record, path.join("loadout.install.toml")),
+            remove_nothing,
+        )
+        .unwrap_err();
+        assert!(!failure.restored, "{}", failure.detail);
+        assert!(
+            failure.detail.contains(&dest.display().to_string())
+                && failure.detail.contains("left there for recovery"),
+            "{}",
+            failure.detail
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"launcher");
+        assert_eq!(
+            fs::read(path.join("loadout.install.toml")).unwrap(),
+            b"old record"
         );
     }
 
