@@ -1179,9 +1179,14 @@ mod seam {
         }
     }
 
-    /// `FailAfterResume`'s readiness wait is the test's own bound. It is longer than the
-    /// production setup deadline, so a test using that seam supplies a longer setup deadline of
-    /// its own.
+    /// What `FailAfterResume` leaves of the setup deadline for stopping the job once the
+    /// descendant is ready.
+    #[cfg(windows)]
+    const DISPOSAL_RESERVE: Duration = Duration::from_secs(10);
+
+    /// `FailAfterResume` waits for the descendant until `DISPOSAL_RESERVE` before the setup
+    /// deadline. A cold PowerShell can take longer than the production setup deadline to start,
+    /// so a test using that seam supplies a longer setup deadline of its own.
     #[cfg(windows)]
     pub(super) fn after_resume(limit: Instant) -> io::Result<()> {
         if is(&Seam::ExpireAfterResume) {
@@ -1195,7 +1200,9 @@ mod seam {
         let Some(ready) = ready else {
             return Ok(());
         };
-        let limit = Instant::now() + Duration::from_secs(20);
+        let limit = limit
+            .checked_sub(DISPOSAL_RESERVE)
+            .unwrap_or_else(Instant::now);
         while !ready.exists() {
             if Instant::now() >= limit {
                 return Err(io::Error::other(
@@ -2816,8 +2823,9 @@ mod windows_tests {
     /// the injected error. The whole job must then be stopped: the query and the descendant are
     /// each checked to be gone.
     ///
-    /// Test-only setup deadline: the readiness wait can take up to 20 seconds, so this control
-    /// supplies 60. It proves the cleanup uses that same original deadline (no fresh budget),
+    /// Test-only setup deadline: a cold PowerShell on a loaded runner has taken over 20 seconds
+    /// to report ready, so this control supplies 60, and the readiness wait leaves 10 of them to
+    /// stop the job. It proves the cleanup uses that same original deadline (no fresh budget),
     /// not that production setup fits in 5 seconds; the 5-second controls above prove that.
     #[test]
     fn a_failure_after_the_query_resumed_stops_the_whole_job_by_the_setup_deadline() {
