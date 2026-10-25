@@ -255,17 +255,14 @@ fn redact_text(text: &str) -> String {
 }
 
 fn userinfo(url: &str) -> Option<&str> {
-    match url.find("://") {
-        Some(scheme) => {
-            let rest = &url[scheme + 3..];
-            let authority = rest.find('/').map_or(rest, |slash| &rest[..slash]);
-            authority.rfind('@').map(|at| &authority[..at])
-        }
-        None => {
-            let at = url.find('@')?;
-            let colon = url.find(':')?;
-            (at < colon && !url.starts_with(['/', '.'])).then(|| &url[..at])
-        }
+    if let Some(scheme) = url.find("://") {
+        let rest = &url[scheme + 3..];
+        let authority = rest.find('/').map_or(rest, |slash| &rest[..slash]);
+        authority.rfind('@').map(|at| &authority[..at])
+    } else {
+        let at = url.find('@')?;
+        let colon = url.find(':')?;
+        (at < colon && !url.starts_with(['/', '.'])).then(|| &url[..at])
     }
 }
 

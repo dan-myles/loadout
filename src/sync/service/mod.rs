@@ -742,6 +742,7 @@ pub(super) mod fake {
         static TOOLS: RefCell<BTreeMap<String, PathBuf>> = const { RefCell::new(BTreeMap::new()) };
     }
 
+    #[cfg(unix)]
     pub(super) fn set(program: &str, path: PathBuf) {
         TOOLS.with(|tools| tools.borrow_mut().insert(program.to_owned(), path));
     }
@@ -944,7 +945,7 @@ mod tests {
     #[test]
     fn unknown_fields_and_other_versions_are_refused() {
         let text = toml::to_string(&recorded(Path::new("/s"))).unwrap();
-        assert!(parse(format!("{text}token = \"x\"\n").as_bytes()).is_err());
+        assert!(parse(format!("token = \"x\"\n{text}").as_bytes()).is_err());
         assert!(parse(text.replace("version = 1", "version = 2").as_bytes()).is_err());
         assert!(parse(b"\xff").is_err());
     }
@@ -1062,14 +1063,16 @@ mod tests {
             fs::read_to_string(self.dir.path().join(format!("{program}.log"))).unwrap_or_default()
         }
 
-        fn plant(&self, path: &Path) {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "planted").unwrap();
-        }
-
         fn record(&self) {
             state::write_private(&self.context, Private::Service, b"version = 1\n").unwrap();
         }
+    }
+
+    /// Puts a file at `path`, creating its folders.
+    #[cfg(unix)]
+    fn plant(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "planted").unwrap();
     }
 
     #[cfg(unix)]
@@ -1098,7 +1101,7 @@ mod tests {
 
         let units = systemd::files(&fakes.context);
         for unit in &units {
-            fakes.plant(unit);
+            plant(unit);
         }
         fakes.tool(
             "systemctl",
@@ -1157,7 +1160,7 @@ mod tests {
         assert!(launchd::uninstall(&fakes.context).is_err());
 
         let plist = launchd::file(&fakes.context);
-        fakes.plant(&plist);
+        plant(&plist);
         fakes.tool(
             "launchctl",
             "echo 'Boot-out failed: 5: Input/output error' >&2; exit 5",
@@ -1173,7 +1176,7 @@ mod tests {
         launchd::uninstall(&fakes.context).unwrap();
         assert!(!plist.exists(), "an unloaded agent's plist is removed");
 
-        fakes.plant(&plist);
+        plant(&plist);
         fakes.tool("launchctl", "exit 0");
         launchd::uninstall(&fakes.context).unwrap();
         assert!(!plist.exists());
@@ -1264,7 +1267,7 @@ mod tests {
         ];
         let own = Private::Service.path(&fakes.context);
         let write_units = |exe: &str, record: &str| {
-            fakes.plant(&service);
+            plant(&service);
             fs::write(&service, systemd::service_unit(exe, record)).unwrap();
             fs::write(&timer, systemd::timer_unit(60)).unwrap();
         };
@@ -1319,7 +1322,7 @@ mod tests {
         record_for(&fakes, &exe);
         let own = Private::Service.path(&fakes.context);
         let units = systemd::files(&fakes.context);
-        fakes.plant(&units[0]);
+        plant(&units[0]);
         fs::write(
             &units[0],
             systemd::service_unit(exe.to_str().unwrap(), own.to_str().unwrap()),
@@ -1327,7 +1330,7 @@ mod tests {
         .unwrap();
         fs::write(&units[1], systemd::timer_unit(60)).unwrap();
         let manifest = super::super::checkout(&fakes.context).join("loadout.toml");
-        fakes.plant(&manifest);
+        plant(&manifest);
 
         fs::write(
             &manifest,
@@ -1381,7 +1384,7 @@ mod tests {
         let fakes = Fakes::new(Os::Windows);
         fakes.tool("schtasks", "exit 0");
         let exe = fakes.dir.path().join("bin").join("loadout.exe");
-        fakes.plant(&exe);
+        plant(&exe);
         record_for(&fakes, &exe);
         let status = status(&fakes.context).unwrap();
         let mismatch = status.mismatch.clone().unwrap_or_default();
@@ -1403,7 +1406,7 @@ mod tests {
             Os::Windows => Vec::new(),
         };
         for path in &planted {
-            fakes.plant(path);
+            plant(path);
         }
         fakes.tool("systemctl", "echo 'Access denied' >&2; exit 1");
         fakes.tool(

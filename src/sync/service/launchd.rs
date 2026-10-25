@@ -3,6 +3,7 @@
 //! deadline is the run's only bound. The arguments are a plist array, never a joined command
 //! line; each is XML-escaped.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::context::Context;
@@ -20,10 +21,12 @@ pub(super) fn file(context: &Context) -> PathBuf {
 }
 
 fn plist(exe: &str, service: &str, interval_minutes: u32) -> String {
-    let arguments: String = [exe, "update", "--background", "--service", service]
+    let arguments = [exe, "update", "--background", "--service", service]
         .iter()
-        .map(|arg| format!("\t\t<string>{}</string>\n", xml(arg)))
-        .collect();
+        .fold(String::new(), |mut out, arg| {
+            let _ = writeln!(out, "\t\t<string>{}</string>", xml(arg));
+            out
+        });
     let seconds = u64::from(interval_minutes) * 60;
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
