@@ -1,0 +1,437 @@
+<#
+Install the loadout CLI on Windows from a GitHub release, then optionally run `loadout init`.
+
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
+  & ([scriptblock]::Create((irm .../install.ps1))) -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+  powershell -ExecutionPolicy Bypass -File install.ps1 -Version v1.2.3
+
+-Version vX.Y.Z  install that release instead of the latest one
+-BaseUrl URL     fetch the assets from URL instead of GitHub: https, or http on localhost
+-LoadoutUrl URL  afterwards, run `loadout init URL` with each -InitArgs element as one argument
+An existing loadout.exe is replaced only if this installer put it there. docs/releasing.md has details.
+#>
+[CmdletBinding()]
+param(
+    [string]$Version = 'latest',
+    [string]$BaseUrl = '',
+    [string]$LoadoutUrl = '',
+    [string[]]$InitArgs = @()
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$Repo = 'dan-myles/loadout'
+$RecordKeys = @('schema', 'installer', 'repository', 'source', 'target', 'version', 'archive_sha256', 'binary', 'binary_sha256')
+$MaxRedirects = 5
+$LoopbackHosts = @('127.0.0.1', 'localhost', '[::1]')
+
+function Say([string]$Message) { [Console]::Error.WriteLine("loadout-install: $Message") }
+
+function Get-NativeArch {
+    # PROCESSOR_ARCHITECTURE describes this process, which is AMD64 for x64 PowerShell emulated on
+    # ARM64 Windows; the machine-wide value in the registry is the native one.
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    $native = (Get-ItemProperty -LiteralPath $key -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+    switch ($native) {
+        'AMD64' { return 'x86_64' }
+        'ARM64' { return 'aarch64' }
+        default { throw "unsupported CPU architecture ${native}: releases exist for x64 and ARM64" }
+    }
+}
+
+function Test-Reparse([string]$Path) {
+    (Test-Path -LiteralPath $Path) -and
+        (((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Get-Sha256([string]$Path) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Assert-DownloadUri([Uri]$Uri, [bool]$LoopbackHttp) {
+    if ($Uri.UserInfo) { throw "refusing ${Uri}: URLs with credentials are not allowed" }
+    if ($Uri.Scheme -ceq 'https') { return }
+    if ($LoopbackHttp -and $Uri.Scheme -ceq 'http' -and $LoopbackHosts -contains $Uri.Host) { return }
+    throw "refusing ${Uri}: every download must use https"
+}
+
+function Get-BaseUri([string]$Url) {
+    if ($Url -match '[\s\x00-\x1F\x7F?#@\\"'']') {
+        throw '-BaseUrl must be a plain URL: no spaces, quotes, credentials, query, or fragment'
+    }
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or -not $uri.Host) {
+        throw "-BaseUrl $Url is not an absolute URL"
+    }
+    if ($uri.Scheme -ceq 'http' -and -not ($LoopbackHosts -contains $uri.Host)) {
+        throw '-BaseUrl may use http only for 127.0.0.1, localhost, or [::1]'
+    }
+    Assert-DownloadUri $uri ($uri.Scheme -ceq 'http')
+    $uri
+}
+
+function New-HttpClient {
+    Add-Type -AssemblyName System.Net.Http
+    # Windows PowerShell 5.1's .NET Framework may not offer TLS 1.2 by default; this adds it.
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $false
+    $client = New-Object Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes(10)
+    $client
+}
+
+function Save-Url($Client, [string]$Url, [string]$OutFile, [bool]$LoopbackHttp) {
+    $uri = New-Object Uri($Url)
+    $allowed = if ($LoopbackHttp) { 0 } else { $MaxRedirects }
+    for ($hop = 0; ; $hop++) {
+        Assert-DownloadUri $uri $LoopbackHttp
+        $response = $null
+        try {
+            try {
+                $response = $Client.GetAsync($uri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            } catch {
+                throw "download failed: $uri ($($_.Exception.Message))"
+            }
+            $code = [int]$response.StatusCode
+            if ($code -ge 300 -and $code -lt 400) {
+                if ($hop -ge $allowed) { throw "download failed: $uri redirects more than $allowed times" }
+                $next = $response.Headers.Location
+                if ($null -eq $next) { throw "download failed: $uri redirects without a location" }
+                if (-not $next.IsAbsoluteUri) { $next = New-Object Uri($uri, $next) }
+                $uri = $next
+                continue
+            }
+            if (-not $response.IsSuccessStatusCode) { throw "download failed: $uri (HTTP $code)" }
+            $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $file = [IO.File]::Open($OutFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $source.CopyTo($file) } finally { $file.Dispose(); $source.Dispose() }
+            return
+        } finally {
+            if ($response) { $response.Dispose() }
+        }
+    }
+}
+
+# Bytes, not decoded text: ReadAllText would silently strip a UTF-8 or UTF-16 byte order mark.
+function Read-Sidecar([string]$Path, [string]$Asset) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    foreach ($byte in $bytes) {
+        if ($byte -ne 10 -and ($byte -lt 32 -or $byte -gt 126)) {
+            throw "$Asset.sha256 is not exactly one '<sha256>  $Asset' line"
+        }
+    }
+    $text = [Text.Encoding]::ASCII.GetString($bytes)
+    $match = [regex]::Match($text, '\A([0-9a-f]{64})  (\S+)\n\z')
+    if (-not $match.Success -or $match.Groups[2].Value -cne $Asset) {
+        throw "$Asset.sha256 is not exactly one '<sha256>  $Asset' line"
+    }
+    $match.Groups[1].Value
+}
+
+# Exactly one regular loadout-<target>/loadout.exe, and no entry outside loadout-<target>/ or nested in it.
+function Export-ZipBinary([string]$Zip, [string]$Target, [string]$OutFile) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $prefix = "loadout-$Target/"
+    $archive = [IO.Compression.ZipFile]::OpenRead($Zip)
+    try {
+        $binary = $null
+        foreach ($entry in $archive.Entries) {
+            $name = $entry.FullName
+            if ($name -ceq $prefix) { continue }
+            $leaf = if ($name.StartsWith($prefix, [StringComparison]::Ordinal)) { $name.Substring($prefix.Length) } else { '' }
+            if ($leaf -cnotmatch '\A[A-Za-z0-9._-]+\z' -or $leaf -eq '.' -or $leaf -eq '..') {
+                throw "the archive has an unexpected entry '$name'"
+            }
+            if ($leaf -ceq 'loadout.exe') {
+                if ($binary) { throw "the archive has more than one $name" }
+                $type = ($entry.ExternalAttributes -shr 16) -band 0xF000
+                if ($type -ne 0 -and $type -ne 0x8000) { throw "$name in the archive is not a regular file" }
+                $binary = $entry
+            }
+        }
+        if (-not $binary) { throw "the archive has no ${prefix}loadout.exe" }
+        $source = $binary.Open()
+        $file = [IO.File]::Open($OutFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $source.CopyTo($file) } finally { $file.Dispose(); $source.Dispose() }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+# Install-record strings never hold control characters (Windows paths can't), so only backslash and
+# double quote need escaping; unpaired surrogates fail the strict UTF-8 encoder before anything changes.
+function ConvertTo-TomlString([string]$Value) {
+    if ($Value -match '[\x00-\x1F\x7F]') { throw "'$Value' contains a control character, which the install record can't hold" }
+    '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
+}
+
+# Data only: the header comment, `schema = 1`, and one basic string per known key. Values stay encoded.
+function Read-InstallRecord([string]$Path) {
+    $text = (New-Object Text.UTF8Encoding($false, $true)).GetString([IO.File]::ReadAllBytes($Path))
+    if (-not $text.EndsWith("`n")) { throw 'it does not end with a newline' }
+    $values = @{}
+    foreach ($line in $text.Substring(0, $text.Length - 1).Split([char]10)) {
+        if ($line -cmatch '\A#[^\x00-\x1F\x7F]*\z') { continue }
+        if ($line -ceq 'schema = 1') {
+            $key = 'schema'; $value = '1'
+        } else {
+            $match = [regex]::Match($line, '\A([a-z0-9_]+) = ("(?:[^"\\\x00-\x1F\x7F]|\\["\\])*")\z')
+            if (-not $match.Success) { throw "line '$line' is not part of the install record format" }
+            $key = $match.Groups[1].Value; $value = $match.Groups[2].Value
+            if ($key -ceq 'schema' -or -not ($RecordKeys -ccontains $key)) { throw "unknown key $key" }
+        }
+        if ($values.ContainsKey($key)) { throw "$key appears twice" }
+        $values[$key] = $value
+    }
+    foreach ($key in $RecordKeys) {
+        if (-not $values.ContainsKey($key)) { throw "$key is missing" }
+    }
+    $values
+}
+
+function Get-RecordMismatch([string]$Record, [string]$Dest, [string]$Target) {
+    if (-not (Test-Path -LiteralPath $Record -PathType Leaf)) { return "there is no install record $Record" }
+    try {
+        $values = Read-InstallRecord $Record
+    } catch {
+        return "$Record is not a valid install record: $($_.Exception.Message)"
+    }
+    if ($values['installer'] -cne '"install.ps1"') { return "$Record was written by another installer" }
+    if ($values['target'] -cne "`"$Target`"") { return "$Record is for another target than $Target" }
+    if (-not [string]::Equals($values['binary'], (ConvertTo-TomlString $Dest), [StringComparison]::OrdinalIgnoreCase)) {
+        return "$Record describes another binary path"
+    }
+    if ($values['binary_sha256'] -cne "`"$(Get-Sha256 $Dest)`"") { return "$Dest changed after it was installed" }
+    $null
+}
+
+function Assert-Destination([string]$Dest, [string]$Record, [string]$Target) {
+    foreach ($path in @($Dest, $Record)) {
+        if ((Test-Path -LiteralPath $path -PathType Container) -or (Test-Reparse $path)) {
+            throw "$path is a link or a folder, so another installer may own it. It was left alone"
+        }
+    }
+    if (Test-Path -LiteralPath $Dest) {
+        $why = Get-RecordMismatch $Record $Dest $Target
+        if ($why) {
+            throw "$Dest was not installed by this installer ($why), so it was left alone. To install here, remove $Dest and $Record yourself first"
+        }
+    }
+}
+
+function New-StagedFile($Owned, [string]$Directory, [string]$Prefix, [byte[]]$Bytes) {
+    $path = Join-Path $Directory ($Prefix + [Guid]::NewGuid().ToString('N'))
+    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $Owned.Add($path)
+    try { $stream.Write($Bytes, 0, $Bytes.Length) } finally { $stream.Dispose() }
+    $path
+}
+
+function Publish-StagedFile($Owned, [string]$Staged, [string]$Destination) {
+    if (Test-Path -LiteralPath $Destination) {
+        [IO.File]::Replace($Staged, $Destination, [NullString]::Value)
+    } else {
+        [IO.File]::Move($Staged, $Destination)
+    }
+    [void]$Owned.Remove($Staged)
+}
+
+# Quotes one argument so CommandLineToArgvW, the MSVC runtime, and Rust's std::env::args all read it
+# back unchanged, including empty strings, embedded quotes, and trailing backslashes.
+function ConvertTo-NativeArgument([string]$Value) {
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $backslash = [char]92
+    $quote = [char]34
+    $quoted = New-Object Text.StringBuilder
+    [void]$quoted.Append($quote)
+    $backslashes = 0
+    foreach ($char in $Value.ToCharArray()) {
+        if ($char -eq $backslash) {
+            $backslashes++
+            continue
+        }
+        if ($char -eq $quote) {
+            [void]$quoted.Append($backslash, 2 * $backslashes + 1)
+        } elseif ($backslashes -gt 0) {
+            [void]$quoted.Append($backslash, $backslashes)
+        }
+        [void]$quoted.Append($char)
+        $backslashes = 0
+    }
+    [void]$quoted.Append($backslash, 2 * $backslashes)
+    [void]$quoted.Append($quote)
+    $quoted.ToString()
+}
+
+function Invoke-Native([string]$FilePath, [string[]]$Arguments) {
+    $encoded = New-Object Collections.Generic.List[string]
+    foreach ($argument in $Arguments) { $encoded.Add((ConvertTo-NativeArgument $argument)) }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = $encoded -join ' '
+    $info.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $process.WaitForExit()
+        $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Install-Loadout {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        throw 'install.ps1 is for Windows; use install.sh on macOS and Linux'
+    }
+    if ($Version -ne 'latest' -and $Version -cnotmatch '\Av\d+\.\d+\.\d+[0-9A-Za-z.+-]*\z') {
+        throw "-Version must be a release tag like v1.2.3, not '$Version'"
+    }
+    $loopbackHttp = $false
+    if ($BaseUrl) {
+        $base = Get-BaseUri $BaseUrl
+        $loopbackHttp = $base.Scheme -ceq 'http'
+    }
+    if ($LoadoutUrl.StartsWith('-')) { throw 'the loadout URL must not start with -' }
+    foreach ($argument in @($LoadoutUrl) + $InitArgs) {
+        if ("$argument".Contains([string][char]0)) { throw 'init arguments must not contain a NUL character' }
+    }
+
+    $arch = Get-NativeArch
+    $target = "$arch-pc-windows-msvc"
+
+    if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw 'git is required but is not on PATH. Install it with winget install --id Git.Git -e --source winget, then open a new terminal and run this installer again'
+    }
+    if (-not $env:LOCALAPPDATA -or -not [IO.Path]::IsPathRooted($env:LOCALAPPDATA)) {
+        throw 'LOCALAPPDATA is not set to an absolute path'
+    }
+    $dir = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs\loadout'))
+    $dest = Join-Path $dir 'loadout.exe'
+    $record = Join-Path $dir 'loadout.install.toml'
+    [void](ConvertTo-TomlString $dest)
+    Assert-Destination $dest $record $target
+
+    $asset = "loadout-$target.zip"
+    if ($BaseUrl) {
+        $url = "$($BaseUrl.TrimEnd('/'))/$asset"
+    } elseif ($Version -eq 'latest') {
+        $url = "https://github.com/$Repo/releases/latest/download/$asset"
+    } else {
+        $url = "https://github.com/$Repo/releases/download/$Version/$asset"
+    }
+    [void](ConvertTo-TomlString $url)
+
+    $owned = New-Object Collections.Generic.List[string]
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('loadout-install-' + [Guid]::NewGuid().ToString('N'))
+    $client = $null
+    $tmpOwned = $false
+    try {
+        [void](New-Item -ItemType Directory -Path $tmp)
+        $tmpOwned = $true
+        $client = New-HttpClient
+        $zip = Join-Path $tmp $asset
+        Say "downloading $url"
+        Save-Url $client $url $zip $loopbackHttp
+        Save-Url $client "$url.sha256" "$zip.sha256" $loopbackHttp
+
+        $want = Read-Sidecar "$zip.sha256" $asset
+        $got = Get-Sha256 $zip
+        if ($got -cne $want) { throw "checksum mismatch for ${asset}: expected $want, got $got" }
+        Say "verified sha256 $got"
+
+        $new = Join-Path $tmp 'loadout.exe'
+        Export-ZipBinary $zip $target $new
+
+        # Windows PowerShell 5.1 turns redirected native stderr into errors that 'Stop' would throw.
+        $ErrorActionPreference = 'Continue'
+        $reported = (& $new --version 2>$null | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        $versionMatch = [regex]::Match($reported, '\Aloadout ([0-9A-Za-z.+-]+)(\s|\z)')
+        if ($exitCode -ne 0 -or -not $versionMatch.Success) {
+            throw "the downloaded loadout.exe does not run on this machine ($target): '$reported'"
+        }
+        $installedVersion = $versionMatch.Groups[1].Value
+        if ($Version -ne 'latest' -and "v$installedVersion" -cne $Version) {
+            throw "release $Version contains loadout $installedVersion"
+        }
+
+        [void](New-Item -ItemType Directory -Path $dir -Force)
+        Assert-Destination $dest $record $target
+
+        $bytes = [IO.File]::ReadAllBytes($new)
+        $staged = New-StagedFile $owned $dir '.loadout.exe.new.' $bytes
+        $lines = @(
+            '# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.',
+            'schema = 1',
+            'installer = "install.ps1"',
+            "repository = `"$Repo`"",
+            "source = $(ConvertTo-TomlString $url)",
+            "target = `"$target`"",
+            "version = `"$installedVersion`"",
+            "archive_sha256 = `"$want`"",
+            "binary = $(ConvertTo-TomlString $dest)",
+            "binary_sha256 = `"$(Get-Sha256 $staged)`""
+        )
+        $recordBytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes(($lines -join "`n") + "`n")
+        $stagedRecord = New-StagedFile $owned $dir '.loadout.install.toml.new.' $recordBytes
+
+        try {
+            Publish-StagedFile $owned $staged $dest
+        } catch {
+            throw "could not replace $dest, so the previous binary is unchanged. Close any running loadout and try again ($($_.Exception.Message))"
+        }
+        try {
+            Publish-StagedFile $owned $stagedRecord $record
+        } catch {
+            throw "installed $dest but could not write $record, so self-update will not replace this binary ($($_.Exception.Message))"
+        }
+        Say "installed loadout $installedVersion ($target) to $dest"
+
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not (($userPath -split ';') -contains $dir)) {
+            Say "$dir is not on your PATH. To add it for new terminals, run:"
+            Say "  [Environment]::SetEnvironmentVariable('Path', '$dir;' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
+        }
+        return $dest
+    } finally {
+        if ($client) { $client.Dispose() }
+        foreach ($path in @($owned)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        if ($tmpOwned) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Only a script file may `exit`. As an in-memory script block, `exit` would end the user's session
+# or calling script, and $PSCommandPath could be the caller's, so the mode is fixed here.
+$LoadoutInstallAsFile = [bool]$MyInvocation.MyCommand.Path
+
+function Complete([int]$Code) {
+    if ($LoadoutInstallAsFile) { exit $Code }
+    $global:LASTEXITCODE = $Code
+}
+
+try {
+    $installed = Install-Loadout
+} catch {
+    Say "error: $($_.Exception.Message)"
+    Complete 1
+    return
+}
+
+if (-not $LoadoutUrl) {
+    Complete 0
+    return
+}
+
+Say "running $installed init $LoadoutUrl $($InitArgs -join ' ')"
+try {
+    $initExit = Invoke-Native $installed (@('init', $LoadoutUrl) + $InitArgs)
+} catch {
+    Say "error: could not run $installed init: $($_.Exception.Message)"
+    Complete 1
+    return
+}
+Complete $initExit

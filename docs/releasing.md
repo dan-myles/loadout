@@ -92,6 +92,173 @@ Triggers:
    Self-update and `releases/latest` only see published, non-prerelease releases. Don't untick
    "pre-release" on a beta draft.
 
+## Installing from a release
+
+`scripts/release/install.sh` (macOS, Linux) and `scripts/release/install.ps1` (Windows) install a
+published release. Until one is published, the default download fails with an HTTP error and
+nothing is installed.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh \
+  | sh -s -- https://github.com/you/your-loadout.git --name laptop
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1))) `
+  -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+```
+
+Prerequisites:
+- `install.sh` needs `git`, `curl`, `tar`, `cmp`, and `sha256sum` or `shasum`. It needs `iconv`
+  only when the home path or an existing install record isn't plain ASCII.
+- `install.ps1` needs `git`, plus Windows PowerShell 5.1 on .NET Framework 4.7.2 or later, or
+  PowerShell 7.
+
+Neither script installs git; each names the per-OS command instead.
+
+### What each script does
+
+1. **Target.** On macOS and Linux, `uname -s`/`uname -m` pick it, and a shell running under Rosetta
+   gets the aarch64 build. On Windows, the registry's native `PROCESSOR_ARCHITECTURE` picks it, so
+   x64 PowerShell emulated on ARM64 gets the ARM64 build. Any other OS or CPU is refused.
+2. **Destination check, before downloading** (repeated just before installing).
+   - A destination that is a symlink, junction, or folder is refused, and so is a record that is one.
+   - An existing binary is replaced only if the install record next to it matches (see below).
+   - With no binary there, a leftover record is simply overwritten.
+3. **Download, https at every hop.**
+   - Sources: `releases/latest/download/` by default, `releases/download/vX.Y.Z/` with
+     `--version`/`-Version`, or `--base-url`/`-BaseUrl` for a mirror.
+   - The archive and its `.sha256` come over https only, with at most 5 redirects, each of them
+     https. `curl` runs with `-q` (ignore `~/.curlrc`), `--proto =https --proto-redir =https
+     --tlsv1.2`.
+   - `install.ps1` turns off automatic redirects and checks every hop itself. It adds TLS 1.2 to the
+     process's allowed protocols (older .NET Framework defaults lack it); it doesn't force it
+     exclusively.
+   - wget is not a fallback, because it can't refuse an http redirect.
+   - The one exception is a `--base-url` on `http://127.0.0.1`, `http://localhost`, or `http://[::1]`
+     (any port), for tests. It gets plain http and no redirects at all.
+   - Base URLs with credentials, a query, a fragment, spaces, or quotes are refused, as are http
+     hosts that merely start with a loopback name.
+4. **Checksum.** The `.sha256` file must be exactly the ASCII bytes `<64 lowercase hex>  <asset>`
+   followed by one LF. That excludes a byte order mark, UTF-16, CR, NUL, extra lines, and other
+   names. `install.sh` compares it byte for byte with `cmp`; `install.ps1` checks the raw bytes
+   before decoding them. The archive's sha256 must equal that value before anything is extracted or
+   run.
+5. **Archive layout.** The archive is checked before extraction. Every entry must be
+   `loadout-<target>/` or a plain name directly inside it (letters, digits, `.`, `_`, `-`), and
+   there must be exactly one `loadout-<target>/loadout[.exe]`.
+   - Only that one entry is extracted, into the script's own temporary directory.
+   - Tar: every entry's type must be a regular file or a directory. `install.sh` reads the type
+     from the first character of `tar -tv` output, which GNU and BSD tar print ls-style (`h` hard
+     link, `l` symlink), so links and devices are refused before extraction. That check depends on
+     those tar implementations' listing format and hasn't been run on either yet. As a second check,
+     the extracted binary must be a regular file and not a symlink.
+   - Zip: `install.ps1` refuses the binary entry if its Unix mode bits mark anything other than a
+     regular file, and other entries are never extracted.
+   - This is a layout check for official release archives, not a sandbox for hostile archives.
+6. **Version check.** The extracted binary must print `loadout <version>` from `--version`. With a
+   requested tag, `v<version>` must equal it exactly, case-sensitively.
+7. **Staging.** Each staging file is created exclusively, under a fresh unique name in the
+   destination directory: `mktemp` for `.loadout.new.XXXXXX` and `.loadout.install.toml.new.XXXXXX`,
+   or a GUID name opened with `CreateNew`.
+   - The script deletes only names it created and hasn't yet published.
+   - Other files, including other runs' staging files, are never overwritten or deleted.
+   - No backup file is kept.
+8. **Publishing.** The binary is published first, with a same-directory rename: `mv -f`, or
+   `File.Replace` with no backup (`File.Move` when nothing is there yet). Then the record is
+   published the same way. Every failure before the first rename leaves the previous binary and
+   record untouched.
+9. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
+   shell profiles or `PATH`.
+10. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
+    remaining arguments. The URL must not start with `-`.
+    - `install.sh` passes `"$@"`.
+    - `install.ps1` encodes each `-InitArgs` element as exactly one argument, using the
+      `CommandLineToArgvW` / MSVC / Rust rules: quotes, backslashes before a quote or at the end,
+      empty strings, whitespace, and Unicode all round-trip.
+    - It starts the binary through `ProcessStartInfo` (no shell, `UseShellExecute = $false`, same
+      console) and returns its exit code.
+    - NUL can't appear on a Windows command line, so it is refused before installing.
+    - If the binary can't be started or waited on (for example, the command line is longer than
+      Windows allows), the script reports the error and completes with exit code 1. It never leaves
+      an earlier `$LASTEXITCODE` standing.
+
+Concurrent runs aren't serialized. Each publishes a complete binary and record, so the last rename
+wins. A record left describing the other run's binary fails its hash. Self-update, and the next run
+of either installer, then refuse to replace that binary. Recovery is manual: remove the binary and
+the record, then install again. There is no automatic adopt or force option.
+
+When the script runs as an in-memory script block, it never calls `exit`, so the console stays
+open; it sets `$LASTEXITCODE` instead. Run with `-File`, it exits with the code. It decides which
+from its own `$MyInvocation`, never from `$PSCommandPath`, which a script block could inherit from
+a calling script.
+
+### Install record, schema 1 (input to U9 self-update)
+
+The record sits next to the binary as `loadout.install.toml`: `~/.local/bin/loadout.install.toml`
+on macOS and Linux, `%LOCALAPPDATA%\Programs\loadout\loadout.install.toml` on Windows. Producers
+write exactly this, in UTF-8 with no byte order mark, `\n` line endings, and a final newline:
+
+```toml
+# loadout install record. Written by install.sh or install.ps1 and read by loadout self-update. Do not edit.
+schema = 1
+installer = "install.sh"
+repository = "dan-myles/loadout"
+source = "https://github.com/dan-myles/loadout/releases/latest/download/loadout-x86_64-unknown-linux-musl.tar.gz"
+target = "x86_64-unknown-linux-musl"
+version = "0.1.0"
+archive_sha256 = "<the verified archive's sha256>"
+binary = "/home/me/.local/bin/loadout"
+binary_sha256 = "<sha256 of that binary>"
+```
+
+- **Framing.** The whole file is UTF-8 with no byte order mark, no NUL or other control bytes
+  except LF, and a final LF.
+- **Lines.** Each line is a `#` comment, exactly `schema = 1` (an integer, never a string), or
+  `<key> = "<value>"`. The keys are exactly
+  `installer` (`"install.sh"` or `"install.ps1"`), `repository`, `source`, `target`, `version`,
+  `archive_sha256`, `binary` and `binary_sha256`, each once.
+- **Values.** They never contain control characters, and only `\\` and `\"` are escaped.
+  Producers refuse a value they can't encode that way before changing anything: a control
+  character, invalid UTF-8, or an unpaired UTF-16 surrogate. So the file is always valid TOML.
+- **`binary`.**
+  - `install.sh` writes the physical path: `pwd -P` of `~/.local/bin`, plus `/loadout`.
+  - `install.ps1` writes `GetFullPath` of `%LOCALAPPDATA%\Programs\loadout\loadout.exe`. It doesn't
+    resolve junctions, and Windows compares it case-insensitively.
+  - Consumers must canonicalize both this path and their own executable before comparing.
+- **Anything else is invalid.** That includes unknown keys, duplicates, a quoted or other schema,
+  CR, a BOM, invalid UTF-8, a missing final LF, or other TOML syntax. Both installers read the record as data only, with no `eval` and no
+  dot-sourcing.
+
+**When a binary counts as installer-managed:**
+- the record is valid
+- `installer` names this platform's script
+- `target` equals the target being installed or running
+- `binary` names the same file
+- that file's current sha256 equals `binary_sha256`
+
+If any check fails, the binary is unmanaged. Both installers refuse to replace an unmanaged binary
+and give no force option. To reinstall, the user removes the binary and record themselves.
+
+The two files are not published atomically. A failure between the two renames leaves a new binary
+with the previous record, or with no record, and the hash check then fails closed.
+
+No CLI code reads this file yet. U9's self-update must apply exactly the rule above. It must also
+verify the downloaded archive and sidecar the way the scripts do, and publish the binary and then
+the record with same-directory renames. Anything else, such as `cargo install`, a package manager,
+or a hand copy, is never replaced, and `doctor` reports which case applies.
+
+### Pending: Windows background launcher (U8)
+
+The U8 background service will need a windowless companion on Windows, because `loadout.exe` is a
+console program and a Scheduled Task running it flashes a console. This repair doesn't implement
+it. When U8 adds it:
+- release packaging must ship it in the Windows zip
+- `install.ps1` must extract, verify, stage, and publish it with the same rules
+- the record schema needs a version bump to cover it
+
 ## Building a release archive locally
 
 ```sh
