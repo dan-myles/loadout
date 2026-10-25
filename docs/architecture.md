@@ -1809,6 +1809,9 @@ Automatic updates are required, so they are on by default.
       Then the binaries are published and the record last. On Windows, running executables are
       moved aside and every completed move is undone if a later one fails. The lock is held until
       publication, any undo and this run's own cleanup are done.
+    - After the record, it deletes the executables it moved aside. One still running is listed
+      with its sha256 in `.loadout.install.asides`, and a later completed self-update deletes
+      exactly that name with exactly that hash. No file is deleted by its name pattern alone.
     - A writer that doesn't take the lock (a hand copy, another tool, or an install script from
       before the lock) is not serialized with this, so its change can still race one publication.
     - A Windows schema-1 install is upgraded to schema 2 with the launcher.

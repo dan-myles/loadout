@@ -796,6 +796,21 @@ class InstallPs1WrapperTest(unittest.TestCase):
                 self.assertEqual((folder / "loadout-background.exe").read_bytes(), b"someone else's")
                 self.assertFalse((folder / "loadout.exe").exists())
 
+    def test_files_named_like_asides_are_never_deleted(self):
+        sentinels = {".loadout.exe.old.keep": b"someone else's", ".loadout-background.exe.old.0123": b"another run's"}
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                local = Path(tempfile.mkdtemp(dir=str(self.root))) / "LocalAppData"
+                folder = local / "Programs" / "loadout"
+                folder.mkdir(parents=True)
+                for name, data in sentinels.items():
+                    (folder / name).write_bytes(data)
+                for _ in range(2):
+                    completed = self.install_only(shell, self.base, local)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                for name, data in sentinels.items():
+                    self.assertEqual((folder / name).read_bytes(), data, name)
+
     def test_a_held_install_lock_changes_nothing(self):
         for shell in SHELLS:
             with self.subTest(shell=shell):

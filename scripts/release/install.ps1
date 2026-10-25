@@ -325,17 +325,9 @@ function Publish-Binaries($Owned, [object[]]$Pairs) {
         }
         throw "could not put the new binaries in place, and the previous ones could not all be restored; reinstall with install.ps1 ($failure)"
     }
+    # Only this run's own asides; one still running stays, and nothing else is ever deleted.
     foreach ($move in $moves) {
         if ($move[1] -like '*.old.*') { Remove-Item -LiteralPath $move[1] -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-# Executables an earlier install or self-update moved aside, now that they may no longer run.
-function Remove-AsideBinaries([string]$Dir) {
-    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
-    foreach ($binary in $Binaries) {
-        Get-ChildItem -LiteralPath $Dir -Force -File -Filter ".$binary.old.*" -ErrorAction SilentlyContinue |
-            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -480,7 +472,6 @@ function Install-Loadout {
         if ((Get-InstallState @($dest, $background, $record)) -cne $seen) {
             throw "$dir changed while this install was downloading, so nothing was replaced. Run the installer again"
         }
-        Remove-AsideBinaries $dir
 
         $staged = New-StagedFile $owned $dir '.loadout.exe.new.' ([IO.File]::ReadAllBytes($new))
         $stagedBackground = New-StagedFile $owned $dir '.loadout-background.exe.new.' ([IO.File]::ReadAllBytes($newBackground))

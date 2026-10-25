@@ -191,11 +191,12 @@ pub(super) struct Failure {
 /// later binary step fails, every completed move is undone in reverse; the record is untouched.
 /// Once every binary is in place the record is renamed over the old one. If that last rename
 /// fails, the new binaries stay and the old record no longer matches them, which fails closed.
+/// Only after the record is in place are moved-aside executables deleted (see `settle_asides`).
 pub(super) fn publish(
     binaries: Vec<(Staged, PathBuf)>,
     record: (Staged, PathBuf),
 ) -> Result<(), Failure> {
-    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut done: Vec<Move> = Vec::new();
     let mut published = Vec::new();
     for (mut staged, dest) in binaries {
         if let Err(detail) = place(&staged, &dest, &mut done) {
@@ -217,19 +218,30 @@ pub(super) fn publish(
     }
     staged.published = true;
     sync_dir(&dest);
-    remove_aside(&done);
+    if let Some(dir) = dest.parent() {
+        settle_asides(dir, &done, delete_file);
+    }
     Ok(())
 }
 
+/// One completed rename, which [`undo`] reverses. `aside` marks an existing destination this run
+/// moved to a fresh `.<name>.old.<nonce>` name.
+#[derive(Debug)]
+struct Move {
+    from: PathBuf,
+    to: PathBuf,
+    aside: bool,
+}
+
 #[cfg(not(windows))]
-fn place(staged: &Staged, dest: &Path, done: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+fn place(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), String> {
     let _ = done;
     fs::rename(&staged.path, dest)
         .map_err(|error| format!("cannot replace {}: {error}", dest.display()))
 }
 
 #[cfg(windows)]
-fn place(staged: &Staged, dest: &Path, done: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+fn place(staged: &Staged, dest: &Path, done: &mut Vec<Move>) -> Result<(), String> {
     if fs::symlink_metadata(dest).is_ok() {
         let name = dest
             .file_name()
@@ -237,54 +249,113 @@ fn place(staged: &Staged, dest: &Path, done: &mut Vec<(PathBuf, PathBuf)>) -> Re
         let aside = dest.with_file_name(format!(".{name}.old.{}", nonce()));
         fs::rename(dest, &aside)
             .map_err(|error| format!("cannot move {} aside: {error}", dest.display()))?;
-        done.push((dest.to_path_buf(), aside));
+        done.push(Move {
+            from: dest.to_path_buf(),
+            to: aside,
+            aside: true,
+        });
     }
     fs::rename(&staged.path, dest)
         .map_err(|error| format!("cannot put the new {} in place: {error}", dest.display()))?;
-    done.push((staged.path.clone(), dest.to_path_buf()));
+    done.push(Move {
+        from: staged.path.clone(),
+        to: dest.to_path_buf(),
+        aside: false,
+    });
     Ok(())
 }
 
 /// Reverses completed moves, newest first. True when all of them were undone.
-fn undo(done: &[(PathBuf, PathBuf)]) -> bool {
+fn undo(done: &[Move]) -> bool {
     done.iter()
         .rev()
-        .all(|(from, to)| fs::rename(to, from).is_ok())
+        .all(|step| fs::rename(&step.to, &step.from).is_ok())
 }
 
-/// The old executables moved aside on Windows. A running one can't be deleted yet; it is
-/// removed by [`sweep`] on a later self-update.
-fn remove_aside(done: &[(PathBuf, PathBuf)]) {
-    for (_, to) in done {
-        if is_aside(to) {
-            let _ = fs::remove_file(to);
+/// The ledger of executables completed self-updates moved aside on Windows but couldn't delete,
+/// because they were running: one `<file name> <sha256>` line each.
+pub(super) const ASIDES_FILE: &str = ".loadout.install.asides";
+const ASIDES_LIMIT: u64 = 64 * 1024;
+
+/// After a completed publication, under the install lock: deletes the executables this run moved
+/// aside, and the ones the ledger lists, then rewrites the ledger to list those still running.
+///
+/// Only files this run moved, or a regular file at exactly a listed name with exactly its listed
+/// sha256, are ever deleted, so a file of any other name or content is left alone however it is
+/// named, and so is any other writer's aside. A missing, unreadable or malformed ledger lists
+/// nothing; a malformed or linked one is also left as it is, and nothing new is recorded.
+fn settle_asides(dir: &Path, done: &[Move], delete: fn(&Path) -> io::Result<()>) {
+    let Some(listed) = read_asides(dir) else {
+        for step in done.iter().filter(|step| step.aside) {
+            let _ = delete(&step.to);
         }
-    }
-}
-
-fn is_aside(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            ["loadout.exe", "loadout-background.exe"]
-                .iter()
-                .any(|binary| name.starts_with(&format!(".{binary}.old.")))
-        })
-}
-
-/// Removes executables an earlier Windows self-update moved aside, now that they may no longer
-/// be running. Only names of exactly that form, and only regular files, are touched; a file
-/// that is still in use stays for the next time.
-pub(super) fn sweep(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_aside(&path) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            let _ = fs::remove_file(&path);
+    let mut running = Vec::new();
+    for (name, sha256) in listed {
+        let path = dir.join(&name);
+        let ours = fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+            && super::sha256_file(&path).is_ok_and(|actual| actual == sha256);
+        if ours && delete(&path).is_err() {
+            running.push((name, sha256));
         }
     }
+    for step in done.iter().filter(|step| step.aside) {
+        if delete(&step.to).is_ok() {
+            continue;
+        }
+        let name = step.to.file_name().and_then(|name| name.to_str());
+        if let (Some(name), Ok(sha256)) = (name, super::sha256_file(&step.to)) {
+            running.push((name.to_owned(), sha256));
+        }
+    }
+    let path = dir.join(ASIDES_FILE);
+    if running.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let mut text = String::new();
+    for (name, sha256) in &running {
+        text.push_str(&format!("{name} {sha256}\n"));
+    }
+    if let Ok(mut staged) = stage(dir, ASIDES_FILE, "", text.as_bytes(), false)
+        && fs::rename(&staged.path, &path).is_ok()
+    {
+        staged.published = true;
+    }
+}
+
+fn delete_file(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// The ledger's entries: `Some(empty)` when there is none, `None` when it can't be trusted.
+fn read_asides(dir: &Path) -> Option<Vec<(String, String)>> {
+    let path = dir.join(ASIDES_FILE);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= ASIDES_LIMIT => {}
+        _ => return None,
+    }
+    let text = String::from_utf8(fs::read(&path).ok()?).ok()?;
+    let body = text.strip_suffix('\n')?;
+    body.split('\n')
+        .map(|line| {
+            let (name, sha256) = line.split_once(' ')?;
+            let nonce = ["loadout.exe", "loadout-background.exe"]
+                .iter()
+                .find_map(|binary| name.strip_prefix(&format!(".{binary}.old.")))?;
+            let hex = |text: &str, len: Option<usize>| {
+                !text.is_empty()
+                    && len.is_none_or(|len| text.len() == len)
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            };
+            (hex(nonce, None) && hex(sha256, Some(64)))
+                .then(|| (name.to_owned(), sha256.to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -325,6 +396,7 @@ mod tests {
         fs::write(&dest, b"old binary").unwrap();
         fs::write(&record, b"old record").unwrap();
         fs::write(dir.path().join(".loadout.new.other-run"), b"someone else's").unwrap();
+        fs::write(dir.path().join(".loadout.exe.old.keep"), b"someone else's").unwrap();
         let binary = stage(dir.path(), "loadout", "", b"new binary", true).unwrap();
         let staged_record =
             stage(dir.path(), "loadout.install.toml", "", b"new record", false).unwrap();
@@ -342,7 +414,12 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            [".loadout.new.other-run", "loadout", "loadout.install.toml"]
+            [
+                ".loadout.exe.old.keep",
+                ".loadout.new.other-run",
+                "loadout",
+                "loadout.install.toml"
+            ]
         );
     }
 
@@ -377,33 +454,212 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sweep_removes_only_moved_aside_executables() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            ".loadout.exe.old.1",
-            ".loadout-background.exe.old.2",
-            ".loadout.exe.new.3",
-            "loadout.exe",
-            "notes.old.txt",
-        ] {
-            fs::write(dir.path().join(name), b"x").unwrap();
-        }
-        fs::create_dir(dir.path().join(".loadout.exe.old.dir")).unwrap();
-        sweep(dir.path());
-        let mut names: Vec<_> = fs::read_dir(dir.path())
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
+        names
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        super::super::sha256(bytes)
+    }
+
+    /// One aside this run made, already moved.
+    fn moved(dir: &Path, name: &str) -> Move {
+        Move {
+            from: dir.join("loadout.exe"),
+            to: dir.join(name),
+            aside: true,
+        }
+    }
+
+    #[test]
+    fn only_listed_asides_with_their_exact_bytes_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for (name, bytes) in [
+            (".loadout.exe.old.1a", b"old one".as_slice()),
+            (".loadout-background.exe.old.2b", b"old launcher"),
+            (".loadout.exe.old.3c", b"replaced since"),
+            (".loadout.exe.old.keep", b"someone else's"),
+            (".loadout.exe.old.4d", b"another writer's, mid-transaction"),
+            (".loadout.exe.new.5e", b"staging"),
+        ] {
+            fs::write(path.join(name), bytes).unwrap();
+        }
+        fs::create_dir(path.join(".loadout.exe.old.6f")).unwrap();
+        let ledger = format!(
+            ".loadout.exe.old.1a {}\n.loadout-background.exe.old.2b {}\n.loadout.exe.old.3c {}\n.loadout.exe.old.6f {}\n",
+            sha(b"old one"),
+            sha(b"old launcher"),
+            sha(b"what was moved aside"),
+            sha(b"")
+        );
+        fs::write(path.join(ASIDES_FILE), ledger).unwrap();
+
+        settle_asides(path, &[], delete_file);
         assert_eq!(
-            names,
+            names(path),
             [
-                ".loadout.exe.new.3",
-                ".loadout.exe.old.dir",
-                "loadout.exe",
-                "notes.old.txt"
+                ".loadout.exe.new.5e",
+                ".loadout.exe.old.3c",
+                ".loadout.exe.old.4d",
+                ".loadout.exe.old.6f",
+                ".loadout.exe.old.keep",
             ]
+        );
+        assert_eq!(
+            fs::read(path.join(".loadout.exe.old.3c")).unwrap(),
+            b"replaced since"
+        );
+    }
+
+    #[test]
+    fn running_asides_are_listed_with_their_hash_until_they_can_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join(".loadout.exe.old.1a"), b"running main").unwrap();
+        fs::write(
+            path.join(".loadout-background.exe.old.2b"),
+            b"stopped launcher",
+        )
+        .unwrap();
+        let done = [
+            moved(path, ".loadout.exe.old.1a"),
+            moved(path, ".loadout-background.exe.old.2b"),
+        ];
+        let running = |file: &Path| {
+            if file.ends_with(".loadout.exe.old.1a") {
+                Err(io::Error::other("in use"))
+            } else {
+                fs::remove_file(file)
+            }
+        };
+        settle_asides(path, &done, running);
+        assert_eq!(
+            fs::read_to_string(path.join(ASIDES_FILE)).unwrap(),
+            format!(".loadout.exe.old.1a {}\n", sha(b"running main"))
+        );
+        assert_eq!(
+            names(path),
+            [".loadout.exe.old.1a", ".loadout.install.asides"]
+        );
+
+        // A later completed publication, once it has stopped running.
+        settle_asides(path, &[], delete_file);
+        assert!(names(path).is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_ledger_deletes_nothing_it_lists() {
+        let listed = format!(".loadout.exe.old.1a {}\n", sha(b"old"));
+        for (name, ledger) in [
+            ("no final newline", listed.trim_end().to_owned()),
+            ("bad name", format!("loadout.exe {}\n", sha(b"old"))),
+            (
+                "nested name",
+                format!(".loadout.exe.old.1a/x {}\n", sha(b"old")),
+            ),
+            (
+                "uppercase hash",
+                format!(".loadout.exe.old.1a {}\n", sha(b"old").to_uppercase()),
+            ),
+            ("short hash", ".loadout.exe.old.1a abc\n".to_owned()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            fs::write(path.join(".loadout.exe.old.1a"), b"old").unwrap();
+            fs::write(path.join(ASIDES_FILE), &ledger).unwrap();
+            settle_asides(path, &[], delete_file);
+            assert_eq!(
+                fs::read(path.join(".loadout.exe.old.1a")).unwrap(),
+                b"old",
+                "{name}"
+            );
+            assert_eq!(
+                fs::read_to_string(path.join(ASIDES_FILE)).unwrap(),
+                ledger,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_deletes_only_its_own_asides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("loadout-background.exe"), b"old launcher").unwrap();
+        fs::write(path.join("loadout.exe"), b"old main").unwrap();
+        fs::write(path.join("loadout.install.toml"), b"old record").unwrap();
+        fs::write(path.join(".loadout.exe.old.keep"), b"someone else's").unwrap();
+        fs::write(path.join(".loadout.exe.old.0123"), b"another run's").unwrap();
+        let launcher = stage(path, "loadout-background", ".exe", b"new launcher", true).unwrap();
+        let main = stage(path, "loadout", ".exe", b"new main", true).unwrap();
+        let record = stage(path, "loadout.install.toml", "", b"new record", false).unwrap();
+        publish(
+            vec![
+                (launcher, path.join("loadout-background.exe")),
+                (main, path.join("loadout.exe")),
+            ],
+            (record, path.join("loadout.install.toml")),
+        )
+        .unwrap();
+        assert_eq!(fs::read(path.join("loadout.exe")).unwrap(), b"new main");
+        assert_eq!(
+            fs::read(path.join("loadout-background.exe")).unwrap(),
+            b"new launcher"
+        );
+        assert_eq!(
+            names(path),
+            [
+                ".loadout.exe.old.0123",
+                ".loadout.exe.old.keep",
+                "loadout-background.exe",
+                "loadout.exe",
+                "loadout.install.toml"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_ledger_or_listed_link_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("old");
+        fs::write(&target, b"old").unwrap();
+        std::os::unix::fs::symlink(&target, path.join(".loadout.exe.old.1a")).unwrap();
+        fs::write(
+            outside.path().join("ledger"),
+            format!(".loadout.exe.old.1a {}\n", sha(b"old")),
+        )
+        .unwrap();
+        fs::write(
+            path.join(ASIDES_FILE),
+            fs::read(outside.path().join("ledger")).unwrap(),
+        )
+        .unwrap();
+        settle_asides(path, &[], delete_file);
+        assert!(fs::symlink_metadata(path.join(".loadout.exe.old.1a")).is_ok());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(
+            !path.join(ASIDES_FILE).exists(),
+            "a listed link isn't ours, so it is dropped"
+        );
+
+        std::os::unix::fs::symlink(outside.path().join("ledger"), path.join(ASIDES_FILE)).unwrap();
+        settle_asides(path, &[], delete_file);
+        assert!(fs::symlink_metadata(path.join(".loadout.exe.old.1a")).is_ok());
+        assert!(
+            fs::symlink_metadata(path.join(ASIDES_FILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 }

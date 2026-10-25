@@ -191,7 +191,9 @@ Neither script installs git; each names the per-OS command instead.
    - On Windows the launcher goes first, then `loadout.exe`. Each existing binary, which may be
      running, is first moved aside to `.<name>.old.<guid>`, and if a later move fails every
      completed move is undone in reverse. Then the record is replaced (`File.Replace`, no backup).
-   - Aside copies that are still running are removed by the next install or self-update.
+   - The script deletes its own aside copies once the record is in place. One that is still
+     running can't be deleted and stays; the script never deletes an aside it didn't make in that
+     run, whatever its name. Self-update keeps a ledger of its own (below).
 10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
     shell profiles or `PATH`.
 11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
@@ -300,6 +302,12 @@ exactly the rule above, with no token:
   when it found the release. Otherwise it replaces nothing (`Changed`).
 - **Publishing.** It publishes the binaries as above, then rewrites the record in the same schema
   rules, and releases the lock after its own cleanup.
+- **Moved-aside executables (Windows).** Once the record is in place it deletes the executables it
+  moved aside. The running `loadout.exe` can't be deleted, so it is listed in
+  `.loadout.install.asides` with its sha256, and a later completed self-update deletes it, under the
+  lock, only if a regular file with exactly that name and sha256 is still there. Nothing else is
+  ever deleted, whatever its name: not another writer's aside, not a file merely named like one. A
+  malformed or linked ledger is left alone and lists nothing.
 
 Anything else, such as `cargo install`, a package manager, a hand copy, or a `LOADOUT_HOME`
 isolated run, is never replaced. `doctor` reports which case applies (`cli install`).

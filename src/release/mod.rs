@@ -441,9 +441,6 @@ fn find(
 fn replace(release: &Release) -> Result<(), Error> {
     let windows = cfg!(windows);
     let install = &release.install;
-    if windows {
-        publish::sweep(&install.dir);
-    }
     let asset = asset(release.target, windows);
     let url = release.source.asset_url(&release.tag, &asset);
     let unreachable = |detail| Error::Download { detail };
