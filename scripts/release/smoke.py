@@ -19,6 +19,7 @@ import zipfile
 from pathlib import Path
 
 PACKAGE = "loadout"
+LAUNCHER = "loadout-background.exe"
 
 
 class SmokeError(Exception):
@@ -52,6 +53,8 @@ def extract(archive, into):
         raise SmokeError(f"{prefix}/{exe} is missing from {archive.name}")
     if os.name != "nt" and not os.access(binary, os.X_OK):
         raise SmokeError(f"{prefix}/{exe} is not executable")
+    if archive.name.endswith(".zip") and not (into / prefix / LAUNCHER).is_file():
+        raise SmokeError(f"{prefix}/{LAUNCHER} is missing from {archive.name}")
     return binary
 
 
@@ -100,7 +103,10 @@ def main(argv=None):
         env = dict(os.environ, LOADOUT_HOME=str(home), LOADOUT_STATE_DIR=str(state))
 
         expect("--help", binary, ["--help"], 0, env, contains="validate")
-        expect("unknown command", binary, ["apply"], 2, env)
+        expect("unknown command", binary, ["no-such-command"], 2, env)
+        if archive.name.endswith(".zip"):
+            expect("launcher --version", binary.with_name(LAUNCHER), ["--version"], 0, env,
+                   contains="loadout-background ")
         doctor(binary, env)
         expect("validate complete", binary, ["validate", str(fixtures / "complete")], 0, env,
                contains="valid: ")

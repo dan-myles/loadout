@@ -89,24 +89,35 @@ class MembersTest(unittest.TestCase):
     def test_ships_regular_root_files_and_skips_missing_ones(self):
         (self.root / "README.md").write_text("readme")
         (self.root / "LICENSE-MIT").write_text("mit")
-        _, entries = package.members(self.root, self.binary, "t")
+        _, entries = package.members(self.root, [self.binary], "t")
         self.assertEqual(
             [name for name, _, _ in entries],
             ["loadout-t/LICENSE-MIT", "loadout-t/README.md", "loadout-t/loadout"],
         )
+
+    def test_windows_archives_ship_the_launcher_beside_the_cli(self):
+        self.assertEqual(
+            package.binaries("x86_64-pc-windows-msvc"),
+            ["loadout.exe", "loadout-background.exe"],
+        )
+        self.assertEqual(package.binaries("x86_64-unknown-linux-musl"), ["loadout"])
+        launcher = self.root / "loadout-background.exe"
+        launcher.write_bytes(b"gui")
+        _, entries = package.members(self.root, [self.binary, launcher], "t")
+        self.assertIn("loadout-t/loadout-background.exe", [name for name, _, _ in entries])
 
     def test_symlink_to_file_outside_checkout_is_rejected(self):
         outside = Path(tempfile.mkdtemp()) / "private.txt"
         outside.write_text("local secret")
         self.symlink(self.root / "README.md", outside)
         with self.assertRaisesRegex(package.ReleaseError, "README.md is a symlink"):
-            package.members(self.root, self.binary, "t")
+            package.members(self.root, [self.binary], "t")
 
     def test_symlink_inside_checkout_is_also_rejected(self):
         (self.root / "docs.md").write_text("docs")
         self.symlink(self.root / "LICENSE", self.root / "docs.md")
         with self.assertRaisesRegex(package.ReleaseError, "LICENSE is a symlink"):
-            package.members(self.root, self.binary, "t")
+            package.members(self.root, [self.binary], "t")
 
 
 @unittest.skipIf(os.name == "nt", "fake binary is a POSIX shell script")

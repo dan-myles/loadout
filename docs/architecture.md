@@ -102,7 +102,7 @@ src/
     validate.rs           loadout validate                                  [foundation; U1/U2 extend]
     plan.rs, apply.rs     loadout plan, loadout apply                       [U4 source]
     status.rs, rollback.rs                                                  [built, U3]
-    update.rs, service.rs                                                   [U8]
+    update.rs, service.rs                                                   [U8 source]
     init.rs                                                                 [U9]
   template/               mod.rs (API), strict.rs (guards), builtins.rs     [built: U2]
   state/                  hash, disk, journal, run, rollback                [built, U3]
@@ -117,7 +117,10 @@ src/
   process/                mod.rs (API, Containment, Cancel), query.rs (U7's bounded queries and
                           installs, moved from programs), background.rs (supervisor, handshake,
                           bounded log)                                      [core: U8]
-  sync/                   git clone/fetch, background service               [U8]
+  sync/                   mod.rs (clone, fetch, settings, unfinished-run gate), git.rs (argv-only
+                          git), background.rs (supervisor start, records, Windows launcher entry),
+                          service/ (systemd, launchd, schtasks)             [U8 source]
+  bin/loadout-background.rs  the Windows Scheduled Task's GUI launcher      [U8 source]
   release/                self-update                                       [U9]
 ```
 
@@ -139,7 +142,7 @@ programs                       -> manifest, resolve, machine, context, process, 
 state                          -> context, plan (types), reserved, mcp
 plan                           -> manifest, machine, resolve, template, agents, programs, source, state, reserved, context, diagnostic, platform
 apply                          -> plan, state, programs, context, diagnostic
-sync                           -> context, manifest, diagnostic
+sync                           -> context, manifest, machine, resolve, state, process, diagnostic, platform
 release                        -> context, diagnostic
 ```
 
@@ -1738,7 +1741,7 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
 
   Under isolation it only looks on PATH and runs no manager.
 
-## 8. Updates (frozen, U8 + U9)
+## 8. Updates (U8 source, unexecuted; U9 self-update)
 
 Automatic updates are required, so they are on by default.
 
@@ -1746,23 +1749,69 @@ Automatic updates are required, so they are on by default.
   `machine.toml`, plans, applies, and installs the background service unless `[update] auto = false`.
   A private loadout works through the user's existing Git credentials or SSH keys. Loadout stores no
   token.
-- `loadout update` fetches and fast-forwards the clone, then plans and applies. If the clone has
-  local changes or the remote doesn't fast-forward, it is left untouched and reported (exit 4).
+- `loadout update` takes the state lock, then refuses (exit 4, nothing fetched) when the newest
+  run didn't finish. It fetches and fast-forwards the clone, then plans and applies under the same
+  lock (`apply::run_under_lock`, `Mode::Interactive`, never `--force` or `--elevated`). If the clone has
+  local changes or an unfinished merge, has no branch or no upstream on `origin`, or the remote
+  doesn't fast-forward (the clone is ahead or diverged), nothing is applied and it exits 4. The
+  clone's branch and working tree are left as they were; a block found only after the fetch
+  (ahead, diverged) has updated the clone's remote-tracking refs, never its branch.
+  - Every git call is an argv array with `--git-dir`/`--work-tree` named, hooks pointed at a path
+    loadout never creates, no fsmonitor, no submodule recursion, and no `ext::` transport. Local
+    reads use the bounded query path (section 7). A URL with a password is refused; shown URLs have
+    their userinfo hidden.
+  - `update --loadout DIR` applies DIR as it is, after printing "not fetched": loadout never
+    fetches or changes a checkout it doesn't manage. `--background` refuses `--loadout`.
+- `loadout update --background` is the scheduled job's command. It is the supervisor
+  (`process::supervise`, `Limits::BACKGROUND`: soft 55 min, hard 60 min, 30 s settle), which starts
+  `loadout update --background --worker` and records how the run ended. The worker runs only after
+  `process::handshake` and with `Context::supervised`; it does the same steps as the foreground in
+  `Mode::Background` (no prompts, replace, force, or elevation), and stops with nothing applied
+  when the loadout sets `[update] auto = false`. With `--service FILE`, both build their `Context`
+  from that `service.toml` alone.
+  - Records in `<state>/background/` (0700; files 0600, written atomically through
+    `state::write_private`): `supervisor.json` (outcome, exit code, cleanup problem, whether the log
+    is complete), `worker.log` (at most `process::LOG_CAP` bytes plus notes), and `last-run.json`
+    (fetch result, run id, outcome counts, the labels of anything not done, never content).
+    `loadout status` and `loadout service status` show them and exit 4 after a blocked, invalid,
+    failed, timed-out, or uncontained run.
 - `loadout service install|uninstall|status` manages a per-user job:
 
   | OS | Job |
   | --- | --- |
   | macOS | launchd agent `~/Library/LaunchAgents/dev.loadout.update.plist` |
   | Linux | systemd user timer `{config}/systemd/user/loadout-update.{service,timer}` |
-  | Windows | Scheduled Task for the current user, no admin |
+  | Windows | Scheduled Task `\Loadout Update` for the current user, interactive token, least privilege, no admin |
 
-  The job runs `loadout update --background` every `interval_minutes`, with no prompts, no
-  elevation, and no `--force`. Drift and blocked actions are recorded for `status`. A Linux machine
-  without a systemd user session gets a doctor warning, and `service install` exits 4.
+  The job runs the supervisor every `interval_minutes`, with no prompts, no elevation, and no
+  `--force`. Drift and blocked actions are recorded for `status`. A Linux machine without a systemd
+  user session makes `service install` exit 4. `install` and `uninstall` are refused under
+  `LOADOUT_HOME` isolation (exit 4), because every scheduler acts on the real user.
+  - `service install` reads the interval from the resolved `[update]` of loadout's clone, and
+    refuses (exit 4) when it sets `auto = false`. It records `<state>/service.toml`: the
+    executable, the interval, the home, config and state dirs, and only `PATH`, `PATHEXT`, the XDG
+    and `LOADOUT_STATE_DIR` variables, and the agent dir variables. A run refuses a record whose
+    rebuilt dirs differ, or that isn't the `service.toml` of the state dir it names.
+  - Arguments are quoted per scheduler: systemd `ExecStart` double quotes with `\`, `"`, `%%` and
+    `$$` escaped; plist `<string>` elements, XML-escaped, never joined; Task `<Arguments>` quoted for
+    `CommandLineToArgvW`, then XML-escaped. A path with a control character or invalid UTF-8 is
+    refused before any write.
+  - systemd: `Type=exec` (so `RuntimeMaxSec=3720` applies), `KillMode=control-group`,
+    `NoNewPrivileges=yes`; the timer uses `OnUnitInactiveSec`. launchd: `StartInterval`, background
+    process type, no run-time limit (the supervisor is the bound). Task: `IgnoreNew`,
+    `ExecutionTimeLimit=PT1H2M`, hidden, registered from UTF-16 XML staged in the state dir.
+- **Windows launcher.** The task runs `loadout-background.exe` (bin target `loadout-background`,
+  GUI subsystem) beside `loadout.exe`, with `--service <state>\service.toml`. It runs the same
+  supervisor with `loadout.exe` from its own folder as the worker, created with
+  `CREATE_SUSPENDED | CREATE_NO_WINDOW`, so no console window opens. `--version` prints
+  `loadout-background <version>`. Release archives for Windows ship both executables in one folder
+  (`scripts/release/package.py`); `service install` refuses when the launcher is missing. U9's
+  installer and self-update must place and replace both together.
 - **Self-update** (U9) runs when `[update] cli = true` and the install script installed the binary.
   `update` reads the latest public GitHub release with no token, verifies the asset's `.sha256`, and
   replaces itself. A binary from `cargo install` or a package manager is never replaced; doctor
-  reports how the CLI was installed.
+  reports how the CLI was installed. U8's `update` calls `release::latest` then `release::install`
+  after its apply, once U9's `release` module is integrated.
 
 ## 9. Bootstrap and release (frozen, U9 + release CI)
 
@@ -1786,8 +1835,8 @@ Automatic updates are required, so they are on by default.
 | `loadout apply [--loadout DIR] [--force] [--elevated]`: read-only preflight, then the lock and a rebuilt plan; exit 1 on a failed action, 3 invalid, 4 when anything is left undone | source, unexecuted | U4 |
 | `loadout status [--json]`: ownership records with drift, runs with interrupted ones; exit 4 when not healthy; never writes | built | U3 |
 | `loadout rollback [RUN]`: undo the newest or the named run; exit 4 when later changes block it | built | U3 |
-| `loadout update [--background]` | frozen | U8 (+U9 self-update) |
-| `loadout service install\|uninstall\|status` | frozen | U8 |
+| `loadout update [--loadout DIR] [--background [--service FILE]]`: lock, unfinished-run gate, fetch and fast-forward the clone (not with `--loadout`), then apply under the same lock; exit 4 when blocked; `--background` supervises a bounded worker and records it | source, unexecuted | U8 (+U9 self-update) |
+| `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
 | `loadout init <URL> [--name NAME] [--no-service]` | frozen | U9 |
 
 `plan`, `apply`, and `update` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
@@ -1957,10 +2006,34 @@ pub enum Error { Plan(plan::Error), State(state::Error) }
 // call on every route; context.containment.is_cancelled() (U8) is checked before the run begins, each journaled
 // action, and each install.
 
-// sync (U8)
-pub fn clone(url: &str, context: &Context) -> Result<(), sync::Error>;
-pub fn fetch(context: &Context) -> Result<Fetched, sync::Error>;   // UpToDate | Advanced { from, to } | Blocked(reason)
-pub mod service { pub fn install(context: &Context, interval_minutes: u32) -> Result<(), Error>; pub fn uninstall(context: &Context) -> Result<(), Error>; pub fn status(context: &Context) -> Result<Status, Error>; }
+// sync (U8 source). clone and fetch take the held state lock (checked with Lock::check), which the
+// caller then moves into apply::run_under_lock.
+pub fn clone(url: &str, context: &Context, lock: &state::Lock) -> Result<(), sync::Error>;
+pub fn fetch(context: &Context, lock: &state::Lock) -> Result<Fetched, sync::Error>;
+pub enum Fetched { UpToDate { head }, Advanced { from, to }, Blocked { reason: Blocked } }
+pub enum Blocked { Dirty, InProgress, Detached, NoUpstream, Ahead, Diverged }   // Display: the reason
+pub fn checkout(context: &Context) -> PathBuf;                                 // <state>/loadout
+pub fn settings(context: &Context, checkout: &Path) -> Result<resolve::Update, sync::Error>; // guarded load, detect, resolve
+pub fn unfinished(context: &Context) -> Result<Option<String>, sync::Error>;   // the update gate, before fetch
+pub fn checks(context: &Context) -> Vec<Check>;                                // doctor: checkout, service, background
+pub mod service {
+    pub fn install(context: &Context, interval_minutes: u32) -> Result<Installed, Error>; // Installed { exe, interval_minutes, warnings }
+    pub fn uninstall(context: &Context) -> Result<(), Error>;
+    pub fn status(context: &Context) -> Result<Status, Error>;
+    pub fn load(path: &Path) -> Result<(Recorded, Context), Error>;   // service.toml -> the background Context
+    // Error::is_unhealthy(): Isolated, NoUserSession, MissingLauncher, UnsafePath, Interval, Moved -> exit 4
+}
+pub mod background {
+    pub fn supervise(context: &Context, worker: &Worker) -> Result<u8, sync::Error>; // writes supervisor.json, worker.log
+    pub fn record(context: &Context, run: &LastRun) -> Result<(), sync::Error>;      // last-run.json
+    pub fn summary(context: &Context) -> Summary;                                    // status, service status, doctor
+    pub fn launch(args: Vec<OsString>) -> u8;                                        // loadout-background.exe
+}
+// state (U8 addition, for independent U3 review): the background files, by a fixed enum only.
+pub enum Private { Service, Supervisor, LastRun, WorkerLog, TaskXml }
+pub fn write_private(context: &Context, file: Private, bytes: &[u8]) -> Result<PathBuf, state::Error>; // atomic, 0600, state_root + internal_dir
+pub fn read_private(context: &Context, file: Private) -> Result<Option<Vec<u8>>, state::Error>;       // regular file inside the state dir only
+pub fn remove_private(context: &Context, file: Private) -> Result<(), state::Error>;
 
 // release (U9)
 pub fn latest(context: &Context) -> Result<Option<Release>, release::Error>;

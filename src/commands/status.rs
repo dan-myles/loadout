@@ -7,6 +7,7 @@ use crate::cli::Exit;
 use crate::context::Context;
 use crate::plan::{ItemRef, Target};
 use crate::state::{self, Health, Record, RunStatus, RunSummary, State};
+use crate::sync::background::{self, Summary};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -21,6 +22,7 @@ struct Report<'a> {
     healthy: bool,
     records: Vec<Owned<'a>>,
     runs: &'a [RunSummary],
+    background: &'a Summary,
 }
 
 #[derive(Serialize)]
@@ -38,6 +40,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = context.state.join("loadout");
     let audit = state::audit(context, &checkout, &state);
     let runs = state::runs(context).context("cannot list loadout's runs")?;
+    let background = background::summary(context);
 
     let healthy = audit.iter().all(|(_, health)| *health == Health::Ok)
         && runs.iter().all(|run| {
@@ -45,7 +48,8 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
                 run.status,
                 Some(RunStatus::Finished | RunStatus::RolledBack | RunStatus::InProgress)
             )
-        });
+        })
+        && background.healthy();
 
     if args.json {
         let report = Report {
@@ -62,10 +66,12 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
                 })
                 .collect(),
             runs: &runs,
+            background: &background,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_text(context, &audit, &runs);
+        println!("{:<9} {}", "background", background.describe());
     }
 
     Ok(if healthy {
