@@ -435,7 +435,7 @@ fn a_recorded_service_run_ignores_an_unusable_ambient_environment() {
         Context::resolve(Os::current().unwrap(), var, Some(machine.home.clone())).unwrap();
     assert!(!context.isolated);
     let exe = fs::canonicalize(env!("CARGO_BIN_EXE_loadout")).unwrap();
-    let recorded = loadout::sync::service::Recorded::new(&context, &exe, 60, var).unwrap();
+    let recorded = sync::service::Recorded::new(&context, &exe, 60, var).unwrap();
     let service = state::write_private(
         &context,
         state::Private::Service,

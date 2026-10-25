@@ -155,7 +155,7 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
     // The log is saved before the terminal record, and a log that can't be saved is that
     // record's problem, so no record ever reports a run whose output was lost as clean.
     let logged = log.map_or(Ok(()), |log| {
-        state::write_private(context, Private::WorkerLog, &log)
+        state::write_private(context, Private::WorkerLog, &log).map(|_| ())
     });
     let mut record = record;
     if let Err(error) = &logged {
@@ -623,7 +623,7 @@ mod tests {
         .unwrap();
         save(&context, &supervisor("B", "running", None, None)).unwrap();
         let unrelated = state::lock(&context).unwrap();
-        let held = summary(&context);
+        let held = super::summary(&context);
         assert!(held.lock_held, "{}", held.describe());
         assert!(!held.healthy(), "{}", held.describe());
         assert!(
@@ -632,7 +632,7 @@ mod tests {
             held.describe()
         );
         drop(unrelated);
-        let released = summary(&context);
+        let released = super::summary(&context);
         assert!(!released.healthy(), "{}", released.describe());
     }
 
