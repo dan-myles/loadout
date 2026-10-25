@@ -821,7 +821,11 @@ mod tests {
             assert!(failure.is_blocked(), "{failure}");
             for refusal in [Refusal::Desired, Refusal::Removal] {
                 let action = refused(item.clone(), target.clone(), failure, refusal).unwrap();
-                assert_eq!(action.change, Change::Blocked(failure.to_string()), "{failure}");
+                assert_eq!(
+                    action.change,
+                    Change::Blocked(failure.to_string()),
+                    "{failure}"
+                );
                 assert_eq!(action.prior, Observed::Absent);
                 assert!(action.content.is_none());
             }
@@ -830,7 +834,10 @@ mod tests {
         let special = state::Error::Special {
             path: document.clone(),
         };
-        assert!(!special.is_blocked(), "only R1's own arm blocks a special file");
+        assert!(
+            !special.is_blocked(),
+            "only R1's own arm blocks a special file"
+        );
         for refusal in [Refusal::Desired, Refusal::Removal] {
             let action = refused(item.clone(), target.clone(), &special, refusal).unwrap();
             assert_eq!(action.change, Change::Blocked(special.to_string()));

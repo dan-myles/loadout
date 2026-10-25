@@ -645,8 +645,7 @@ mod tests {
         mode: Mode::Background,
     };
 
-    const TWO_FILES: &str =
-        "[files.a]\nsource = \"a\"\ntarget = \"~/.a\"\n[files.b]\nsource = \"b\"\ntarget = \"~/.b\"\n";
+    const TWO_FILES: &str = "[files.a]\nsource = \"a\"\ntarget = \"~/.a\"\n[files.b]\nsource = \"b\"\ntarget = \"~/.b\"\n";
 
     fn skipped_by_cancel(outcome: &Outcome) -> bool {
         *outcome == Outcome::Skipped(CANCELLED.to_owned())
@@ -836,8 +835,7 @@ mod tests {
             let sandbox = sandbox(manifest, &files);
             std::fs::create_dir(&sandbox.context.state).unwrap();
             let other = tempfile::tempdir().unwrap();
-            let wrong =
-                state::lock(&isolated(&sandbox.home, &other.path().join("state"))).unwrap();
+            let wrong = state::lock(&isolated(&sandbox.home, &other.path().join("state"))).unwrap();
             plan_observe::take();
             let result = run_under_lock(&sandbox.context, &sandbox.loadout, wrong, INTERACTIVE);
             assert!(
@@ -948,8 +946,7 @@ mod tests {
     /// first action through the finish and the report, then is released.
     #[cfg(unix)]
     #[test]
-    fn a_finish_that_cannot_save_its_journal_keeps_the_outcome_and_holds_the_lock_to_the_report()
-    {
+    fn a_finish_that_cannot_save_its_journal_keeps_the_outcome_and_holds_the_lock_to_the_report() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -1000,7 +997,10 @@ mod tests {
             ],
             "the lock is held at every boundary"
         );
-        assert!(!state::busy(&sandbox.context).unwrap(), "and released after");
+        assert!(
+            !state::busy(&sandbox.context).unwrap(),
+            "and released after"
+        );
     }
 
     /// Controls that need a real package manager: `programs::steps` finds a genuinely missing
@@ -1091,7 +1091,10 @@ mod tests {
                 Some(root.join("home")),
             )
             .unwrap();
-            assert!(!context.isolated, "a real manager is asked only outside isolation");
+            assert!(
+                !context.isolated,
+                "a real manager is asked only outside isolation"
+            );
             let checkout = root.join("loadout");
             let calls = || std::fs::read_to_string(root.join("calls")).unwrap_or_default();
             let installs = |calls: &str| calls.lines().filter(|line| *line == "install a").count();
@@ -1115,9 +1118,13 @@ mod tests {
                         "{result:?}"
                     );
                     assert_eq!(calls(), "", "no manager is asked under a wrong lock");
-                    let report =
-                        run_under_lock(&context, &checkout, state::lock(&context).unwrap(), INTERACTIVE)
-                            .unwrap();
+                    let report = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        INTERACTIVE,
+                    )
+                    .unwrap();
                     assert!(
                         calls().lines().any(|line| line == "install --list"),
                         "under the right lock the same route asks the manager: {:?}",
@@ -1141,7 +1148,10 @@ mod tests {
                     let report = run_under_lock(&context, &checkout, lock, INTERACTIVE);
                     set_mode(&context.state, 0o700);
                     let report = report.unwrap();
-                    assert!(report.finish_error.is_some() && report.failed(), "{report:#?}");
+                    assert!(
+                        report.finish_error.is_some() && report.failed(),
+                        "{report:#?}"
+                    );
                     let program = report
                         .outcomes
                         .iter()
@@ -1167,10 +1177,18 @@ mod tests {
                             seen.borrow_mut().push(state::busy(context).unwrap());
                         }
                     });
-                    let report =
-                        run_under_lock(&context, &checkout, state::lock(&context).unwrap(), INTERACTIVE)
-                            .unwrap();
-                    assert_eq!(*held.borrow(), vec![true], "the lock is held as the installer starts");
+                    let report = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        INTERACTIVE,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        *held.borrow(),
+                        vec![true],
+                        "the lock is held as the installer starts"
+                    );
                     assert_eq!(installs(&calls()), 1, "{:?}", calls());
                     assert!(root.join("installed-a").exists());
                     assert!(!report.failed(), "{report:#?}");
@@ -1183,15 +1201,23 @@ mod tests {
                             cancel(context);
                         }
                     });
-                    let report =
-                        run_under_lock(&context, &checkout, state::lock(&context).unwrap(), BACKGROUND)
-                            .unwrap();
+                    let report = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        BACKGROUND,
+                    )
+                    .unwrap();
                     let program = report
                         .outcomes
                         .iter()
                         .find(|(action, _)| matches!(action.target, Target::Program { .. }))
                         .unwrap();
-                    assert_eq!(program.1, Outcome::Skipped(CANCELLED.to_owned()), "{report:#?}");
+                    assert_eq!(
+                        program.1,
+                        Outcome::Skipped(CANCELLED.to_owned()),
+                        "{report:#?}"
+                    );
                     assert!(report.cancelled && report.unhealthy() && !report.failed());
                     assert!(
                         calls().lines().all(|line| line == "install --list"),
@@ -1203,8 +1229,12 @@ mod tests {
                 "query-error" => {
                     let context = supervised(&context);
                     std::fs::write(root.join("fail"), "").unwrap();
-                    let result =
-                        run_under_lock(&context, &checkout, state::lock(&context).unwrap(), BACKGROUND);
+                    let result = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        BACKGROUND,
+                    );
                     assert!(
                         matches!(result, Err(Error::Plan(plan::Error::Runtime(_)))),
                         "a failed query is a runtime error: {result:?}"

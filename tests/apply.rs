@@ -828,9 +828,8 @@ fn a_real_mcp_entry_is_created_updated_and_removed_and_only_its_own_value_is_bac
             "[agents]\nenabled = [\"claude\"]\n[mcp.docs]\ncommand = \"{command}\"\n"
         ));
     };
-    let document = || -> serde_json::Value {
-        serde_json::from_slice(&fs::read(&claude).unwrap()).unwrap()
-    };
+    let document =
+        || -> serde_json::Value { serde_json::from_slice(&fs::read(&claude).unwrap()).unwrap() };
 
     declare("old-docs-server");
     let created = machine.apply(INTERACTIVE).unwrap();
@@ -847,7 +846,11 @@ fn a_real_mcp_entry_is_created_updated_and_removed_and_only_its_own_value_is_bac
 
     declare("new-docs-server");
     let updated = machine.apply(INTERACTIVE).unwrap();
-    assert_eq!(entry_outcome(&updated, "docs"), &Outcome::Done, "{updated:#?}");
+    assert_eq!(
+        entry_outcome(&updated, "docs"),
+        &Outcome::Done,
+        "{updated:#?}"
+    );
     let doc = document();
     assert_eq!(doc["mcpServers"]["docs"]["command"], "new-docs-server");
     assert_eq!(doc["oauthAccount"], auth);
@@ -864,7 +867,11 @@ fn a_real_mcp_entry_is_created_updated_and_removed_and_only_its_own_value_is_bac
 
     machine.manifest("[agents]\nenabled = [\"claude\"]\n");
     let removed = machine.apply(INTERACTIVE).unwrap();
-    assert_eq!(entry_outcome(&removed, "docs"), &Outcome::Removed, "{removed:#?}");
+    assert_eq!(
+        entry_outcome(&removed, "docs"),
+        &Outcome::Removed,
+        "{removed:#?}"
+    );
     let doc = document();
     assert!(doc["mcpServers"].get("docs").is_none());
     assert_eq!(doc["oauthAccount"], auth);
@@ -894,7 +901,11 @@ fn real_mcp_entries_keep_jsonc_comments_and_toml_settings_beside_them() {
         "{\n  // keep this comment\n  \"theme\": \"dark\",\n  \"mcpServers\": {}\n}\n",
     )
     .unwrap();
-    fs::write(&toml_file, "# keep this comment\nmodel = \"o3\"\n\n[mcp_servers]\n").unwrap();
+    fs::write(
+        &toml_file,
+        "# keep this comment\nmodel = \"o3\"\n\n[mcp_servers]\n",
+    )
+    .unwrap();
     let agents = "[agents]\nenabled = [\"jc\", \"tm\"]\n\
         [agents.custom.jc]\nevidence = \"e\"\n\
         mcp = { linux = \"~/jc/mcp.jsonc\", macos = \"~/jc/mcp.jsonc\", windows = \"~/jc/mcp.jsonc\", format = \"jsonc\", map = \"/mcpServers\", shape = \"cursor-json\", env_syntax = \"none\" }\n\
@@ -932,19 +943,26 @@ fn real_mcp_entries_keep_jsonc_comments_and_toml_settings_beside_them() {
         Some("lint-server"),
         "{written}"
     );
-    assert_eq!(
-        State::load(&machine.context).unwrap().records().count(),
-        2
-    );
+    assert_eq!(State::load(&machine.context).unwrap().records().count(), 2);
 
     machine.manifest(agents);
     let removed = machine.apply(INTERACTIVE).unwrap();
-    assert_eq!(entry_outcome(&removed, "search"), &Outcome::Removed, "{removed:#?}");
+    assert_eq!(
+        entry_outcome(&removed, "search"),
+        &Outcome::Removed,
+        "{removed:#?}"
+    );
     assert_eq!(entry_outcome(&removed, "lint"), &Outcome::Removed);
     let left = fs::read_to_string(&jsonc).unwrap();
-    assert!(left.contains("// keep this comment") && !left.contains("search-server"), "{left}");
+    assert!(
+        left.contains("// keep this comment") && !left.contains("search-server"),
+        "{left}"
+    );
     let left = fs::read_to_string(&toml_file).unwrap();
-    assert!(left.starts_with("# keep this comment\nmodel = \"o3\"\n") && !left.contains("lint-server"), "{left}");
+    assert!(
+        left.starts_with("# keep this comment\nmodel = \"o3\"\n") && !left.contains("lint-server"),
+        "{left}"
+    );
     assert_eq!(State::load(&machine.context).unwrap().records().count(), 0);
 }
 
@@ -964,7 +982,11 @@ fn an_unowned_server_is_adopted_when_equal_and_never_replaced_when_not_even_with
         ..INTERACTIVE
     };
     let report = machine.apply(forced).unwrap();
-    assert_eq!(entry_outcome(&report, "docs"), &Outcome::Adopted, "{report:#?}");
+    assert_eq!(
+        entry_outcome(&report, "docs"),
+        &Outcome::Adopted,
+        "{report:#?}"
+    );
     assert!(
         matches!(entry_outcome(&report, "search"), Outcome::Blocked(reason) if reason.contains("never replaces")),
         "{report:#?}"
@@ -980,13 +1002,23 @@ fn an_unowned_server_is_adopted_when_equal_and_never_replaced_when_not_even_with
 
     machine.manifest(&format!("{servers}[mcp.lint]\ncommand = \"lint-server\"\n"));
     let report = machine.apply(forced).unwrap();
-    assert_eq!(entry_outcome(&report, "lint"), &Outcome::Done, "{report:#?}");
+    assert_eq!(
+        entry_outcome(&report, "lint"),
+        &Outcome::Done,
+        "{report:#?}"
+    );
     assert_eq!(entry_outcome(&report, "docs"), &Outcome::Unchanged);
-    assert!(matches!(entry_outcome(&report, "search"), Outcome::Blocked(_)));
+    assert!(matches!(
+        entry_outcome(&report, "search"),
+        Outcome::Blocked(_)
+    ));
     let doc: serde_json::Value = serde_json::from_slice(&fs::read(&claude).unwrap()).unwrap();
     assert_eq!(doc["mcpServers"]["search"]["command"], "the-users-own");
     assert_eq!(doc["mcpServers"]["lint"]["command"], "lint-server");
-    assert_eq!(doc["oauthAccount"], serde_json::json!({ "id": "SENTINEL-AUTH" }));
+    assert_eq!(
+        doc["oauthAccount"],
+        serde_json::json!({ "id": "SENTINEL-AUTH" })
+    );
 }
 
 /// A custom agent `name` whose MCP config is `~/{dir}/custom.json` in `format` and `shape`.
@@ -1155,21 +1187,32 @@ fn a_raw_key_migration_through_a_link_changes_neither_the_document_nor_the_recor
                 .outcomes
                 .iter()
                 .filter_map(|(action, outcome)| match (&action.target, outcome) {
-                    (plan::Target::Entry { key, .. }, Outcome::Blocked(reason)) if key == "my_docs" => {
+                    (plan::Target::Entry { key, .. }, Outcome::Blocked(reason))
+                        if key == "my_docs" =>
+                    {
                         Some(reason)
                     }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(refusals.len(), 2, "the declaration and the old removal: {report:#?}");
+            assert_eq!(
+                refusals.len(),
+                2,
+                "the declaration and the old removal: {report:#?}"
+            );
             assert!(
                 refusals
                     .iter()
-                    .all(|reason| reason.starts_with("loadout owns ") && reason.contains("doesn't convert")),
+                    .all(|reason| reason.starts_with("loadout owns ")
+                        && reason.contains("doesn't convert")),
                 "the migration is each one's first refusal: {refusals:?}"
             );
             assert!(report.unhealthy() && !report.failed());
-            assert_eq!(fs::read(&document).unwrap(), before, "{from} -> {to} via {other_dir}");
+            assert_eq!(
+                fs::read(&document).unwrap(),
+                before,
+                "{from} -> {to} via {other_dir}"
+            );
             assert_eq!(entry_record(&machine, "my_docs"), Some(record));
         }
     }

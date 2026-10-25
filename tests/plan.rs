@@ -396,10 +396,7 @@ fn an_unowned_mcp_server_that_already_matches_is_adopted() {
         .find(|action| matches!(&action.target, Target::Entry { key, .. } if key == "docs"))
         .unwrap();
     assert_eq!(docs.change, Change::Adopt);
-    assert!(
-        matches!(docs.prior, Observed::Present { .. }),
-        "{docs:?}"
-    );
+    assert!(matches!(docs.prior, Observed::Present { .. }), "{docs:?}");
     let target = docs.target.clone();
 
     let report = loadout::apply::run(
