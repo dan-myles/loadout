@@ -266,7 +266,12 @@ impl Run {
     /// lock held to the end, one read, the key's prior, a backup of that key's value only, the
     /// edit, the staged document's hash journaled, then the atomic write that re-reads the whole
     /// document just before its rename.
-    fn write_entry(&mut self, index: usize, action: &Action, content: &Content) -> Result<(), Error> {
+    fn write_entry(
+        &mut self,
+        index: usize,
+        action: &Action,
+        content: &Content,
+    ) -> Result<(), Error> {
         let Content::Entry(value) = content else {
             return Err(Error::InvalidContent {
                 message: format!(

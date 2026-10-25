@@ -119,12 +119,22 @@ impl Machine {
                 let mode = mode_of(&metadata);
                 if metadata.file_type().is_symlink() {
                     let target = fs::read_link(&path).unwrap();
-                    out.insert(path, ("link".to_owned(), target.as_os_str().as_encoded_bytes().to_vec(), mode));
+                    out.insert(
+                        path,
+                        (
+                            "link".to_owned(),
+                            target.as_os_str().as_encoded_bytes().to_vec(),
+                            mode,
+                        ),
+                    );
                 } else if metadata.is_dir() {
                     out.insert(path.clone(), ("dir".to_owned(), Vec::new(), mode));
                     walk(&path, apart, out);
                 } else if metadata.is_file() {
-                    out.insert(path.clone(), ("file".to_owned(), fs::read(&path).unwrap(), mode));
+                    out.insert(
+                        path.clone(),
+                        ("file".to_owned(), fs::read(&path).unwrap(), mode),
+                    );
                 } else {
                     out.insert(path, ("special".to_owned(), Vec::new(), mode));
                 }
@@ -197,7 +207,8 @@ impl Machine {
         let action = self.action(target, Some(value));
         let mut run = self.begin(vec![action.clone()]).unwrap();
         let id = run.id().to_owned();
-        run.write(&action, action.content.as_ref().unwrap()).unwrap();
+        run.write(&action, action.content.as_ref().unwrap())
+            .unwrap();
         let mut state = self.state();
         run.finish(&mut state).unwrap();
         id
@@ -286,27 +297,57 @@ fn entry(file: PathBuf, format: McpFormat, pointer: &str, key: &str, shape: McpS
 
 fn cursor(machine: &Machine, key: &str) -> Target {
     let file = machine.path(".cursor/mcp.json");
-    entry(file, McpFormat::Json, "/mcpServers", key, McpShape::CursorJson)
+    entry(
+        file,
+        McpFormat::Json,
+        "/mcpServers",
+        key,
+        McpShape::CursorJson,
+    )
 }
 
 fn claude(machine: &Machine, key: &str) -> Target {
     let file = machine.path(".claude.json");
-    entry(file, McpFormat::Json, "/mcpServers", key, McpShape::ClaudeJson)
+    entry(
+        file,
+        McpFormat::Json,
+        "/mcpServers",
+        key,
+        McpShape::ClaudeJson,
+    )
 }
 
 fn codex(machine: &Machine, key: &str) -> Target {
     let file = machine.path(".codex/config.toml");
-    entry(file, McpFormat::Toml, "/mcp_servers", key, McpShape::CodexToml)
+    entry(
+        file,
+        McpFormat::Toml,
+        "/mcp_servers",
+        key,
+        McpShape::CodexToml,
+    )
 }
 
 fn grok(machine: &Machine, key: &str) -> Target {
     let file = machine.path(".grok/config.toml");
-    entry(file, McpFormat::Toml, "/mcp_servers", key, McpShape::GrokToml)
+    entry(
+        file,
+        McpFormat::Toml,
+        "/mcp_servers",
+        key,
+        McpShape::GrokToml,
+    )
 }
 
 fn muse(machine: &Machine, key: &str) -> Target {
     let file = machine.path(".config/muse/settings.json");
-    entry(file, McpFormat::Json, "/mcp_servers", key, McpShape::MuseJson)
+    entry(
+        file,
+        McpFormat::Json,
+        "/mcp_servers",
+        key,
+        McpShape::MuseJson,
+    )
 }
 
 fn pi(machine: &Machine, key: &str) -> Target {
@@ -352,10 +393,13 @@ fn document_hash(bytes: &[u8]) -> String {
     hasher.update(b"loadout:document:v1\n");
     hasher.update(u64::try_from(bytes.len()).unwrap().to_be_bytes());
     hasher.update(bytes);
-    hasher.finalize().iter().fold(String::new(), |mut out, byte| {
-        write!(out, "{byte:02x}").unwrap();
-        out
-    })
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").unwrap();
+            out
+        })
 }
 
 fn scratch(target: &Target, run: &str, suffix: &str) -> PathBuf {
@@ -407,7 +451,15 @@ fn without_key(target: &Target) -> Vec<u8> {
         _ => unreachable!("an entry target"),
     };
     let bytes = fs::read(file).unwrap();
-    mcp::edit(&bytes, format, pointer, shape, &mcp::Servers::new(), &[key.to_owned()]).unwrap()
+    mcp::edit(
+        &bytes,
+        format,
+        pointer,
+        shape,
+        &mcp::Servers::new(),
+        &[key.to_owned()],
+    )
+    .unwrap()
 }
 
 #[cfg(unix)]
@@ -465,7 +517,10 @@ fn an_update_beside_secrets_never_copies_them_into_the_state_dir() {
     let document: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
     assert_eq!(document["oauthAccount"]["token"], "SECRET-OAUTH");
     assert_eq!(document["projects"], json!({"/x": {}}));
-    assert_eq!(document["mcpServers"]["other"]["env"]["TOKEN"], "SECRET-OTHER");
+    assert_eq!(
+        document["mcpServers"]["other"]["env"]["TOKEN"],
+        "SECRET-OTHER"
+    );
     assert_eq!(document["mcpServers"]["mine"], server("v2"));
     let kept = machine.state_bytes();
     for secret in [&b"SECRET-OAUTH"[..], b"SECRET-OTHER"] {
@@ -478,7 +533,11 @@ fn an_update_beside_secrets_never_copies_them_into_the_state_dir() {
     let backup: Value =
         serde_json::from_slice(&fs::read(machine.run_dir(&second).join("backups/0")).unwrap())
             .unwrap();
-    assert_eq!(backup, server("v1"), "only the owned key's value is backed up");
+    assert_eq!(
+        backup,
+        server("v1"),
+        "only the owned key's value is backed up"
+    );
 }
 
 // 3
@@ -487,18 +546,32 @@ fn comments_formatting_bom_and_crlf_survive() {
     let machine = Machine::new();
     let jsonc = machine.path(".config/opencode/opencode.jsonc");
     fs::create_dir_all(jsonc.parent().unwrap()).unwrap();
-    fs::write(&jsonc, "{\n  // keep me\n  \"theme\": \"dark\",\n  \"mcp\": {}\n}\n").unwrap();
+    fs::write(
+        &jsonc,
+        "{\n  // keep me\n  \"theme\": \"dark\",\n  \"mcp\": {}\n}\n",
+    )
+    .unwrap();
     machine.apply(&opencode(&machine, "one"), &server("one"));
     let text = fs::read_to_string(&jsonc).unwrap();
-    assert!(text.contains("// keep me") && text.contains("\"theme\": \"dark\""), "{text}");
+    assert!(
+        text.contains("// keep me") && text.contains("\"theme\": \"dark\""),
+        "{text}"
+    );
 
     let toml = machine.path(".codex/config.toml");
     fs::create_dir_all(toml.parent().unwrap()).unwrap();
-    fs::write(&toml, "# mine\nmodel = \"x\"\n\n[projects.\"/a\"]\ntrust_level = \"trusted\"\n").unwrap();
+    fs::write(
+        &toml,
+        "# mine\nmodel = \"x\"\n\n[projects.\"/a\"]\ntrust_level = \"trusted\"\n",
+    )
+    .unwrap();
     machine.apply(&codex(&machine, "one"), &server("one"));
     let text = fs::read_to_string(&toml).unwrap();
     assert!(text.starts_with("# mine\nmodel = \"x\"\n"), "{text}");
-    assert!(text.contains("[projects.\"/a\"]\ntrust_level = \"trusted\""), "{text}");
+    assert!(
+        text.contains("[projects.\"/a\"]\ntrust_level = \"trusted\""),
+        "{text}"
+    );
 
     let json = machine.path(".cursor/mcp.json");
     fs::create_dir_all(json.parent().unwrap()).unwrap();
@@ -595,7 +668,10 @@ fn removal_backs_up_and_removes_an_owned_key_and_releases_a_changed_or_missing_o
     document["mcpServers"]["two"] = json!({"command": "edited"});
     fs::write(file, serde_json::to_vec(&document).unwrap()).unwrap();
     assert_eq!(machine.remove(&drifted), Removal::Released);
-    assert_eq!(servers(&drifted).get("two"), Some(&json!({"command": "edited"})));
+    assert_eq!(
+        servers(&drifted).get("two"),
+        Some(&json!({"command": "edited"}))
+    );
     assert!(machine.state().record(&drifted).is_none());
 
     let gone = cursor(&machine, "three");
@@ -647,7 +723,8 @@ fn adopting_an_equal_unowned_key_records_it_without_rewriting_the_document() {
     let action = machine.action(&target, Some(&server("one")));
     assert_eq!(action.change, Change::Adopt);
     let mut run = machine.begin(vec![action.clone()]).unwrap();
-    run.write(&action, action.content.as_ref().unwrap()).unwrap();
+    run.write(&action, action.content.as_ref().unwrap())
+        .unwrap();
     let mut state = machine.state();
     run.finish(&mut state).unwrap();
     let after = fs::metadata(file).unwrap();
@@ -665,7 +742,10 @@ fn grok_s_lock_is_honored_on_write_and_never_taken_by_observe() {
     fs::write(file, "model = \"x\"\n").unwrap();
     let lock_path = machine.path(".grok/.config-init.lock");
     assert!(machine.observe(&target).is_ok());
-    assert!(!lock_path.exists(), "observe and plan never create Grok's lock");
+    assert!(
+        !lock_path.exists(),
+        "observe and plan never create Grok's lock"
+    );
 
     let held = fs::File::create(&lock_path).unwrap();
     held.try_lock().unwrap();
@@ -675,7 +755,13 @@ fn grok_s_lock_is_honored_on_write_and_never_taken_by_observe() {
         .write(&action, action.content.as_ref().unwrap())
         .unwrap_err();
     assert!(
-        matches!(&error, Error::Mcp { source: mcp::Error::Lock { .. }, .. }),
+        matches!(
+            &error,
+            Error::Mcp {
+                source: mcp::Error::Lock { .. },
+                ..
+            }
+        ),
         "{error}"
     );
     assert!(error.is_blocked());
@@ -693,11 +779,9 @@ fn unparseable_documents_are_typed_blocked_errors() {
             "{\"mcpServers\":{\"a\":{},\"a\":{}}}",
             |error| matches!(error, mcp::Error::Duplicate { .. }),
         ),
-        (
-            claude(&machine, "x"),
-            "{\"mcpServers\": ",
-            |error| matches!(error, mcp::Error::Parse { .. }),
-        ),
+        (claude(&machine, "x"), "{\"mcpServers\": ", |error| {
+            matches!(error, mcp::Error::Parse { .. })
+        }),
         (
             codex(&machine, "x"),
             "[mcp_servers.a]\nwhen = 1979-05-27T07:32:00Z\n",
@@ -821,7 +905,11 @@ fn a_tampered_key_backup_is_never_restored() {
     let target = cursor(&machine, "one");
     machine.apply(&target, &server("v1"));
     let second = machine.apply(&target, &server("v2"));
-    fs::write(machine.run_dir(&second).join("backups/0"), "{\"command\":\"evil\"}").unwrap();
+    fs::write(
+        machine.run_dir(&second).join("backups/0"),
+        "{\"command\":\"evil\"}",
+    )
+    .unwrap();
     let (file, ..) = parts(&target);
     let before = fs::read(file).unwrap();
     let error = machine.rollback().unwrap_err();
@@ -985,7 +1073,11 @@ fn a_foreign_occupant_of_a_s_rollback_staging_name_blocks_b_too() {
         let error = machine.rollback().unwrap_err();
         assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
         assert!(error.is_blocked());
-        assert_eq!(machine.snapshot(), before, "B is restored first, yet nothing changed");
+        assert_eq!(
+            machine.snapshot(),
+            before,
+            "B is restored first, yet nothing changed"
+        );
     }
 }
 
@@ -1039,7 +1131,10 @@ fn a_restore_that_already_renamed_is_kept_on_the_next_try() {
             json!({"base": document_hash(&current), "staged": document_hash(&planned)});
     });
     let rolled = machine.rollback().unwrap();
-    assert!(rolled.restored.is_empty(), "the key already holds its prior");
+    assert!(
+        rolled.restored.is_empty(),
+        "the key already holds its prior"
+    );
     assert_eq!(fs::read(file).unwrap(), planned);
 }
 
@@ -1084,8 +1179,15 @@ fn a_partial_or_unrecorded_rollback_staging_file_is_never_taken_for_the_restore(
         }
         let before = machine.snapshot();
         let error = machine.rollback().unwrap_err();
-        assert!(matches!(error, Error::RollbackBlocked { .. }), "{recorded}: {error}");
-        assert_eq!(machine.snapshot(), before, "partial bytes kept, nothing restored");
+        assert!(
+            matches!(error, Error::RollbackBlocked { .. }),
+            "{recorded}: {error}"
+        );
+        assert_eq!(
+            machine.snapshot(),
+            before,
+            "partial bytes kept, nothing restored"
+        );
     }
 }
 
@@ -1138,7 +1240,8 @@ fn staged_document_hashes_are_validated() {
     let mut state = machine.state();
     path_run.finish(&mut state).unwrap();
     machine.edit_journal(&id, |journal| {
-        journal["entries"][0]["document"] = json!({"base": "1".repeat(64), "staged": "2".repeat(64)});
+        journal["entries"][0]["document"] =
+            json!({"base": "1".repeat(64), "staged": "2".repeat(64)});
     });
     assert!(matches!(machine.rollback(), Err(Error::Invalid { .. })));
 }
@@ -1155,7 +1258,10 @@ fn replacing_an_unowned_key_is_refused_before_anything_is_journaled() {
     action.change = Change::Replace;
     let error = machine.begin(vec![action]).unwrap_err();
     assert!(matches!(error, Error::WrongChange { .. }), "{error}");
-    assert!(!error.is_blocked(), "a literal Replace is a contract fault, exit 1");
+    assert!(
+        !error.is_blocked(),
+        "a literal Replace is a contract fault, exit 1"
+    );
     assert!(!machine.context.state.join("runs").exists());
 }
 
@@ -1242,7 +1348,8 @@ fn a_new_shared_document_is_private_and_an_existing_one_keeps_its_mode() {
         set_mode(file, existing);
         let action = machine.action(&target, Some(&server("one")));
         let mut run = machine.begin(vec![action.clone()]).unwrap();
-        run.write(&action, action.content.as_ref().unwrap()).unwrap();
+        run.write(&action, action.content.as_ref().unwrap())
+            .unwrap();
         let mut state = machine.state();
         run.finish(&mut state).unwrap();
         assert_eq!(mode(file), existing);
@@ -1268,23 +1375,39 @@ fn set_json(target: &Target, edit: impl FnOnce(&mut Value)) {
 #[test]
 fn an_uneditable_document_blocks_rollback_before_b_is_restored() {
     let breaks: [(&str, fn(&Machine) -> Target, fn(&Target)); 4] = [
-        ("muse schema 2, SetKey", |machine| muse(machine, "a"), |a| {
-            set_json(a, |document| document["schema_version"] = json!(2));
-        }),
-        ("pi collision, SetKey", |machine| pi(machine, "my-srv"), |a| {
-            set_json(a, |document| {
-                document["mcpServers"]["my_srv"] = json!({"command": "theirs"});
-            });
-        }),
-        ("map no longer an object, refused on read", |machine| cursor(machine, "a"), |a| {
-            set_json(a, |document| document["mcpServers"] = json!("gone"));
-        }),
-        ("mixed newlines, SetKey", |machine| codex(machine, "a"), |a| {
-            let (file, ..) = parts(a);
-            let mut text = fs::read_to_string(file).unwrap();
-            text.push_str("# added\r\n");
-            fs::write(file, text).unwrap();
-        }),
+        (
+            "muse schema 2, SetKey",
+            |machine| muse(machine, "a"),
+            |a| {
+                set_json(a, |document| document["schema_version"] = json!(2));
+            },
+        ),
+        (
+            "pi collision, SetKey",
+            |machine| pi(machine, "my-srv"),
+            |a| {
+                set_json(a, |document| {
+                    document["mcpServers"]["my_srv"] = json!({"command": "theirs"});
+                });
+            },
+        ),
+        (
+            "map no longer an object, refused on read",
+            |machine| cursor(machine, "a"),
+            |a| {
+                set_json(a, |document| document["mcpServers"] = json!("gone"));
+            },
+        ),
+        (
+            "mixed newlines, SetKey",
+            |machine| codex(machine, "a"),
+            |a| {
+                let (file, ..) = parts(a);
+                let mut text = fs::read_to_string(file).unwrap();
+                text.push_str("# added\r\n");
+                fs::write(file, text).unwrap();
+            },
+        ),
     ];
     for (case, make, break_a) in breaks {
         let machine = Machine::new();
@@ -1294,8 +1417,15 @@ fn an_uneditable_document_blocks_rollback_before_b_is_restored() {
         break_a(&a);
         let before = machine.snapshot();
         let error = machine.rollback().unwrap_err();
-        assert!(matches!(error, Error::RollbackBlocked { .. }), "{case}: {error}");
-        assert_eq!(machine.snapshot(), before, "{case}: B is restored first, yet nothing changed");
+        assert!(
+            matches!(error, Error::RollbackBlocked { .. }),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            machine.snapshot(),
+            before,
+            "{case}: B is restored first, yet nothing changed"
+        );
     }
 }
 
@@ -1323,7 +1453,9 @@ fn editable_documents_restore_including_muse_at_schema_1() {
     let a = muse(&machine, "a");
     let b = claude(&machine, "b");
     owned_updates(&machine, &a, &b);
-    set_json(&b, |document| document["theme"] = json!("unrelated, edited after the run"));
+    set_json(&b, |document| {
+        document["theme"] = json!("unrelated, edited after the run")
+    });
     machine.rollback().unwrap();
     assert_eq!(servers(&a).get("a"), Some(&server("a1")));
     assert_eq!(servers(&b).get("b"), Some(&server("b1")));
@@ -1334,7 +1466,12 @@ fn editable_documents_restore_including_muse_at_schema_1() {
 // E2 (groups 8, 14)
 #[test]
 fn an_unowned_key_with_another_value_is_never_written_whatever_the_label() {
-    for label in [Change::Adopt, Change::Update, Change::Drifted, Change::Create] {
+    for label in [
+        Change::Adopt,
+        Change::Update,
+        Change::Drifted,
+        Change::Create,
+    ] {
         let machine = Machine::new();
         let target = cursor(&machine, "one");
         let (file, ..) = parts(&target);
@@ -1366,19 +1503,26 @@ fn an_unowned_key_with_another_value_is_never_written_whatever_the_label() {
         let error = run
             .write(&action, action.content.as_ref().unwrap())
             .unwrap_err();
-        assert!(matches!(error, Error::UnownedEntry { .. }), "{label:?}: {error}");
+        assert!(
+            matches!(error, Error::UnownedEntry { .. }),
+            "{label:?}: {error}"
+        );
         assert!(error.is_blocked());
         let (after, still_held) = machine.snapshot_while_running();
         assert_eq!(after, before, "{label:?}: no backup, no started, no edit");
         assert_eq!(still_held, held);
-        let journal: Value = serde_json::from_slice(
-            &fs::read(machine.run_dir(&id).join("journal.json")).unwrap(),
-        )
-        .unwrap();
+        let journal: Value =
+            serde_json::from_slice(&fs::read(machine.run_dir(&id).join("journal.json")).unwrap())
+                .unwrap();
         assert_eq!(journal["entries"][0]["step"], "pending");
         assert_eq!(journal["entries"][0]["backup"]["kind"], "pending");
         assert!(journal["entries"][0].get("document").is_none());
-        assert_eq!(fs::read_dir(machine.run_dir(&id).join("backups")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(machine.run_dir(&id).join("backups"))
+                .unwrap()
+                .count(),
+            0
+        );
         drop(run);
         let mut released = machine.snapshot();
         let lock = machine.lock_file();
@@ -1387,7 +1531,10 @@ fn an_unowned_key_with_another_value_is_never_written_whatever_the_label() {
             idle.get(&lock).cloned(),
             "{label:?}: the inactive lock file's bytes and mode"
         );
-        assert_eq!(released, before, "{label:?}: nothing else changed once the run dropped");
+        assert_eq!(
+            released, before,
+            "{label:?}: nothing else changed once the run dropped"
+        );
     }
 }
 
@@ -1404,14 +1551,18 @@ fn a_forced_update_of_an_owned_drifted_key_backs_up_the_drift_and_rolls_back_to_
     assert_eq!(action.change, Change::Drifted);
     let mut run = machine.begin(vec![action.clone()]).unwrap();
     let id = run.id().to_owned();
-    run.write(&action, action.content.as_ref().unwrap()).unwrap();
+    run.write(&action, action.content.as_ref().unwrap())
+        .unwrap();
     let mut state = machine.state();
     run.finish(&mut state).unwrap();
     let backup: Value =
         serde_json::from_slice(&fs::read(machine.run_dir(&id).join("backups/0")).unwrap()).unwrap();
     assert_eq!(backup, json!({"command": "drifted"}));
     machine.rollback().unwrap();
-    assert_eq!(servers(&target).get("one"), Some(&json!({"command": "drifted"})));
+    assert_eq!(
+        servers(&target).get("one"),
+        Some(&json!({"command": "drifted"}))
+    );
 }
 
 // E2, removal of an unowned key
@@ -1449,15 +1600,25 @@ fn an_equal_adopt_writes_nothing_and_backs_up_nothing() {
     let id = run.id().to_owned();
     let before = fs::metadata(file).unwrap().modified().unwrap();
     let bytes = fs::read(file).unwrap();
-    run.write(&action, action.content.as_ref().unwrap()).unwrap();
+    run.write(&action, action.content.as_ref().unwrap())
+        .unwrap();
     let mut state = machine.state();
     run.finish(&mut state).unwrap();
     assert_eq!(fs::read(file).unwrap(), bytes);
     assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), before);
-    assert_eq!(fs::read_dir(machine.run_dir(&id).join("backups")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(machine.run_dir(&id).join("backups"))
+            .unwrap()
+            .count(),
+        0
+    );
     assert!(state.record(&target).is_some());
     machine.rollback().unwrap();
-    assert_eq!(fs::read(file).unwrap(), bytes, "rollback keeps an adopted key");
+    assert_eq!(
+        fs::read(file).unwrap(),
+        bytes,
+        "rollback keeps an adopted key"
+    );
 }
 
 // E3 (groups 12, 22)
@@ -1465,11 +1626,17 @@ fn an_equal_adopt_writes_nothing_and_backs_up_nothing() {
 fn entry_journals_must_match_what_actually_happened() {
     let edits: [(&str, fn(&mut Value)); 8] = [
         ("written done without its document", |journal| {
-            journal["entries"][0].as_object_mut().unwrap().remove("document");
+            journal["entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("document");
         }),
         ("failed without its document", |journal| {
             journal["entries"][0]["step"] = json!("failed");
-            journal["entries"][0].as_object_mut().unwrap().remove("document");
+            journal["entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("document");
         }),
         ("a written replace with a pending backup", |journal| {
             journal["entries"][0]["backup"]["kind"] = json!("pending");
@@ -1537,7 +1704,10 @@ fn a_true_no_op_and_a_release_journal_validly_and_roll_back() {
     });
     assert_eq!(machine.remove(&released), Removal::Released);
     machine.rollback().unwrap();
-    assert_eq!(servers(&released).get("two"), Some(&json!({"command": "edited"})));
+    assert_eq!(
+        servers(&released).get("two"),
+        Some(&json!({"command": "edited"}))
+    );
 }
 
 // E3, a linked backup
@@ -1619,7 +1789,11 @@ fn only_a_new_shared_mcp_document_is_forced_private() {
     run.write(&action, &content).unwrap();
     let mut state = machine.state();
     run.finish(&mut state).unwrap();
-    assert_eq!(mode(&path), default, "an ordinary new file keeps the process default");
+    assert_eq!(
+        mode(&path),
+        default,
+        "an ordinary new file keeps the process default"
+    );
     let fresh = cursor(&machine, "one");
     machine.apply(&fresh, &server("one"));
     assert_eq!(mode(parts(&fresh).0), 0o600);
@@ -1660,7 +1834,11 @@ fn every_grok_lock_is_taken_before_rollback_changes_anything() {
     let a = grok_at(&override_home, "a");
     let b = grok_at(&default_home, "b");
     let c = cursor(&machine, "c");
-    run_many(&machine, &[&a, &b, &c], &[server("a"), server("b"), server("c")]);
+    run_many(
+        &machine,
+        &[&a, &b, &c],
+        &[server("a"), server("b"), server("c")],
+    );
     for contended in [&default_home, &override_home] {
         let other = if contended == &default_home {
             &override_home
@@ -1677,18 +1855,27 @@ fn every_grok_lock_is_taken_before_rollback_changes_anything() {
         let (before, locks_before) = machine.snapshot_apart(&locks);
         let error = machine.rollback().unwrap_err();
         assert!(
-            matches!(&error, Error::Mcp { source: mcp::Error::Lock { .. }, .. }),
+            matches!(
+                &error,
+                Error::Mcp {
+                    source: mcp::Error::Lock { .. },
+                    ..
+                }
+            ),
             "{error}"
         );
         assert!(error.is_blocked());
         let (after, locks_after) = machine.snapshot_apart(&locks);
         assert_eq!(after, before, "nothing changed while a lock was held");
-        assert_eq!(locks_after, locks_before, "both lock files existed, empty, and still do");
-        assert!(
-            locks_after
-                .values()
-                .all(|shape| shape.as_ref().is_some_and(|(kind, len, _)| kind == "file" && *len == 0))
+        assert_eq!(
+            locks_after, locks_before,
+            "both lock files existed, empty, and still do"
         );
+        assert!(locks_after.values().all(|shape| {
+            shape
+                .as_ref()
+                .is_some_and(|(kind, len, _)| kind == "file" && *len == 0)
+        }));
         let freed = hold(&other.join(".config-init.lock"));
         drop(freed);
         drop(held);
@@ -1718,11 +1905,19 @@ fn aliases_of_one_grok_config_share_one_lock_without_deadlock() {
     assert!(ids[0].is_some());
     assert_eq!(ids[0], ids[1], "an alias names the same lock");
     assert!(
-        mcp::lock_id(&machine.context, &machine.loadout, parts(&cursor(&machine, "x")).0)
-            .unwrap()
-            .is_none()
+        mcp::lock_id(
+            &machine.context,
+            &machine.loadout,
+            parts(&cursor(&machine, "x")).0
+        )
+        .unwrap()
+        .is_none()
     );
-    run_many(&machine, &[&canonical, &aliased], &[server("a"), server("b")]);
+    run_many(
+        &machine,
+        &[&canonical, &aliased],
+        &[server("a"), server("b")],
+    );
     machine.rollback().unwrap();
     let now = servers(&canonical);
     assert!(!now.contains_key("a") && !now.contains_key("b"));
@@ -1757,7 +1952,11 @@ fn one_changed_key_blocks_the_whole_run_s_rollback_and_changes_nothing() {
     let before = machine.snapshot();
     let error = machine.rollback().unwrap_err();
     assert!(matches!(error, Error::RollbackBlocked { .. }), "{error}");
-    assert_eq!(machine.snapshot(), before, "B is restored first, yet nothing changed");
+    assert_eq!(
+        machine.snapshot(),
+        before,
+        "B is restored first, yet nothing changed"
+    );
 }
 
 // 9, released
@@ -1771,7 +1970,11 @@ fn a_grok_key_is_written_once_grok_releases_its_lock() {
     drop(hold(&machine.path(".grok/.config-init.lock")));
     machine.apply(&target, &server("one"));
     assert_eq!(servers(&target).get("one"), Some(&server("one")));
-    assert!(fs::read_to_string(file).unwrap().starts_with("model = \"x\"\n"));
+    assert!(
+        fs::read_to_string(file)
+            .unwrap()
+            .starts_with("model = \"x\"\n")
+    );
 }
 
 // 13, before staging and partial staging
@@ -1785,7 +1988,11 @@ fn a_forward_edit_stopped_before_or_during_staging_rolls_back_without_its_scratc
     let partial = fs::read(&tmp).unwrap();
     let rolled = machine.rollback().unwrap();
     assert_eq!(rolled.run, run);
-    assert_eq!(rolled.leftovers, vec![tmp.clone()], "partial bytes are never the run's own");
+    assert_eq!(
+        rolled.leftovers,
+        vec![tmp.clone()],
+        "partial bytes are never the run's own"
+    );
     assert_eq!(fs::read(&tmp).unwrap(), partial);
     assert!(!servers(&target).contains_key("one"));
 
@@ -1798,7 +2005,10 @@ fn a_forward_edit_stopped_before_or_during_staging_rolls_back_without_its_scratc
     });
     fs::remove_file(parts(&target).0).unwrap();
     let rolled = machine.rollback().unwrap();
-    assert!(rolled.restored.is_empty(), "nothing was staged, so the key already holds its prior");
+    assert!(
+        rolled.restored.is_empty(),
+        "nothing was staged, so the key already holds its prior"
+    );
     assert!(!parts(&target).0.exists());
     assert!(machine.state().record(&target).is_none());
 }
@@ -1859,7 +2069,10 @@ fn restores_that_only_collide_together_block_the_whole_rollback() {
     let error = machine.rollback().unwrap_err();
     match &error {
         Error::RollbackBlocked { targets, .. } => {
-            assert!(targets.iter().any(|target| target.contains("collides")), "{targets:?}");
+            assert!(
+                targets.iter().any(|target| target.contains("collides")),
+                "{targets:?}"
+            );
         }
         other => panic!("{other}"),
     }
@@ -1937,7 +2150,11 @@ fn a_blocked_rollback_creates_only_the_grok_lock_files_it_selected() {
     let a = grok_at(&override_home, "a");
     let b = grok_at(&default_home, "b");
     let c = cursor(&machine, "c");
-    run_many(&machine, &[&a, &b, &c], &[server("a"), server("b"), server("c")]);
+    run_many(
+        &machine,
+        &[&a, &b, &c],
+        &[server("a"), server("b"), server("c")],
+    );
     let locks = [
         default_home.join(".config-init.lock"),
         override_home.join(".config-init.lock"),
@@ -1959,9 +2176,9 @@ fn a_blocked_rollback_creates_only_the_grok_lock_files_it_selected() {
     let (after, locks_after) = machine.snapshot_apart(&locks);
     assert_eq!(after, before, "only the selected lock files may differ");
     assert!(
-        locks_after
-            .values()
-            .all(|shape| shape.as_ref().is_some_and(|(kind, len, _)| kind == "file" && *len == 0)),
+        locks_after.values().all(|shape| shape
+            .as_ref()
+            .is_some_and(|(kind, len, _)| kind == "file" && *len == 0)),
         "locks are taken before preflight blocks, so both were created empty: {locks_after:?}"
     );
 }

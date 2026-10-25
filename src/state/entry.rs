@@ -43,11 +43,9 @@ pub(super) fn place(target: &Target) -> Result<Place<'_>, Error> {
             key,
             shape: *shape,
         }),
-        Target::Path { .. } | Target::Program { .. } | Target::None => {
-            Err(Error::InvalidContent {
-                message: format!("{} is not an MCP entry", label(target)),
-            })
-        }
+        Target::Path { .. } | Target::Program { .. } | Target::None => Err(Error::InvalidContent {
+            message: format!("{} is not an MCP entry", label(target)),
+        }),
     }
 }
 
@@ -114,7 +112,11 @@ pub(super) fn observed(value: Option<&Value>) -> Observed {
 
 /// What the key holds now. Read-only: no lock is taken, so plan and status never create Grok's
 /// lock file.
-pub(super) fn observe(context: &Context, loadout: &Path, target: &Target) -> Result<Observed, Error> {
+pub(super) fn observe(
+    context: &Context,
+    loadout: &Path,
+    target: &Target,
+) -> Result<Observed, Error> {
     let place = place(target)?;
     check(context, loadout, &place)?;
     let real = disk::real(place.file)?;
@@ -142,8 +144,15 @@ pub(super) fn edit(place: &Place<'_>, bytes: &[u8], edit: &Edit<'_>) -> Result<V
         }
         Edit::Remove => remove.push(place.key.to_owned()),
     }
-    mcp::edit(bytes, place.format, place.pointer, place.shape, &set, &remove)
-        .map_err(|source| mcp_error(place.target, source))
+    mcp::edit(
+        bytes,
+        place.format,
+        place.pointer,
+        place.shape,
+        &set,
+        &remove,
+    )
+    .map_err(|source| mcp_error(place.target, source))
 }
 
 /// Replaces the document with `bytes` through the staged, fsynced, atomic `disk::put`. Just
@@ -202,8 +211,12 @@ mod tests {
         let target = target(file.clone());
         let place = place(&target).unwrap();
         let base = read(&place, &file).unwrap();
-        let bytes = edit(&place, &base.bytes, &Edit::Set(&serde_json::json!({"command": "x"})))
-            .unwrap();
+        let bytes = edit(
+            &place,
+            &base.bytes,
+            &Edit::Set(&serde_json::json!({"command": "x"})),
+        )
+        .unwrap();
         fs::write(&file, "{\"mcpServers\":{},\"user\":true}\n").unwrap();
         let error = put(&file, &base, bytes, "t", &target).unwrap_err();
         assert!(matches!(error, Error::Changed { .. }), "{error}");
@@ -223,8 +236,12 @@ mod tests {
         let place = place(&target).unwrap();
         let base = read(&place, &file).unwrap();
         assert!(base.mode.is_none());
-        let bytes = edit(&place, &base.bytes, &Edit::Set(&serde_json::json!({"command": "x"})))
-            .unwrap();
+        let bytes = edit(
+            &place,
+            &base.bytes,
+            &Edit::Set(&serde_json::json!({"command": "x"})),
+        )
+        .unwrap();
         fs::write(&file, "{}").unwrap();
         assert!(matches!(
             put(&file, &base, bytes, "t", &target),

@@ -237,7 +237,11 @@ mod tests {
         assert_eq!(upper, lower);
         assert_eq!(upper.cmp(&lower), Ordering::Equal);
         assert_eq!(upper.cmp(&default), lower.cmp(&default));
-        assert_eq!(upper.cmp(&default), Ordering::Greater, "a prefix sorts first");
+        assert_eq!(
+            upper.cmp(&default),
+            Ordering::Greater,
+            "a prefix sorts first"
+        );
         assert!(
             upper.path() < default.path(),
             "sorting by the kept spelling would have put it first"

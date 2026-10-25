@@ -420,7 +420,11 @@ fn status_reports_an_mcp_entry_and_the_cli_rollback_removes_only_its_key() {
     let machine = Machine::new();
     let file = machine.home.join(".cursor/mcp.json");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(&file, "{\"mcpServers\":{\"user\":{\"command\":\"mine\"}}}\n").unwrap();
+    fs::write(
+        &file,
+        "{\"mcpServers\":{\"user\":{\"command\":\"mine\"}}}\n",
+    )
+    .unwrap();
     let target = Target::Entry {
         file: file.clone(),
         format: McpFormat::Json,
@@ -447,7 +451,8 @@ fn status_reports_an_mcp_entry_and_the_cli_rollback_removes_only_its_key() {
         let plan = Plan {
             actions: vec![action.clone()],
         };
-        let mut run = Run::begin(&machine.context, &machine.checkout(), lock, &state, &plan).unwrap();
+        let mut run =
+            Run::begin(&machine.context, &machine.checkout(), lock, &state, &plan).unwrap();
         run.write(&action, &content).unwrap();
         run.finish(&mut state).unwrap();
     }

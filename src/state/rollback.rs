@@ -386,7 +386,8 @@ fn preflight_entry(
         Err(error) => return Err(error),
     };
     let now = entry::observed(document.value.as_ref());
-    let staged = |staged: Option<&Staged>| Expect::Bytes(staged.map(|staged| staged.staged.clone()));
+    let staged =
+        |staged: Option<&Staged>| Expect::Bytes(staged.map(|staged| staged.staged.clone()));
     let scratch_tag = tag(run, index);
     let retag = format!("{scratch_tag}-rollback");
     let scratch = vec![
@@ -394,7 +395,10 @@ fn preflight_entry(
             disk::scratch(&real, &scratch_tag, "tmp")?,
             staged(entry.document.as_ref()),
         ),
-        (disk::scratch(&real, &scratch_tag, "old")?, Expect::Bytes(None)),
+        (
+            disk::scratch(&real, &scratch_tag, "old")?,
+            Expect::Bytes(None),
+        ),
     ];
     let rescratch = vec![
         (
@@ -780,7 +784,8 @@ mod tests {
             shape: McpShape::CursorJson,
         };
         let value = json!({"command": "ours"});
-        let written = entry::edit(&entry::place(&target).unwrap(), b"", &Edit::Set(&value)).unwrap();
+        let written =
+            entry::edit(&entry::place(&target).unwrap(), b"", &Edit::Set(&value)).unwrap();
         let planned = digest(&Content::Entry(value)).unwrap();
         let (run, started) = journal::now();
         let dir = root.join(journal::RUNS).join(&run);
@@ -837,7 +842,11 @@ mod tests {
         assert!(matches!(error, Error::Changed { .. }), "{error}");
         assert_eq!(fs::read_to_string(&undo.real).unwrap(), theirs);
         assert!(journal.entries[0].rollback.is_none());
-        assert_eq!(fs::read(run.join(journal::FILE)).unwrap(), saved, "nothing journaled");
+        assert_eq!(
+            fs::read(run.join(journal::FILE)).unwrap(),
+            saved,
+            "nothing journaled"
+        );
     }
 
     // An unrelated key added after preflight is kept: the restore edits the bytes it reads now.

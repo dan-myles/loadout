@@ -56,7 +56,9 @@ pub enum Error {
         #[source]
         source: mcp::Error,
     },
-    #[error("{path} is a folder, not the single file an MCP config must be; loadout never reads into it")]
+    #[error(
+        "{path} is a folder, not the single file an MCP config must be; loadout never reads into it"
+    )]
     NotADocument { path: PathBuf },
     #[error(
         "{target} already holds an MCP server loadout doesn't own, with a different value; loadout never overwrites it"
