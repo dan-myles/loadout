@@ -1,13 +1,15 @@
 //! The system `git`, always run with an argv array, never through a shell.
 //!
-//! Every call names its repository and work tree explicitly (`--git-dir`, `--work-tree`), so a
-//! `GIT_DIR` or `GIT_WORK_TREE` in the caller's environment can't redirect it, and runs with
-//! hooks pointed at a folder that never exists, no fsmonitor, no submodule recursion, and no
-//! `ext::` transport (a URL that would run a command). Local reads go through the bounded query
-//! path loadout uses for package managers. Clone, fetch and merge talk to the remote or change
-//! the checkout: in the foreground they inherit the terminal, so the user's credential helper
-//! or SSH key can ask for a passphrase; in a supervised background run they get no terminal and
-//! every prompt git and its helpers honour is turned off.
+//! Every call names its repository and work tree explicitly (`--git-dir`, `--work-tree`) and
+//! inherits none of `process::GIT_REDIRECTS` (`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+//! `GIT_CONFIG_PARAMETERS`, ...), so nothing in the caller's environment can redirect it to
+//! another repository, index, or configuration. It runs with hooks pointed at a folder that
+//! never exists, no fsmonitor, no submodule recursion, and no `ext::` transport (a URL that would
+//! run a command). Local reads go through the bounded query path loadout uses for package
+//! managers. Clone, fetch and merge talk to the remote or change the checkout: in the foreground
+//! they inherit the terminal, so the user's credential helper or SSH key can ask for a
+//! passphrase; in a supervised background run they get no terminal and every prompt git and its
+//! helpers honour is turned off.
 
 use std::ffi::OsString;
 use std::io;
@@ -147,7 +149,11 @@ impl<'a> Git<'a> {
                 })
             }
         } else {
-            let status = Command::new(&self.program)
+            let mut command = Command::new(&self.program);
+            for name in process::GIT_REDIRECTS {
+                command.env_remove(name);
+            }
+            let status = command
                 .args(&all)
                 .env_remove(process::WORKER_NONCE)
                 .stdin(Stdio::inherit())

@@ -23,6 +23,33 @@ pub(crate) use query::{Captured, QueryError, install, query};
 /// from every query and install the worker starts.
 pub(crate) const WORKER_NONCE: &str = "LOADOUT_WORKER_NONCE";
 
+/// Git variables that would point a git process, or one a manager runs, at another repository,
+/// index, object store, or configuration than the one on its command line. None is inherited by
+/// a subprocess loadout starts: loadout names its own clone explicitly, and a variable left in
+/// the caller's environment (by a git hook or a script, say) must not redirect a read or a write.
+pub(crate) const GIT_REDIRECTS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_QUARANTINE_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_EXEC_PATH",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
 /// One manager command: an exact program path, its argv, and fixed extra environment. Never a
 /// shell line.
 pub(crate) struct Invocation {

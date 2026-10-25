@@ -175,6 +175,46 @@ fn update_fetches_fast_forwards_and_applies_the_new_commit() {
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
 }
 
+/// Git variables in the caller's environment that would redirect git elsewhere (an index file,
+/// another repository) reach no git process: the planted ones keep every byte, and loadout's own
+/// clone advances with its own index.
+#[test]
+fn inherited_git_redirections_never_touch_another_index_or_repository() {
+    let machine = Machine::new(LOADOUT);
+    let clone = machine.clone();
+    let root = machine.home.parent().unwrap().to_path_buf();
+    let planted_index = root.join("planted-index");
+    fs::write(&planted_index, b"PLANTED-INDEX-BYTES").unwrap();
+    let planted_head = git(&machine.work, &["rev-parse", "HEAD"]);
+    machine.push("second\n");
+    let pushed = git(&machine.work, &["rev-parse", "HEAD"]);
+    assert_ne!(planted_head, pushed);
+
+    let output = machine
+        .command(&["update"])
+        .env("GIT_INDEX_FILE", &planted_index)
+        .env("GIT_DIR", machine.work.join(".git"))
+        .env("GIT_WORK_TREE", &machine.work)
+        .env("GIT_OBJECT_DIRECTORY", root.join("planted-objects"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(fs::read(&planted_index).unwrap(), b"PLANTED-INDEX-BYTES");
+    assert!(!root.join("planted-objects").exists());
+    assert_eq!(git(&machine.work, &["rev-parse", "HEAD"]), pushed);
+    assert_eq!(
+        git(&clone, &["rev-parse", "HEAD"]),
+        pushed,
+        "the clone must advance"
+    );
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--untracked-files=all"]),
+        "",
+        "the clone's own index must match its new commit"
+    );
+    assert_eq!(machine.notes().as_deref(), Some("second\n"));
+}
+
 #[test]
 fn a_dirty_clone_blocks_update_and_nothing_is_applied() {
     let machine = Machine::new(LOADOUT);
@@ -367,7 +407,7 @@ fn fake_git(dir: &Path) -> PathBuf {
     fs::write(
         bin.join("git"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" >> '{}'\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" \"index=$GIT_INDEX_FILE dir=$GIT_DIR\" >> '{}'\nexit 1\n",
             log.display()
         ),
     )
@@ -386,6 +426,8 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
     let output = machine
         .command(&["update"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GIT_INDEX_FILE", root.join("planted-index"))
+        .env("GIT_DIR", root.join("planted-repo"))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
@@ -404,4 +446,10 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
     assert!(first.contains("core.fsmonitor=false"), "{log}");
     assert!(first.contains("symbolic-ref"), "{log}");
     assert!(log.contains("prompt=0"), "local reads never prompt: {log}");
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("index="))
+            .all(|line| line == "index= dir="),
+        "no inherited index or repository may reach git: {log}"
+    );
 }
