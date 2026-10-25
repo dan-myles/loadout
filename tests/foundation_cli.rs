@@ -66,7 +66,8 @@ fn help_lists_only_working_commands() {
     assert!(help.contains("rollback"), "{help}");
     assert!(help.contains("plan"), "{help}");
     assert!(help.contains("apply"), "{help}");
-    for future in ["update", "service", "init"] {
+    assert!(help.contains("init"), "{help}");
+    for future in ["update", "service"] {
         assert!(
             !help
                 .lines()
