@@ -5,11 +5,29 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use loadout::context::Context;
 use loadout::platform::Os;
 use loadout::state;
 use loadout::sync::{self, Blocked, Error, Fetched};
+
+/// The state lock, taken once no other process holds it. When this test just dropped an earlier
+/// lock, a child that another test thread is starting can hold a copy of that lock's descriptor
+/// until it execs, so this waits up to 5 seconds for `state::busy` to clear before taking the
+/// lock. Still held then, or any error, fails the test.
+fn relock(context: &Context) -> state::Lock {
+    let until = Instant::now() + Duration::from_secs(5);
+    while state::busy(context).unwrap() {
+        assert!(
+            Instant::now() < until,
+            "the state lock is still held 5 seconds later"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    state::lock(context).unwrap()
+}
 
 /// Runs git in `dir` with a fixed identity and no signing, and returns its stdout.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -98,13 +116,13 @@ impl Scratch {
     }
 
     fn clone(&self) -> PathBuf {
-        let lock = state::lock(&self.context).unwrap();
+        let lock = relock(&self.context);
         sync::clone(&self.url(), &self.context, &lock).unwrap();
         sync::checkout(&self.context)
     }
 
     fn fetch(&self) -> Fetched {
-        let lock = state::lock(&self.context).unwrap();
+        let lock = relock(&self.context);
         sync::fetch(&self.context, &lock).unwrap()
     }
 
@@ -158,7 +176,7 @@ fn a_url_carrying_a_credential_is_refused_before_anything_is_written() {
         "http://SENTINELtoken@example.invalid/loadout.git",
     ] {
         let scratch = Scratch::new();
-        let lock = state::lock(&scratch.context).unwrap();
+        let lock = relock(&scratch.context);
         let error = sync::clone(url, &scratch.context, &lock).unwrap_err();
         assert!(matches!(error, Error::Credential), "{url}: {error}");
         for shown in [
@@ -185,7 +203,7 @@ fn an_existing_clone_is_never_overwritten() {
     let scratch = Scratch::new();
     let clone = scratch.clone();
     fs::write(clone.join("marker"), "mine").unwrap();
-    let lock = state::lock(&scratch.context).unwrap();
+    let lock = relock(&scratch.context);
     let error = sync::clone(&scratch.url(), &scratch.context, &lock).unwrap_err();
     assert!(matches!(error, Error::Exists { .. }), "{error}");
     assert_eq!(fs::read_to_string(clone.join("marker")).unwrap(), "mine");
@@ -194,7 +212,7 @@ fn an_existing_clone_is_never_overwritten() {
 #[test]
 fn a_failed_clone_leaves_no_temporary_folder() {
     let scratch = Scratch::new();
-    let lock = state::lock(&scratch.context).unwrap();
+    let lock = relock(&scratch.context);
     let missing = format!("{}-missing", scratch.url());
     assert!(sync::clone(&missing, &scratch.context, &lock).is_err());
     let left: Vec<_> = fs::read_dir(&scratch.context.state)
@@ -337,7 +355,7 @@ fn a_linked_clone_is_refused() {
     let elsewhere = scratch.context.state.parent().unwrap().join("elsewhere");
     fs::rename(&clone, &elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &clone).unwrap();
-    let lock = state::lock(&scratch.context).unwrap();
+    let lock = relock(&scratch.context);
     let error = sync::fetch(&scratch.context, &lock).unwrap_err();
     assert!(matches!(error, Error::NotAClone { .. }), "{error}");
 }
@@ -347,7 +365,7 @@ fn the_lock_of_another_state_dir_is_refused() {
     let scratch = Scratch::new();
     scratch.clone();
     let other = Scratch::new();
-    let foreign = state::lock(&other.context).unwrap();
+    let foreign = relock(&other.context);
     let error = sync::fetch(&scratch.context, &foreign).unwrap_err();
     assert!(
         matches!(error, Error::State(state::Error::WrongLock { .. })),

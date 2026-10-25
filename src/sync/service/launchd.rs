@@ -3,6 +3,7 @@
 //! deadline is the run's only bound. The arguments are a plist array, never a joined command
 //! line; each is XML-escaped.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::context::Context;
@@ -19,11 +20,13 @@ pub(super) fn file(context: &Context) -> PathBuf {
         .join(format!("{LABEL}.plist"))
 }
 
-fn plist(exe: &str, service: &str, interval_minutes: u32) -> String {
-    let arguments: String = [exe, "update", "--background", "--service", service]
+pub(super) fn plist(exe: &str, service: &str, interval_minutes: u32) -> String {
+    let arguments = [exe, "update", "--background", "--service", service]
         .iter()
-        .map(|arg| format!("\t\t<string>{}</string>\n", xml(arg)))
-        .collect();
+        .fold(String::new(), |mut out, arg| {
+            let _ = writeln!(out, "\t\t<string>{}</string>", xml(arg));
+            out
+        });
     let seconds = u64::from(interval_minutes) * 60;
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -136,16 +139,65 @@ fn not_loaded(answer: &crate::process::Captured) -> bool {
         || answer.stderr.contains("Could not find specified service")
 }
 
-/// How the plist differs from the one `install` would write for this record, if it does.
+/// How the agent differs from the one `install` would load for this record, if it does: first
+/// the plist on disk, then (outside isolation) the program arguments launchd has loaded, since a
+/// matching plist proves nothing about an agent loaded before it was written. A plist that can't
+/// be read, or a launchd that can't be asked, is an error, never a match.
 pub(super) fn differs(
     context: &Context,
     exe: &str,
     service: &str,
     interval_minutes: u32,
-) -> Option<String> {
-    let actual = super::definition(&file(context))?;
-    (actual != plist(exe, service, interval_minutes))
-        .then(|| super::differs_from_record(&format!("{LABEL}.plist")))
+) -> Result<Option<String>, String> {
+    let Some(actual) = super::definition(&file(context))? else {
+        return Ok(None);
+    };
+    if actual != plist(exe, service, interval_minutes) {
+        return Ok(Some(super::differs_from_record(&format!("{LABEL}.plist"))));
+    }
+    if context.isolated {
+        return Ok(None);
+    }
+    let owned = super::Private::Service.path(context);
+    let job = format!(
+        "{}/{LABEL}",
+        domain(&owned).map_err(|error| error.to_string())?
+    );
+    let args = ["print", job.as_str()];
+    let answer = query(context, "launchctl", &args).map_err(|error| error.to_string())?;
+    if !answer.success() {
+        if not_loaded(&answer) {
+            return Ok(None);
+        }
+        return Err(failed("launchctl", &args, &answer).to_string());
+    }
+    let expected = [exe, "update", "--background", "--service", service];
+    match arguments(&answer.stdout) {
+        Some(loaded) if loaded == expected => Ok(None),
+        Some(loaded) => Ok(Some(format!(
+            "launchd has {LABEL} loaded with other arguments ({}); the job it runs is not this record's",
+            loaded.join(" ")
+        ))),
+        None => Err(format!(
+            "`launchctl {}` didn't list the agent's arguments",
+            args.join(" ")
+        )),
+    }
+}
+
+/// The program arguments in `launchctl print`'s answer: one per line between `arguments = {` and
+/// its closing `}`, indented with tabs.
+fn arguments(printed: &str) -> Option<Vec<&str>> {
+    let mut lines = printed.lines();
+    lines.find(|line| line.trim() == "arguments = {")?;
+    let mut found = Vec::new();
+    for line in lines {
+        if line.trim() == "}" {
+            return Some(found);
+        }
+        found.push(line.trim_start_matches('\t'));
+    }
+    None
 }
 
 pub(super) fn registered(context: &Context, owned: &Path) -> Scheduler {

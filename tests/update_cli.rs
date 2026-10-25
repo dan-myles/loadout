@@ -7,11 +7,29 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use loadout::context::Context;
 use loadout::platform::Os;
 use loadout::state;
 use loadout::sync;
+
+/// The state lock, taken once no other process holds it. When this test just dropped an earlier
+/// lock, a child that another test thread is starting can hold a copy of that lock's descriptor
+/// until it execs, so this waits up to 5 seconds for `state::busy` to clear before taking the
+/// lock. Still held then, or any error, fails the test.
+fn relock(context: &Context) -> state::Lock {
+    let until = Instant::now() + Duration::from_secs(5);
+    while state::busy(context).unwrap() {
+        assert!(
+            Instant::now() < until,
+            "the state lock is still held 5 seconds later"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    state::lock(context).unwrap()
+}
 
 const LOADOUT: &str = "[loadout]\nversion = 1\n\
                        [files.notes]\nsource = \"files/notes\"\ntarget = \"~/notes.md\"\n";
@@ -99,7 +117,7 @@ impl Machine {
     /// Loadout's clone, made the way `init` makes it.
     fn clone(&self) -> PathBuf {
         let context = self.context();
-        let lock = state::lock(&context).unwrap();
+        let lock = relock(&context);
         let path = self.remote.to_str().unwrap().replace('\\', "/");
         let url = if path.starts_with('/') {
             format!("file://{path}")
@@ -223,7 +241,7 @@ fn an_interrupted_run_blocks_update_before_the_fetch() {
     let machine = Machine::new(LOADOUT);
     let clone = machine.clone();
     let context = machine.context();
-    let lock = state::lock(&context).unwrap();
+    let lock = relock(&context);
     let run = state::Run::begin(
         &context,
         &clone,
@@ -371,6 +389,33 @@ fn a_background_run_is_supervised_applies_and_leaves_its_records() {
     assert!(text(&status).contains("background"), "{}", text(&status));
 }
 
+/// A worker whose run succeeded, but whose output the supervisor can't save (a folder is where
+/// `worker.log` goes): the supervisor fails, and its record keeps that failure, so status never
+/// reports the run as a clean, healthy one.
+#[test]
+fn a_worker_log_that_cannot_be_saved_fails_the_run_and_its_record() {
+    let machine = Machine::new(LOADOUT);
+    machine.clone();
+    machine.push("second\n");
+    fs::create_dir_all(machine.state.join("background").join("worker.log")).unwrap();
+    let output = machine.run(&["update", "--background"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+
+    let supervisor = machine.record("supervisor.json");
+    assert_eq!(supervisor["outcome"], "exited", "{supervisor}");
+    assert!(
+        supervisor["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("output could not be saved")),
+        "{supervisor}"
+    );
+    let run = machine.record("last-run.json");
+    assert_eq!(run["supervisor"], supervisor["run"], "{run}");
+
+    let status = machine.run(&["status"]);
+    assert_eq!(status.status.code(), Some(4), "{}", text(&status));
+}
+
 /// The scheduled job's route takes its `Context` from the service record alone: ambient
 /// overrides that `Context` would reject (relative paths) don't stop it, and it applies to the
 /// recorded home and state.
@@ -424,7 +469,7 @@ fn a_background_run_that_finds_the_lock_held_is_recorded_as_locked() {
     let machine = Machine::new(LOADOUT);
     machine.clone();
     machine.push("second\n");
-    let held = state::lock(&machine.context()).unwrap();
+    let held = relock(&machine.context());
     let output = machine.run(&["update", "--background"]);
     drop(held);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
@@ -513,8 +558,9 @@ fn doctor_reports_the_clone_the_service_and_the_background_run() {
     );
 }
 
-/// A fake `git` that records its argv and the prompt variables, then says the clone has no
-/// branch, so `update` stops at the first query.
+/// A fake `git` that records its argv, the prompt variables, the redirection variables and the
+/// transient configuration variables, then says the clone has no branch, so `update` stops at the
+/// first query.
 #[cfg(unix)]
 fn fake_git(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -524,7 +570,7 @@ fn fake_git(dir: &Path) -> PathBuf {
     fs::write(
         bin.join("git"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" \"index=$GIT_INDEX_FILE dir=$GIT_DIR\" >> '{}'\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" \"index=$GIT_INDEX_FILE dir=$GIT_DIR\" \"config=$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_VALUE_0 $GIT_CONFIG_PARAMETERS\" >> '{}'\nexit 1\n",
             log.display()
         ),
     )
@@ -545,6 +591,10 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("GIT_INDEX_FILE", root.join("planted-index"))
         .env("GIT_DIR", root.join("planted-repo"))
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "loadout-sentinel-helper")
+        .env("GIT_CONFIG_PARAMETERS", "'http.extraheader'='Sentinel'")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
@@ -569,4 +619,12 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
             .all(|line| line == "index= dir="),
         "no inherited index or repository may reach git: {log}"
     );
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("config="))
+            .all(|line| line
+                == "config=1 credential.helper loadout-sentinel-helper 'http.extraheader'='Sentinel'"),
+        "the caller's transient git configuration reaches git unchanged: {log}"
+    );
+    assert!(log.contains("config=1"), "{log}");
 }

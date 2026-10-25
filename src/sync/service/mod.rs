@@ -25,7 +25,7 @@ use crate::context::{self, Context, STATE_OVERRIDE};
 use crate::diagnostic::{Check, CheckStatus};
 use crate::manifest::MIN_INTERVAL_MINUTES;
 use crate::platform::Os;
-use crate::process::{self, Captured, Invocation};
+use crate::process::{self, Captured, Invocation, Output};
 use crate::state::{self, Private};
 
 /// The Windows launcher's file stem. It sits beside `loadout.exe` and is what the Scheduled
@@ -350,7 +350,8 @@ pub struct Scheduler {
 pub struct Status {
     /// `service.toml`, when it could be read.
     pub recorded: Option<Recorded>,
-    /// Why `service.toml` couldn't be used, when it exists.
+    /// Why `service.toml` couldn't be used, when it exists, or why the installed job couldn't be
+    /// checked against it (a definition that can't be read, a scheduler query that failed).
     pub problem: Option<String>,
     pub files: Vec<File>,
     /// `None` under isolation, where the scheduler is never asked.
@@ -449,9 +450,17 @@ pub fn status(context: &Context) -> Result<Status, Error> {
             .and_then(fs::canonicalize)
             .is_ok_and(|current| current == recorded.exe)
     });
-    let mismatch = match (&recorded, &problem) {
-        (Some(recorded), None) => mismatch(context, recorded),
-        _ => None,
+    let (mismatch, problem) = match (&recorded, problem) {
+        (Some(recorded), None) => match mismatch(context, recorded) {
+            Ok(mismatch) => (mismatch, None),
+            Err(unverified) => (
+                None,
+                Some(format!(
+                    "cannot check the installed job against service.toml: {unverified}"
+                )),
+            ),
+        },
+        (_, problem) => (None, problem),
     };
     let advice = recorded
         .as_ref()
@@ -507,34 +516,41 @@ fn program(os: Os, exe: &Path) -> PathBuf {
     }
 }
 
-/// How the installed definition differs from the one `recorded` would install for `context`.
-/// Read-only: local definitions are read only when they are regular files, and the Windows task
-/// is read back from Task Scheduler (never under isolation).
-fn mismatch(context: &Context, recorded: &Recorded) -> Option<String> {
+/// How the installed job differs from the one `recorded` would install for `context`: `Ok(None)`
+/// only when everything checked matches, `Err` when something couldn't be checked. Read-only:
+/// local definitions are read only when they are regular files, and outside isolation the job
+/// the scheduler actually has is read back too (systemd's loaded units, launchd's loaded agent,
+/// the registered Windows task).
+fn mismatch(context: &Context, recorded: &Recorded) -> Result<Option<String>, String> {
     let program = program(context.os, &recorded.exe);
     if context.os == Os::Windows && !fs::metadata(&program).is_ok_and(|metadata| metadata.is_file())
     {
-        return Some(Error::MissingLauncher { path: program }.to_string());
+        return Ok(Some(Error::MissingLauncher { path: program }.to_string()));
     }
     let service = Private::Service.path(context);
     let (Ok(program), Ok(service)) = (safe(&program), safe(&service)) else {
-        return Some("the recorded paths can't be written into a scheduler file".to_owned());
+        return Ok(Some(
+            "the recorded paths can't be written into a scheduler file".to_owned(),
+        ));
     };
     let interval = recorded.interval_minutes;
     match context.os {
         Os::Linux => systemd::differs(context, program, service, interval),
         Os::Macos => launchd::differs(context, program, service, interval),
-        Os::Windows if context.isolated => None,
+        Os::Windows if context.isolated => Ok(None),
         Os::Windows => schtasks::differs(context, program, service, interval),
     }
 }
 
-/// The contents of a local definition, when it is a regular file.
-fn definition(path: &Path) -> Option<String> {
-    fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file())
-        .then(|| fs::read_to_string(path).ok())
-        .flatten()
+/// The contents of a local definition: `None` when it isn't a regular file (absent, a folder, a
+/// link, which `Status::files` reports), and an error when a regular one can't be read as text.
+fn definition(path: &Path) -> Result<Option<String>, String> {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(None);
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
 
 /// The answer for a definition that isn't the one this record would install.
@@ -698,6 +714,19 @@ fn query(context: &Context, program: &str, args: &[&str]) -> Result<Captured, Er
     })
 }
 
+/// `query`, with the scheduler's answer as the exact bytes it wrote.
+fn query_output(context: &Context, program: &str, args: &[&str]) -> Result<Output, Error> {
+    let path = locate(program).ok_or_else(|| Error::Scheduler {
+        command: program.to_owned(),
+        detail: "it is not on PATH".to_owned(),
+    })?;
+    let invocation = Invocation::new(&path, args.iter().copied());
+    process::query_output(&invocation, &context.containment).map_err(|error| Error::Scheduler {
+        command: invocation.display(),
+        detail: error.to_string(),
+    })
+}
+
 /// A scheduler command that must succeed.
 fn required(context: &Context, program: &str, args: &[&str]) -> Result<Captured, Error> {
     let captured = query(context, program, args)?;
@@ -742,6 +771,7 @@ pub(super) mod fake {
         static TOOLS: RefCell<BTreeMap<String, PathBuf>> = const { RefCell::new(BTreeMap::new()) };
     }
 
+    #[cfg(unix)]
     pub(super) fn set(program: &str, path: PathBuf) {
         TOOLS.with(|tools| tools.borrow_mut().insert(program.to_owned(), path));
     }
@@ -944,7 +974,7 @@ mod tests {
     #[test]
     fn unknown_fields_and_other_versions_are_refused() {
         let text = toml::to_string(&recorded(Path::new("/s"))).unwrap();
-        assert!(parse(format!("{text}token = \"x\"\n").as_bytes()).is_err());
+        assert!(parse(format!("token = \"x\"\n{text}").as_bytes()).is_err());
         assert!(parse(text.replace("version = 1", "version = 2").as_bytes()).is_err());
         assert!(parse(b"\xff").is_err());
     }
@@ -1062,14 +1092,16 @@ mod tests {
             fs::read_to_string(self.dir.path().join(format!("{program}.log"))).unwrap_or_default()
         }
 
-        fn plant(&self, path: &Path) {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "planted").unwrap();
-        }
-
         fn record(&self) {
             state::write_private(&self.context, Private::Service, b"version = 1\n").unwrap();
         }
+    }
+
+    /// Puts a file at `path`, creating its folders.
+    #[cfg(unix)]
+    fn plant(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "planted").unwrap();
     }
 
     #[cfg(unix)]
@@ -1098,7 +1130,7 @@ mod tests {
 
         let units = systemd::files(&fakes.context);
         for unit in &units {
-            fakes.plant(unit);
+            plant(unit);
         }
         fakes.tool(
             "systemctl",
@@ -1130,6 +1162,56 @@ mod tests {
         assert!(calls.contains("--user daemon-reload"), "{calls}");
     }
 
+    /// Removal follows what systemd has loaded, not which unit files remain: a service file
+    /// without its timer file still has a loaded timer stopped, and a user manager that can't be
+    /// reached is a failure that keeps `service.toml`, never an absence.
+    #[cfg(unix)]
+    #[test]
+    fn systemd_uninstall_stops_a_loaded_timer_whatever_files_remain() {
+        let fakes = Fakes::new(Os::Linux);
+        let [service, timer] = [
+            systemd::files(&fakes.context)[0].clone(),
+            systemd::files(&fakes.context)[1].clone(),
+        ];
+        plant(&service);
+        fakes.tool("systemctl", "case \"$2\" in show) echo loaded;; esac");
+        systemd::uninstall(&fakes.context).unwrap();
+        let calls = fakes.calls("systemctl");
+        assert!(
+            calls.contains("--user stop loadout-update.timer"),
+            "the loaded timer is stopped though its file is gone: {calls}"
+        );
+        assert!(!calls.contains("disable"), "{calls}");
+        assert!(calls.contains("--user daemon-reload"), "{calls}");
+        assert!(!service.exists() && !timer.exists());
+
+        plant(&service);
+        fakes.tool(
+            "systemctl",
+            "case \"$2\" in show) echo loaded;; stop) echo 'Failed to stop: Access denied' >&2; exit 1;; esac",
+        );
+        let error = systemd::uninstall(&fakes.context).unwrap_err();
+        assert!(error.to_string().contains("Access denied"), "{error}");
+        assert!(service.exists(), "nothing is removed when the stop fails");
+
+        fs::remove_file(&service).unwrap();
+        fakes.record();
+        let record = Private::Service.path(&fakes.context);
+        fakes.tool(
+            "systemctl",
+            "echo 'Failed to connect to bus: No medium found' >&2; exit 1",
+        );
+        assert!(matches!(
+            systemd::uninstall(&fakes.context),
+            Err(Error::NoUserSession(_))
+        ));
+        assert!(uninstall(&fakes.context).is_err());
+        assert!(
+            record.exists(),
+            "an unreachable manager is not an absent timer, so service.toml stays"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn launchd_uninstall_tells_an_unloaded_agent_from_a_failure() {
@@ -1157,7 +1239,7 @@ mod tests {
         assert!(launchd::uninstall(&fakes.context).is_err());
 
         let plist = launchd::file(&fakes.context);
-        fakes.plant(&plist);
+        plant(&plist);
         fakes.tool(
             "launchctl",
             "echo 'Boot-out failed: 5: Input/output error' >&2; exit 5",
@@ -1173,7 +1255,7 @@ mod tests {
         launchd::uninstall(&fakes.context).unwrap();
         assert!(!plist.exists(), "an unloaded agent's plist is removed");
 
-        fakes.plant(&plist);
+        plant(&plist);
         fakes.tool("launchctl", "exit 0");
         launchd::uninstall(&fakes.context).unwrap();
         assert!(!plist.exists());
@@ -1254,7 +1336,7 @@ mod tests {
     #[test]
     fn status_reports_a_job_installed_for_another_record_as_a_mismatch() {
         let fakes = Fakes::new(Os::Linux);
-        fakes.tool("systemctl", SYSTEMD_RUNNING);
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "no"));
         let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
         let exe_text = exe.to_str().unwrap();
         record_for(&fakes, &exe);
@@ -1264,7 +1346,7 @@ mod tests {
         ];
         let own = Private::Service.path(&fakes.context);
         let write_units = |exe: &str, record: &str| {
-            fakes.plant(&service);
+            plant(&service);
             fs::write(&service, systemd::service_unit(exe, record)).unwrap();
             fs::write(&timer, systemd::timer_unit(60)).unwrap();
         };
@@ -1303,10 +1385,173 @@ mod tests {
         );
     }
 
-    /// A fake `systemctl` with a running user manager and the timer enabled.
+    /// Matching unit files on disk are not enough: systemd must run them. A unit changed on
+    /// disk since systemd loaded it (a reinstall whose reload failed), or loaded from another
+    /// file, is a mismatch; a unit file that can't be read, or a systemd that can't say what it
+    /// loaded, can't be checked, and neither is ever healthy.
     #[cfg(unix)]
-    const SYSTEMD_RUNNING: &str =
-        "case \"$2\" in is-system-running) echo running;; is-enabled) echo enabled;; esac";
+    #[test]
+    fn systemd_status_checks_the_loaded_units_not_only_the_files() {
+        let fakes = Fakes::new(Os::Linux);
+        let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
+        record_for(&fakes, &exe);
+        let own = Private::Service.path(&fakes.context);
+        let units = systemd::files(&fakes.context);
+        plant(&units[0]);
+        fs::write(
+            &units[0],
+            systemd::service_unit(exe.to_str().unwrap(), own.to_str().unwrap()),
+        )
+        .unwrap();
+        fs::write(&units[1], systemd::timer_unit(60)).unwrap();
+
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "no"));
+        let matching = status(&fakes.context).unwrap();
+        assert!(matching.healthy(), "{}", describe(&matching));
+        assert!(
+            fakes.calls("systemctl").contains("NeedDaemonReload"),
+            "{}",
+            fakes.calls("systemctl")
+        );
+
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "yes"));
+        let stale = status(&fakes.context).unwrap();
+        assert!(!stale.healthy(), "{}", describe(&stale));
+        assert!(
+            describe(&stale).contains("changed on disk since systemd loaded it"),
+            "{}",
+            describe(&stale)
+        );
+
+        let elsewhere = systemd_running(&fakes.context, "no").replace(
+            &format!("FragmentPath={}", units[0].display()),
+            "FragmentPath=/etc/systemd/user/loadout-update.service",
+        );
+        fakes.tool("systemctl", &elsewhere);
+        let other = status(&fakes.context).unwrap();
+        assert!(!other.healthy(), "{}", describe(&other));
+        assert!(
+            describe(&other).contains("/etc/systemd/user"),
+            "{}",
+            describe(&other)
+        );
+
+        fakes.tool(
+            "systemctl",
+            "case \"$2\" in is-enabled) echo enabled;; show) echo 'Access denied' >&2; exit 1;; esac",
+        );
+        let unasked = status(&fakes.context).unwrap();
+        assert!(!unasked.healthy(), "{}", describe(&unasked));
+        assert!(
+            describe(&unasked).contains("cannot check the installed job"),
+            "{}",
+            describe(&unasked)
+        );
+
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "no"));
+        fs::write(&units[1], b"[Timer]\n\xff\n").unwrap();
+        let unreadable = status(&fakes.context).unwrap();
+        assert!(!unreadable.healthy(), "{}", describe(&unreadable));
+        assert!(
+            describe(&unreadable).contains("cannot read"),
+            "{}",
+            describe(&unreadable)
+        );
+    }
+
+    /// The same for launchd: the plist on disk may match while launchd still runs an agent
+    /// loaded with other arguments.
+    #[cfg(unix)]
+    #[test]
+    fn launchd_status_checks_the_loaded_arguments_not_only_the_plist() {
+        let fakes = Fakes::new(Os::Macos);
+        let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
+        let exe_text = exe.to_str().unwrap();
+        record_for(&fakes, &exe);
+        let own = Private::Service.path(&fakes.context);
+        let own_text = own.to_str().unwrap();
+        let plist = launchd::file(&fakes.context);
+        plant(&plist);
+        fs::write(&plist, launchd::plist(exe_text, own_text, 60)).unwrap();
+        let printed = |exe: &str| {
+            format!(
+                "printf 'gui/501/dev.loadout.update = {{\\n\\targuments = {{\\n\\t\\t%s\\n\\t\\tupdate\\n\\t\\t--background\\n\\t\\t--service\\n\\t\\t%s\\n\\t}}\\n}}\\n' '{exe}' '{own_text}'"
+            )
+        };
+
+        fakes.tool("launchctl", &printed(exe_text));
+        let matching = status(&fakes.context).unwrap();
+        assert!(matching.healthy(), "{}", describe(&matching));
+
+        fakes.tool("launchctl", &printed("/opt/old/loadout"));
+        let stale = status(&fakes.context).unwrap();
+        assert!(!stale.healthy(), "{}", describe(&stale));
+        assert!(
+            describe(&stale).contains("/opt/old/loadout"),
+            "{}",
+            describe(&stale)
+        );
+
+        fakes.tool(
+            "launchctl",
+            "case \"$1\" in print) echo 'Operation not permitted' >&2; exit 1;; esac",
+        );
+        let unasked = status(&fakes.context).unwrap();
+        assert!(!unasked.healthy(), "{}", describe(&unasked));
+        assert!(
+            describe(&unasked).contains("cannot check the installed job"),
+            "{}",
+            describe(&unasked)
+        );
+    }
+
+    /// A registered Windows task whose definition can't be read back is never healthy, even
+    /// though the plain `/Query` finds it.
+    #[cfg(unix)]
+    #[test]
+    fn a_windows_task_that_cannot_be_read_back_is_not_healthy() {
+        let fakes = Fakes::new(Os::Windows);
+        let exe = fakes.dir.path().join("bin").join("loadout.exe");
+        plant(&exe);
+        plant(&exe.with_file_name(format!("{LAUNCHER}.exe")));
+        record_for(&fakes, &exe);
+        fakes.tool(
+            "schtasks",
+            "case \"$4\" in /XML) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
+        );
+        let status = status(&fakes.context).unwrap();
+        assert!(
+            status
+                .scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.registered)
+        );
+        assert!(!status.healthy(), "{}", describe(&status));
+        assert!(
+            describe(&status).contains("Access is denied"),
+            "{}",
+            describe(&status)
+        );
+    }
+
+    /// A fake `systemctl` with a running user manager, the timer enabled, and both units loaded
+    /// from their files in `context`'s unit folder with no drop-ins; `reload` is what `show` says
+    /// for `NeedDaemonReload`.
+    #[cfg(unix)]
+    fn systemd_running(context: &Context, reload: &str) -> String {
+        let units = systemd::files(context);
+        let shown = |unit: &Path| {
+            format!(
+                "LoadState=loaded\\nFragmentPath={}\\nDropInPaths=\\nNeedDaemonReload={reload}\\n",
+                unit.display()
+            )
+        };
+        format!(
+            "case \"$2\" in is-system-running) echo running;; is-enabled) echo enabled;; show) printf '{}\\n{}';; esac",
+            shown(&units[0]),
+            shown(&units[1])
+        )
+    }
 
     /// Read-only advice: the loadout's interval or `auto = false` against the record, no user
     /// session, linger off. None of it makes the job unhealthy, and doctor shows it as a warning.
@@ -1314,12 +1559,12 @@ mod tests {
     #[test]
     fn status_advises_on_changed_settings_and_the_linux_session() {
         let fakes = Fakes::new(Os::Linux);
-        fakes.tool("systemctl", SYSTEMD_RUNNING);
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "no"));
         let exe = env::current_exe().and_then(fs::canonicalize).unwrap();
         record_for(&fakes, &exe);
         let own = Private::Service.path(&fakes.context);
         let units = systemd::files(&fakes.context);
-        fakes.plant(&units[0]);
+        plant(&units[0]);
         fs::write(
             &units[0],
             systemd::service_unit(exe.to_str().unwrap(), own.to_str().unwrap()),
@@ -1327,7 +1572,7 @@ mod tests {
         .unwrap();
         fs::write(&units[1], systemd::timer_unit(60)).unwrap();
         let manifest = super::super::checkout(&fakes.context).join("loadout.toml");
-        fakes.plant(&manifest);
+        plant(&manifest);
 
         fs::write(
             &manifest,
@@ -1363,7 +1608,7 @@ mod tests {
         let advice = status(&fakes.context).unwrap().advice.join("\n");
         assert!(advice.contains("no systemd user session"), "{advice}");
 
-        fakes.tool("systemctl", SYSTEMD_RUNNING);
+        fakes.tool("systemctl", &systemd_running(&fakes.context, "no"));
         fakes.tool("loginctl", "echo no");
         let advice = status(&fakes.context).unwrap().advice.join("\n");
         assert!(advice.contains("linger is off"), "{advice}");
@@ -1381,7 +1626,7 @@ mod tests {
         let fakes = Fakes::new(Os::Windows);
         fakes.tool("schtasks", "exit 0");
         let exe = fakes.dir.path().join("bin").join("loadout.exe");
-        fakes.plant(&exe);
+        plant(&exe);
         record_for(&fakes, &exe);
         let status = status(&fakes.context).unwrap();
         let mismatch = status.mismatch.clone().unwrap_or_default();
@@ -1403,7 +1648,7 @@ mod tests {
             Os::Windows => Vec::new(),
         };
         for path in &planted {
-            fakes.plant(path);
+            plant(path);
         }
         fakes.tool("systemctl", "echo 'Access denied' >&2; exit 1");
         fakes.tool(

@@ -1,13 +1,15 @@
 //! The system `git`, always run with an argv array, never through a shell.
 //!
 //! Every call names its repository and work tree explicitly (`--git-dir`, `--work-tree`) and
-//! inherits none of `process::GIT_REDIRECTS` (`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
-//! `GIT_CONFIG_PARAMETERS`, ...), so nothing in the caller's environment can redirect it to
-//! another repository, index, or configuration. It runs with hooks pointed at a folder that
-//! never exists, no fsmonitor, no submodule recursion, and no `ext::` transport (a URL that would
-//! run a command). Local reads go through the bounded query path loadout uses for package
-//! managers. Clone, fetch and merge talk to the remote or change the checkout: in the foreground
-//! they inherit the terminal, so the user's credential helper or SSH key can ask for a
+//! inherits none of `process::GIT_REDIRECTS` (`GIT_INDEX_FILE`, `GIT_DIR`,
+//! `GIT_OBJECT_DIRECTORY`, ...), so nothing in the caller's environment can redirect it to
+//! another repository, index, or object store. The caller's transient configuration
+//! (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) is kept, since it can carry a credential helper
+//! or a URL rewrite; the `-c` settings below come after it and win. It runs with hooks pointed at
+//! a folder that never exists, no fsmonitor, no submodule recursion, and no `ext::` transport (a
+//! URL that would run a command). Local reads go through the bounded query path loadout uses for
+//! package managers. Clone, fetch and merge talk to the remote or change the checkout: in the
+//! foreground they inherit the terminal, so the user's credential helper or SSH key can ask for a
 //! passphrase; in a supervised background run they get no terminal and every prompt git and its
 //! helpers honour is turned off.
 
@@ -149,16 +151,7 @@ impl<'a> Git<'a> {
                 })
             }
         } else {
-            let mut command = Command::new(&self.program);
-            for name in process::GIT_REDIRECTS {
-                command.env_remove(name);
-            }
-            let status = command
-                .args(&all)
-                .env_remove(process::WORKER_NONCE)
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+            let status = foreground(&self.program, &all)
                 .status()
                 .map_err(|error| Error::Git {
                     action: action.clone(),
@@ -174,6 +167,22 @@ impl<'a> Git<'a> {
             }
         }
     }
+}
+
+/// A foreground clone, fetch or merge: on the terminal, so a credential helper or SSH key can
+/// ask, with none of `process::GIT_REDIRECTS` inherited.
+fn foreground(program: &Path, args: &[OsString]) -> Command {
+    let mut command = Command::new(program);
+    for name in process::GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    command
+        .args(args)
+        .env_remove(process::WORKER_NONCE)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
 }
 
 fn spawn_detail(error: &io::Error) -> String {
@@ -255,23 +264,49 @@ fn redact_text(text: &str) -> String {
 }
 
 fn userinfo(url: &str) -> Option<&str> {
-    match url.find("://") {
-        Some(scheme) => {
-            let rest = &url[scheme + 3..];
-            let authority = rest.find('/').map_or(rest, |slash| &rest[..slash]);
-            authority.rfind('@').map(|at| &authority[..at])
-        }
-        None => {
-            let at = url.find('@')?;
-            let colon = url.find(':')?;
-            (at < colon && !url.starts_with(['/', '.'])).then(|| &url[..at])
-        }
+    if let Some(scheme) = url.find("://") {
+        let rest = &url[scheme + 3..];
+        let authority = rest.find('/').map_or(rest, |slash| &rest[..slash]);
+        authority.rfind('@').map(|at| &authority[..at])
+    } else {
+        let at = url.find('@')?;
+        let colon = url.find(':')?;
+        (at < colon && !url.starts_with(['/', '.'])).then(|| &url[..at])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A foreground clone, fetch or merge loses every inherited redirection, but keeps the
+    /// caller's transient configuration (credential helper, extra headers, URL rewrites).
+    #[test]
+    fn foreground_git_keeps_transient_config_and_loses_redirections() {
+        let command = foreground(Path::new("git"), &[]);
+        let envs: Vec<_> = command.get_envs().collect();
+        let set = |name: &str| {
+            envs.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| *value)
+        };
+        for name in [
+            "GIT_INDEX_FILE",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+        ] {
+            assert_eq!(set(name), Some(None), "{name} is removed");
+        }
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert_eq!(set(name), None, "{name} is inherited untouched");
+        }
+    }
 
     #[test]
     fn a_password_in_the_url_is_found_in_every_url_form() {

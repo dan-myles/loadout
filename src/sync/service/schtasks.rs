@@ -4,8 +4,9 @@
 //! launcher beside `loadout.exe`, so no console window opens at each run; the launcher runs the
 //! same supervisor as `loadout update --background`.
 
-use super::{Error, LAUNCHER, Scheduler, failed, query, required, xml};
+use super::{Error, LAUNCHER, Scheduler, failed, query, query_output, required, xml};
 use crate::context::Context;
+use crate::process::Captured;
 use crate::state::{self, Private};
 
 const NAME: &str = "Loadout Update";
@@ -144,55 +145,156 @@ pub(super) fn uninstall(context: &Context) -> Result<(), Error> {
     Ok(())
 }
 
-fn not_running(answer: &crate::process::Captured) -> bool {
+fn not_running(answer: &Captured) -> bool {
     let said = format!("{} {}", answer.stdout, answer.stderr);
     said.contains("not running") || said.contains("no running instance")
 }
 
-fn not_found(answer: &crate::process::Captured) -> bool {
+fn not_found(answer: &Captured) -> bool {
     answer.stderr.contains("cannot find") || answer.stdout.contains("cannot find")
 }
 
 /// How the registered task differs from the one `install` would register for this record, if
-/// it does: its command, arguments, or interval, read back from Task Scheduler. A task that
-/// can't be read here is left to `registered`.
-///
-/// `schtasks` may print the XML as UTF-16; its NUL bytes are dropped before reading, which
-/// keeps ASCII text exact. A path with other characters may then read as different, which is
-/// reported as a mismatch, never as a match.
+/// it does: its command, arguments, and interval, read back from Task Scheduler and compared as
+/// values. A task that isn't there is left to `registered`; one whose definition can't be read
+/// back or decoded is an error, never a match.
 pub(super) fn differs(
     context: &Context,
     launcher: &str,
     service: &str,
     interval_minutes: u32,
-) -> Option<String> {
-    let answer = query(context, "schtasks", &["/Query", "/TN", NAME, "/XML"]).ok()?;
-    if !answer.success() {
-        return None;
+) -> Result<Option<String>, String> {
+    let args = ["/Query", "/TN", NAME, "/XML"];
+    let answer = query_output(context, "schtasks", &args).map_err(|error| error.to_string())?;
+    if answer.code != Some(0) {
+        let answer = Captured::from(answer);
+        if not_found(&answer) {
+            return Ok(None);
+        }
+        return Err(failed("schtasks", &args, &answer).to_string());
     }
-    let text: String = answer
-        .stdout
-        .chars()
-        .filter(|character| *character != '\0' && *character != '\u{feff}')
+    compare(&answer.stdout, launcher, service, interval_minutes)
+}
+
+/// The task definition `schtasks /Query /XML` printed, against the one this record would
+/// register.
+fn compare(
+    bytes: &[u8],
+    launcher: &str,
+    service: &str,
+    interval_minutes: u32,
+) -> Result<Option<String>, String> {
+    let text = decode(bytes)?;
+    let arguments = format!("--service {}", argv_quote(service));
+    let same = element(&text, "Command")?.as_deref() == Some(launcher)
+        && element(&text, "Arguments")?.as_deref() == Some(arguments.as_str())
+        && element(&text, "Interval")?
+            .as_deref()
+            .and_then(seconds)
+            .is_some_and(|seconds| seconds == u64::from(interval_minutes) * 60);
+    Ok((!same).then(|| super::differs_from_record(&format!("the task {NAME}"))))
+}
+
+/// The task XML as text: UTF-16 (little- or big-endian, by its byte order mark, or without one
+/// when the second or first byte of its opening `<` is 0) or UTF-8, with or without a byte order
+/// mark. Nothing is replaced or dropped: anything else is an error.
+fn decode(bytes: &[u8]) -> Result<String, String> {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => from_utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => from_utf16(rest, u16::from_be_bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => from_utf8(rest),
+        [first, 0, ..] if *first != 0 => from_utf16(bytes, u16::from_le_bytes),
+        [0, second, ..] if *second != 0 => from_utf16(bytes, u16::from_be_bytes),
+        _ => from_utf8(bytes),
+    }
+}
+
+fn from_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("the task's XML is UTF-16 with an odd number of bytes".to_owned());
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| unit([pair[0], pair[1]]))
         .collect();
-    let element = |tag: &str| {
-        let open = format!("<{tag}>");
-        let start = text.find(&open)? + open.len();
-        let end = text[start..].find(&format!("</{tag}>"))? + start;
-        Some(text[start..end].to_owned())
+    String::from_utf16(&units).map_err(|_| "the task's XML is not valid UTF-16".to_owned())
+}
+
+fn from_utf8(bytes: &[u8]) -> Result<String, String> {
+    String::from_utf8(bytes.to_vec()).map_err(|_| "the task's XML is not valid UTF-8".to_owned())
+}
+
+/// The value of the one `<tag>` element, with its XML references resolved; `None` when there is
+/// none or more than one, which is not the task `install` registers.
+fn element(text: &str, tag: &str) -> Result<Option<String>, String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut found = text.match_indices(&open);
+    let (Some((start, _)), None) = (found.next(), found.next()) else {
+        return Ok(None);
     };
-    let expected = [
-        ("Command", xml(launcher)),
-        (
-            "Arguments",
-            xml(&format!("--service {}", argv_quote(service))),
-        ),
-        ("Interval", format!("PT{interval_minutes}M")),
-    ];
-    expected
-        .into_iter()
-        .any(|(tag, value)| element(tag).as_deref() != Some(value.as_str()))
-        .then(|| super::differs_from_record(&format!("the task {NAME}")))
+    let start = start + open.len();
+    let Some(end) = text[start..].find(&close) else {
+        return Ok(None);
+    };
+    unescape(&text[start..start + end]).map(Some)
+}
+
+/// XML text with its five named references and its numeric character references resolved.
+fn unescape(text: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let semicolon = after
+            .find(';')
+            .ok_or_else(|| "the task's XML has an unterminated reference".to_owned())?;
+        let name = &after[..semicolon];
+        let character = match name {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => name
+                .strip_prefix("#x")
+                .map(|hex| u32::from_str_radix(hex, 16))
+                .or_else(|| name.strip_prefix('#').map(str::parse::<u32>))
+                .and_then(Result::ok)
+                .and_then(char::from_u32),
+        };
+        out.push(
+            character.ok_or_else(|| format!("the task's XML has an unknown reference &{name};"))?,
+        );
+        rest = &after[semicolon + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// An `xs:duration` as Task Scheduler writes an interval (`PT15M`, `PT1H`, `P1DT2H`), in
+/// seconds; `None` for anything else.
+fn seconds(duration: &str) -> Option<u64> {
+    let rest = duration.strip_prefix('P')?;
+    let (date, time) = rest.split_once('T').unwrap_or((rest, ""));
+    let mut total: u64 = 0;
+    for (mut part, units) in [
+        (date, &[('D', 86_400)][..]),
+        (time, &[('H', 3_600), ('M', 60), ('S', 1)][..]),
+    ] {
+        for &(unit, scale) in units {
+            if let Some((number, after)) = part.split_once(unit) {
+                let value: u64 = number.parse().ok()?;
+                total = total.checked_add(value.checked_mul(scale)?)?;
+                part = after;
+            }
+        }
+        if !part.is_empty() {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 pub(super) fn registered(context: &Context) -> Scheduler {
@@ -269,6 +371,106 @@ mod tests {
             xml.contains("<Arguments>--service &quot;C:\\A B\\service.toml&quot;</Arguments>"),
             "{xml}"
         );
+    }
+
+    const UNICODE_LAUNCHER: &str =
+        r"C:\Users\José & Co\AppData\Local\Programs\loadout\loadout-background.exe";
+    const UNICODE_SERVICE: &str = r"C:\Users\José & Co\AppData\Local\loadout\service.toml";
+
+    fn unicode_task() -> String {
+        task_xml(UNICODE_LAUNCHER, UNICODE_SERVICE, 60)
+    }
+
+    fn checked(bytes: &[u8]) -> Result<Option<String>, String> {
+        compare(bytes, UNICODE_LAUNCHER, UNICODE_SERVICE, 60)
+    }
+
+    /// The task read back the way schtasks may print it, a user name that isn't ASCII, a space
+    /// and an `&` included: UTF-16 with or without a byte order mark, and UTF-8 with or without
+    /// one, all match.
+    #[test]
+    fn a_unicode_task_matches_in_every_encoding_schtasks_may_print() {
+        let text = unicode_task();
+        let le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let utf8_bom = [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat();
+        let be_bom = [&[0xFE, 0xFF][..], &be].concat();
+        for bytes in [
+            utf16(&text),
+            le,
+            be_bom,
+            be,
+            utf8_bom,
+            text.clone().into_bytes(),
+        ] {
+            assert_eq!(checked(&bytes), Ok(None));
+        }
+    }
+
+    /// Values are compared, not their XML spelling: a quote written literally or as a numeric
+    /// reference, and the interval written in hours, are the same task.
+    #[test]
+    fn equivalent_xml_spellings_are_the_same_task() {
+        let text = unicode_task();
+        assert!(text.contains("&quot;"), "{text}");
+        for spelling in [
+            text.replace("&quot;", "\""),
+            text.replace("&quot;", "&#34;"),
+            text.replace("&quot;", "&#x22;"),
+            text.replace("&amp;", "&#38;"),
+            text.replace("<Interval>PT60M</Interval>", "<Interval>PT1H</Interval>"),
+        ] {
+            assert_eq!(checked(spelling.as_bytes()), Ok(None), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn another_command_argument_or_interval_is_a_mismatch() {
+        let text = unicode_task();
+        for changed in [
+            task_xml(r"C:\Other\loadout-background.exe", UNICODE_SERVICE, 60),
+            task_xml(UNICODE_LAUNCHER, r"C:\Users\Jos\service.toml", 60),
+            task_xml(UNICODE_LAUNCHER, UNICODE_SERVICE, 30),
+            text.replace("<Arguments>", "<Arguments>--verbose "),
+            text.replace(
+                "<Interval>PT60M</Interval>",
+                "<Interval>PT1M60S</Interval>x",
+            ),
+            text.replace("<Command>", "<Command>C:"),
+            text.replace("</Exec>", "</Exec><Exec><Command>x</Command></Exec>"),
+            String::new(),
+        ] {
+            let found = checked(&utf16(&changed));
+            assert!(matches!(found, Ok(Some(_))), "{found:?}: {changed}");
+        }
+    }
+
+    /// Output that can't be decoded exactly is an error, never a match or a guess.
+    #[test]
+    fn malformed_task_output_is_an_error() {
+        let mut odd = utf16(&unicode_task());
+        odd.push(b'>');
+        let mut unpaired = vec![0xFF, 0xFE];
+        unpaired.extend(utf16("<Task>")[2..].iter().copied());
+        unpaired.extend([0x00, 0xD8]);
+        let latin1: Vec<u8> = unicode_task()
+            .chars()
+            .map(|character| u8::try_from(u32::from(character)).unwrap())
+            .collect();
+        let bad_reference = unicode_task().replace("&amp;", "&ampersand;");
+        for bytes in [odd, unpaired, latin1, bad_reference.into_bytes()] {
+            assert!(checked(&bytes).is_err(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn intervals_are_read_as_durations() {
+        assert_eq!(seconds("PT15M"), Some(900));
+        assert_eq!(seconds("PT1H"), Some(3_600));
+        assert_eq!(seconds("P1DT2H3M4S"), Some(93_784));
+        for bad in ["15M", "PT", "PTxM", "P1M", "PT1H2", "PT1M1H"] {
+            assert_eq!(seconds(bad).filter(|seconds| *seconds > 0), None, "{bad}");
+        }
     }
 
     #[test]
