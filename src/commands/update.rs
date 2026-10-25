@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
@@ -8,6 +8,7 @@ use crate::commands::apply as shown;
 use crate::context::Context;
 use crate::plan;
 use crate::process;
+use crate::release;
 use crate::state;
 use crate::sync::background::{self, LastRun, RunResult, Worker};
 use crate::sync::{self, Fetched, service};
@@ -105,7 +106,11 @@ fn foreground(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         mode: Mode::Interactive,
     };
     match apply::run_under_lock(context, &checkout, lock, options) {
-        Ok(report) => shown::print(&report),
+        Ok(report) => {
+            let exit = shown::print(&report)?;
+            self_update(context, &checkout, &report)?;
+            Ok(exit)
+        }
         Err(error) => shown::refused(error),
     }
 }
@@ -208,7 +213,20 @@ fn background_update(context: &Context, record: &mut LastRun) -> anyhow::Result<
     match apply::run_under_lock(context, &checkout, lock, options) {
         Ok(report) => {
             summarize(&report, record);
-            shown::print(&report)
+            let exit = shown::print(&report)?;
+            match self_update(context, &checkout, &report) {
+                Ok(line) => {
+                    if record.message.is_none() {
+                        record.message = line;
+                    }
+                    Ok(exit)
+                }
+                Err(error) => {
+                    record.result = RunResult::Failed;
+                    record.message = Some(format!("{error:#}"));
+                    Err(error)
+                }
+            }
         }
         Err(error) => {
             record.result = match &error {
@@ -222,6 +240,33 @@ fn background_update(context: &Context, record: &mut LastRun) -> anyhow::Result<
             shown::refused(error)
         }
     }
+}
+
+/// Self-update after an apply that ran to its report, when the loadout's resolved `[update] cli`
+/// is true (section 8). It never runs after a failed apply (already exit 1) or a cancelled one,
+/// so it starts no work in a run that is stopping and never hides the apply's exit. A skip
+/// (isolation, an unmanaged binary, no release, another install holding the folder) is shown
+/// and keeps the apply's exit; any other error fails the update. Returns the line it printed.
+fn self_update(
+    context: &Context,
+    checkout: &Path,
+    report: &Report,
+) -> anyhow::Result<Option<String>> {
+    if report.cancelled || report.failed() || !sync::settings(context, checkout)?.cli {
+        return Ok(None);
+    }
+    let line = match release::latest(context) {
+        Ok(None) => "cli: up to date".to_owned(),
+        Ok(Some(newer)) => match release::install(&newer) {
+            Ok(()) => format!("cli: updated {} to {}", newer.current(), newer.version()),
+            Err(error) if error.skipped() => format!("cli: not updated: {error}"),
+            Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
+        },
+        Err(error) if error.skipped() => format!("cli: not updated: {error}"),
+        Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
+    };
+    println!("{line}");
+    Ok(Some(line))
 }
 
 /// Counts and labels for `last-run.json`: how each action ended, and every action that didn't

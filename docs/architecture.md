@@ -1837,8 +1837,12 @@ Automatic updates are required, so they are on by default.
   `update` reads the latest public GitHub release with no token, verifies the asset's `.sha256`, and
   replaces itself. A binary from `cargo install` or a package manager is never replaced; doctor
   reports how the CLI was installed. As built in `src/release/`:
-  - **Calling it.** After its apply, `update` calls `release::latest(context)`, then
-    `release::install(&release)` on `Some`.
+  - **Calling it.** In the foreground and in the background worker alike, `update` calls
+    `release::latest(context)` after an apply that ran to its report, then
+    `release::install(&release)` on `Some`. It doesn't run after an apply that failed (exit 1
+    stands) or was cancelled, or when the resolved `[update] cli` is false. A skip is printed as
+    `cli: not updated: <reason>` and keeps the apply's exit; any other error fails `update` with
+    exit 1, and a background run records it as `failed` in `last-run.json`.
   - **Newer only.** `Some` means a release strictly newer than the running CLI; `None` means none
     is offered. The release tag comes from the `releases/latest` redirect.
   - **Skips.** `Error::skipped()` covers LOADOUT_HOME isolation, a binary without a matching
