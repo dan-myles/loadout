@@ -156,8 +156,9 @@ fn not_found(answer: &Captured) -> bool {
 
 /// How the registered task differs from the one `install` would register for this record, if
 /// it does: its command, arguments, and interval, read back from Task Scheduler and compared as
-/// values. A task that isn't there is left to `registered`; one whose definition can't be read
-/// back or decoded is an error, never a match.
+/// values. A task Task Scheduler can't find when its definition is read is a mismatch, even if
+/// an earlier query found it; one whose definition can't be read back or decoded is an error.
+/// Neither is ever a match.
 pub(super) fn differs(
     context: &Context,
     launcher: &str,
@@ -169,7 +170,9 @@ pub(super) fn differs(
     if answer.code != Some(0) {
         let answer = Captured::from(answer);
         if not_found(&answer) {
-            return Ok(None);
+            return Ok(Some(format!(
+                "Task Scheduler has no task {NAME} to read back"
+            )));
         }
         return Err(failed("schtasks", &args, &answer).to_string());
     }
@@ -210,13 +213,11 @@ fn decode(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn from_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
-    if !bytes.len().is_multiple_of(2) {
+    let (pairs, odd) = bytes.as_chunks::<2>();
+    if !odd.is_empty() {
         return Err("the task's XML is UTF-16 with an odd number of bytes".to_owned());
     }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| unit([pair[0], pair[1]]))
-        .collect();
+    let units: Vec<u16> = pairs.iter().copied().map(unit).collect();
     String::from_utf16(&units).map_err(|_| "the task's XML is not valid UTF-16".to_owned())
 }
 
