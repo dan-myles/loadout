@@ -40,18 +40,27 @@ foreach ($statement in $ast.EndBlock.Statements) {
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($call in (Get-Content -LiteralPath $CallsPath -Raw -Encoding UTF8 | ConvertFrom-Json)) {
     # '@owned' stands for the List[string] of owned staging names that Publish-Binaries updates.
+    # Its final contents are reported as 'owned', for calls that take it.
     $list = New-Object System.Collections.Generic.List[object]
+    $owned = $null
     foreach ($arg in @($call.args)) {
-        if ($arg -is [string] -and $arg -ceq '@owned') { $list.Add((New-Object System.Collections.Generic.List[string])) } else { $list.Add($arg) }
+        if ($arg -is [string] -and $arg -ceq '@owned') {
+            $owned = New-Object System.Collections.Generic.List[string]
+            $list.Add($owned)
+        } else {
+            $list.Add($arg)
+        }
     }
     $arguments = $list.ToArray()
     try {
         $value = & $call.fn @arguments
         if ($value -is [Uri]) { $value = $value.AbsoluteUri }
-        $results.Add([pscustomobject]@{ ok = $true; value = $value; error = $null })
+        $result = [pscustomobject]@{ ok = $true; value = $value; error = $null; owned = $null }
     } catch {
-        $results.Add([pscustomobject]@{ ok = $false; value = $null; error = $_.Exception.Message })
+        $result = [pscustomobject]@{ ok = $false; value = $null; error = $_.Exception.Message; owned = $null }
     }
+    if ($null -ne $owned) { $result.owned = [string[]]$owned.ToArray() }
+    $results.Add($result)
 }
 [IO.File]::WriteAllText($ResultsPath, (ConvertTo-Json -InputObject $results.ToArray() -Depth 6), (New-Object Text.UTF8Encoding($false)))
 """
@@ -442,6 +451,62 @@ class InstallPs1FunctionTest(unittest.TestCase):
                 for name in kept:
                     self.assertIn(name, results[1]["error"])
                 self.assertEqual((failed / ".loadout.install.toml.new.c").read_bytes(), b"new record")
+
+
+    def test_cleanup_roles_ignore_old_and_new_in_parent_folders(self):
+        # Valid parent folders such as an alice.old.home profile must not make destinations or
+        # restored binaries look like asides or staging files.
+        parents = ("alice.old.home", "build.new.tree")
+        cases = ("replace", "schema-1", "rollback")
+        layout = [(parent, case) for parent in parents for case in cases]
+
+        def build(directory):
+            calls = []
+            for parent, case in layout:
+                folder = directory / parent / case
+                folder.mkdir(parents=True)
+                if case != "schema-1":
+                    (folder / "loadout-background.exe").write_bytes(b"old launcher")
+                (folder / "loadout.exe").write_bytes(b"old main")
+                (folder / "loadout.install.toml").write_bytes(b"old record")
+                (folder / ".loadout.exe.old.keep").write_bytes(b"someone else's")
+                (folder / ".loadout-background.exe.new.a").write_bytes(b"new launcher")
+                if case != "rollback":
+                    (folder / ".loadout.exe.new.b").write_bytes(b"new main")
+                (folder / ".loadout.install.toml.new.c").write_bytes(b"new record")
+                pairs = [
+                    [str(folder / ".loadout-background.exe.new.a"), str(folder / "loadout-background.exe")],
+                    [str(folder / ".loadout.exe.new.b"), str(folder / "loadout.exe")],
+                ]
+                calls.append({"fn": "Publish-Install", "args": [
+                    "@owned", pairs, str(folder / ".loadout.install.toml.new.c"), str(folder / "loadout.install.toml")]})
+            return calls
+
+        outcomes = self.assert_outcomes(build, [case != "rollback" for _, case in layout])
+        for shell, (directory, _, results) in outcomes.items():
+            for (parent, case), result in zip(layout, results):
+                with self.subTest(shell=shell, parent=parent, case=case):
+                    folder = directory / parent / case
+                    names = sorted(path.name for path in folder.iterdir())
+                    self.assertEqual((folder / ".loadout.exe.old.keep").read_bytes(), b"someone else's")
+                    if case == "rollback":
+                        self.assertIn("previous ones are back", result["error"])
+                        self.assertEqual((folder / "loadout-background.exe").read_bytes(), b"old launcher")
+                        self.assertEqual((folder / "loadout.exe").read_bytes(), b"old main")
+                        self.assertEqual((folder / "loadout.install.toml").read_bytes(), b"old record")
+                        self.assertEqual((folder / ".loadout-background.exe.new.a").read_bytes(), b"new launcher")
+                        self.assertEqual(names, [".loadout-background.exe.new.a", ".loadout.exe.old.keep",
+                                                 ".loadout.install.toml.new.c", "loadout-background.exe",
+                                                 "loadout.exe", "loadout.install.toml"])
+                        # Only the staging file moved back is owned for cleanup, never a restored binary.
+                        self.assertEqual(result["owned"], [str(folder / ".loadout-background.exe.new.a")])
+                    else:
+                        self.assertEqual((folder / "loadout-background.exe").read_bytes(), b"new launcher")
+                        self.assertEqual((folder / "loadout.exe").read_bytes(), b"new main")
+                        self.assertEqual((folder / "loadout.install.toml").read_bytes(), b"new record")
+                        self.assertEqual(names, [".loadout.exe.old.keep", "loadout-background.exe",
+                                                 "loadout.exe", "loadout.install.toml"])
+                        self.assertEqual(result["owned"], [])
 
 
 class RuntimeIsolationControlTest(unittest.TestCase):

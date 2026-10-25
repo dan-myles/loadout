@@ -306,6 +306,9 @@ function Publish-StagedFile($Owned, [string]$Staged, [string]$Destination) {
 # first moved aside to `.<name>.old.<guid>`. If a later step fails, every completed move is undone
 # in reverse and the record is never touched. The binaries are not replaced as one atomic step.
 # Returns the aside paths this run made; the caller deletes them only once the record is in place.
+# Each move records its role when it is made, never inferred from path text, because any parent
+# folder may contain `.old.` or `.new.`: 'aside' moved an existing binary to its aside name,
+# 'staged' moved this run's staging file to the destination.
 function Publish-Binaries($Owned, [object[]]$Pairs) {
     $moves = New-Object Collections.Generic.List[object]
     try {
@@ -315,21 +318,22 @@ function Publish-Binaries($Owned, [object[]]$Pairs) {
             if (Test-Path -LiteralPath $dest) {
                 $aside = Join-Path (Split-Path -Parent $dest) (".$(Split-Path -Leaf $dest).old." + [Guid]::NewGuid().ToString('N'))
                 [IO.File]::Move($dest, $aside)
-                $moves.Add(@($dest, $aside))
+                $moves.Add([pscustomobject]@{ From = $dest; To = $aside; Role = 'aside' })
             }
             [IO.File]::Move($staged, $dest)
             [void]$Owned.Remove($staged)
-            $moves.Add(@($staged, $dest))
+            $moves.Add([pscustomobject]@{ From = $staged; To = $dest; Role = 'staged' })
         }
     } catch {
         $failure = $_.Exception.Message
         $restored = $true
         for ($index = $moves.Count - 1; $index -ge 0; $index--) {
-            $from = $moves[$index][0]
-            $to = $moves[$index][1]
+            $move = $moves[$index]
             try {
-                [IO.File]::Move($to, $from)
-                if ($from -like '*.new.*') { $Owned.Add($from) }
+                [IO.File]::Move($move.To, $move.From)
+                # A staging file moved back is this run's to clean up again. A binary moved back
+                # from its aside is the installed one, and never is.
+                if ($move.Role -ceq 'staged') { $Owned.Add($move.From) }
             } catch {
                 $restored = $false
             }
@@ -340,7 +344,7 @@ function Publish-Binaries($Owned, [object[]]$Pairs) {
         throw "could not put the new binaries in place, and the previous ones could not all be restored; reinstall with install.ps1 ($failure)"
     }
     foreach ($move in $moves) {
-        if ($move[1] -like '*.old.*') { $move[1] }
+        if ($move.Role -ceq 'aside') { $move.To }
     }
 }
 
