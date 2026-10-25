@@ -152,10 +152,22 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
             (record, None, 1)
         }
     };
-    save(context, &record)?;
-    if let Some(log) = log {
-        state::write_private(context, Private::WorkerLog, &log)?;
+    // The log is saved before the terminal record, and a log that can't be saved is that
+    // record's problem, so no record ever reports a run whose output was lost as clean.
+    let logged = log.map_or(Ok(()), |log| {
+        state::write_private(context, Private::WorkerLog, &log)
+    });
+    let mut record = record;
+    if let Err(error) = &logged {
+        let lost = format!("the worker's output could not be saved: {error}");
+        record.problem = Some(match record.problem.take() {
+            Some(problem) => format!("{problem}; {lost}"),
+            None => lost,
+        });
     }
+    let saved = save(context, &record);
+    logged?;
+    saved?;
     Ok(exit)
 }
 

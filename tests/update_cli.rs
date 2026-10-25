@@ -389,6 +389,33 @@ fn a_background_run_is_supervised_applies_and_leaves_its_records() {
     assert!(text(&status).contains("background"), "{}", text(&status));
 }
 
+/// A worker whose run succeeded, but whose output the supervisor can't save (a folder is where
+/// `worker.log` goes): the supervisor fails, and its record keeps that failure, so status never
+/// reports the run as a clean, healthy one.
+#[test]
+fn a_worker_log_that_cannot_be_saved_fails_the_run_and_its_record() {
+    let machine = Machine::new(LOADOUT);
+    machine.clone();
+    machine.push("second\n");
+    fs::create_dir_all(machine.state.join("background").join("worker.log")).unwrap();
+    let output = machine.run(&["update", "--background"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+
+    let supervisor = machine.record("supervisor.json");
+    assert_eq!(supervisor["outcome"], "exited", "{supervisor}");
+    assert!(
+        supervisor["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("output could not be saved")),
+        "{supervisor}"
+    );
+    let run = machine.record("last-run.json");
+    assert_eq!(run["supervisor"], supervisor["run"], "{run}");
+
+    let status = machine.run(&["status"]);
+    assert_eq!(status.status.code(), Some(4), "{}", text(&status));
+}
+
 /// The scheduled job's route takes its `Context` from the service record alone: ambient
 /// overrides that `Context` would reject (relative paths) don't stop it, and it applies to the
 /// recorded home and state.
