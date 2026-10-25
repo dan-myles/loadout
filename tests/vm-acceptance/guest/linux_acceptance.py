@@ -758,13 +758,27 @@ def interrupted(h, c6):
     for pid, _ in processes_matching("install pkg-cargo"):
         os.kill(pid, signal.SIGKILL)
     (FAKE_STATE / "hang").unlink()
-    h.run("G6-status-interrupted", [CLI, "status"], {4})
+    # v5 (standing 167): at H 21187ad a program is installed only after the run's journal is finished
+    # (src/apply/mod.rs:165-173), so killing a held install leaves a FINISHED run, not an interrupted
+    # one. These cases assert that behaviour. They are not interrupted-run gates and get no
+    # interrupted-recovery credit; the real-CLI interrupted-write gate is recorded as not run.
+    target = HOME / ".config/loadout-e2e/hello.txt"
+    h.run("G6-status-after-killed-install", [CLI, "status"], {0}, asserts=lambda code, text: [
+        ("no run reported interrupted", "interrupted" not in text.lower()),
+        ("the killed install never finished", not (FAKE_STATE / "cargo").exists())])
+    h.record("G6-interrupted-journal-gate", "not-run",
+             detail="UNEXERCISED: a killed held program install leaves a finished journal by design "
+                    "(apply/mod.rs:165-173); no real-CLI kill inside a journaled write is induced")
+    prior = read(target)
     c7 = commit("C7", {"files/hello.txt": hello("c7")})
-    h.run("G6-interrupted-blocks-update", [CLI, "update"], {4}, asserts=lambda code, text: [
-        ("nothing fetched", head() == c6)])
-    h.run("G6-rollback-interrupted", [CLI, "rollback"], {0})
+    h.run("G6-update-after-killed-install", [CLI, "update"], {0}, asserts=lambda code, text: [
+        ("fetched C7", head() == c7), ("file c7", read(target) == hello("c7")),
+        ("the program installed this time", (FAKE_STATE / "cargo").exists())])
+    h.run("G6-rollback-latest-finished-run", [CLI, "rollback"], {0}, asserts=lambda code, text: [
+        ("the C7 run's file is restored", read(target) == prior)])
     h.run("G6-update-after-rollback", [CLI, "update"], {0}, asserts=lambda code, text: [
-        ("clone at C7", head() == c7), ("cargo reinstalled", (FAKE_STATE / "cargo").exists())])
+        ("clone at C7", head() == c7), ("file c7 again", read(target) == hello("c7")),
+        ("cargo still installed", (FAKE_STATE / "cargo").exists())])
 
 
 def g7_background_by_hand(h):
@@ -995,6 +1009,17 @@ def planted_scratch(h):
         link.unlink()
 
 
+def names_cadence_change(text, requested, registered):
+    """v5 (standing 167): one line names the cadence the loadout now asks for ("N minutes"), the
+    cadence the job is registered with (M), and the repair (`service install`). Wording around them
+    is free; v4 looked for the literal word "interval", which the product does not print."""
+    for line in text.lower().splitlines():
+        if (re.search(r"\b%d minutes\b" % requested, line) and re.search(r"\b%d\b" % registered, line)
+                and "service install" in line):
+            return True
+    return False
+
+
 def changed_settings(h, service_toml):
     """v2, U8 R9/R10: the recorded route ignores a broken ambient Context; status and doctor
     name an interval the loadout changed after install."""
@@ -1003,9 +1028,11 @@ def changed_settings(h, service_toml):
     commit("C-interval 30", {"loadout.toml": manifest({"interval_minutes": "30"})})
     sh(["git", "-C", CLONE, "pull", "-q", "--ff-only"])
     h.run("G8-status-names-changed-interval", [CLI, "service", "status"], {0, 4}, observe=True,
-          asserts=lambda code, text: [("mentions the interval", "interval" in text.lower())])
+          asserts=lambda code, text: [("names requested 30, registered 15 and the reinstall",
+                                       names_cadence_change(text, 30, 15))])
     h.run("G8-doctor-names-changed-interval", [CLI, "doctor"], {0, 4}, observe=True,
-          asserts=lambda code, text: [("mentions the interval", "interval" in text.lower())])
+          asserts=lambda code, text: [("names requested 30, registered 15 and the reinstall",
+                                       names_cadence_change(text, 30, 15))])
     commit("C-interval 15", {"loadout.toml": manifest({"interval_minutes": "15"})})
     sh(["git", "-C", CLONE, "pull", "-q", "--ff-only"])
 
@@ -1115,7 +1142,7 @@ def unicode_job(h, service_toml):
         h.run(prefix + "-unicode-install", [copy, "service", "install"], {0})
         # A newly enabled job may start a run at once; let it end before driving one by hand.
         if IS_MAC:
-            wait_for(lambda: launchd_state()["state"] != "running", 900, 2)
+            launchd_drain()
         else:
             wait_for(lambda: unit_state(SERVICE).get("ActiveState") not in ("active", "activating"), 900, 2)
         native_formats(h, prefix + "-unicode-native-formats")
@@ -1151,23 +1178,107 @@ def partial_uninstall(h, service_toml):
         h.run("G8-status-after-%s" % case, [CLI, "service", "status", "--json"], {0, 4}, observe=True)
 
 
-def launchd_state():
-    out = sh(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], check=False)
-    state = re.search(r"(?m)^\s*state = (\S+)", out)
+def parse_launchd(out):
+    """v5 (standing 169): one `launchctl print` snapshot. state is the WHOLE value ("not running",
+    "running", "spawn scheduled", ...); v4 kept only its first word, so "not" and "spawn" both read as
+    finished."""
+    state = re.search(r"(?m)^\s*state = (.+?)\s*$", out)
     runs = re.search(r"(?m)^\s*runs = (\d+)", out)
-    last = re.search(r"last exit code = (\S+)", out)
+    last = re.search(r"(?m)^\s*last exit code = (-?\d+)", out)  # "(never exited)" is no code
+    pid = re.search(r"(?m)^\s*pid = (\d+)", out)
     return {"loaded": state is not None, "state": state.group(1) if state else None,
-            "runs": int(runs.group(1)) if runs else 0, "last": last.group(1) if last else None}
+            "runs": int(runs.group(1)) if runs else 0, "last": last.group(1) if last else None,
+            "pid": int(pid.group(1)) if pid else None}
+
+
+def launchd_state():
+    return parse_launchd(sh(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], check=False))
+
+
+def launchd_completed(snap, before_runs):
+    """Finished, from ONE snapshot: loaded, more runs than before, state exactly "not running", no
+    pid and an exit code recorded. Pending, spawn-scheduled, throttled or running is not finished. The
+    exit code VALUE is not compared, so two successes in a row (both 0) still complete."""
+    return bool(snap["loaded"] and snap["runs"] > before_runs and snap["state"] == "not running"
+                and snap["pid"] is None and snap["last"] is not None)
+
+
+def launchd_drain(timeout=900):
+    """Settled: exactly "not running" with no pid, and the run count unchanged across 10 s, so no
+    kickstart or StartInterval run is still pending."""
+    def settled():
+        first = launchd_state()
+        if first["state"] != "not running" or first["pid"] is not None:
+            return False
+        time.sleep(10)
+        second = launchd_state()
+        return second["state"] == "not running" and second["pid"] is None and second["runs"] == first["runs"]
+    return wait_for(settled, timeout, 2)
+
+
+def supervisor_run():
+    """The CLI's own run identity: supervisor.json `run` (`<secs>-<pid>-<nanos>`) and the file's mtime."""
+    path = STATE / "background/supervisor.json"
+    record = json_file(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    return record.get("run"), mtime
+
+
+def run_pid(run):
+    parts = str(run or "").split("-")
+    return int(parts[1]) if len(parts) == 3 and parts[1].isdigit() else None
+
+
+KICKSTART_SECONDS = 120
+
+
+def kickstart_request(run=subprocess.run, seconds=KICKSTART_SECONDS):
+    """v6 (standing 180): one bounded `launchctl kickstart -p` request, the same 120 s request/capture
+    budget as v4's sh(). Returns (pid, None) with the pid kickstart printed, or (None, failure) for a
+    timeout, a start error, a nonzero exit or no pid. Separate from the completion wait."""
+    argv = ["launchctl", "kickstart", "-p", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)]
+    try:
+        kick = run(argv, capture_output=True, text=True, timeout=seconds, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, "harness: kickstart request did not return within %ss" % seconds
+    except OSError as error:
+        return None, "harness: kickstart request could not start: %s" % error
+    out = (kick.stdout or "").strip()
+    if kick.returncode != 0:
+        return None, "harness: kickstart exit %s: %s" % (kick.returncode, (kick.stderr or "").strip()[:200])
+    if not out.isdigit():
+        return None, "harness: kickstart -p printed no pid (%r)" % out[:80]
+    return int(out), None
 
 
 def run_launchd(h, case, expect_code, extra_checks=None, timeout=900):
-    """Starts the loaded agent once (`launchctl kickstart`), as StartInterval would, and waits."""
-    before = launchd_state()["runs"]
-    sh(["launchctl", "kickstart", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], check=False)
-    finished = wait_for(lambda: launchd_state()["runs"] > before and launchd_state()["state"] != "running",
-                        timeout, 1)
+    """Starts the loaded agent once (`launchctl kickstart -p`) and waits for THAT run (v5, standing
+    169): a pending run is drained first; completion is one coherent snapshot; the supervisor record
+    must name a new run whose pid is the one kickstart started."""
+    failures = []
+    if not launchd_drain():
+        failures.append("harness: the agent never settled before the kickstart")
+    base = launchd_state()
+    run_before, _ = supervisor_run()
+    t0 = time.time()
+    pid, request_failure = kickstart_request()
+    if request_failure:
+        # v6 (standing 180): no requested run to wait for; recorded before any completion wait.
+        failures.append(request_failure)
+        h.record(case, "fail", detail="; ".join(failures))
+        return
+    finished = wait_for(lambda: launchd_completed(launchd_state(), base["runs"]), timeout, 1)
     state = launchd_state()
-    failures = [] if finished else ["did not finish in %ss" % timeout]
+    run_after, mtime = supervisor_run()
+    if not finished:
+        failures.append("requested run did not complete in %ss (%s)" % (timeout, json.dumps(state, sort_keys=True)))
+    if run_after in (None, run_before) or mtime is None or mtime < t0 - 1:
+        failures.append("supervisor record names no new run (before %s, after %s)" % (run_before, run_after))
+    elif run_pid(run_after) != pid:
+        failures.append("supervisor run %s is not the kickstarted pid %s" % (run_after, pid))
     if state["last"] != str(expect_code):
         failures.append("last exit code %s, wanted %s" % (state["last"], expect_code))
     for label, ok in (extra_checks() if extra_checks else []):
@@ -1193,7 +1304,7 @@ def g8_launchd(h):
     h.run("M8-isolated-install", [CLI, "service", "install"], {4}, env=h.env(isolated=ACC / "iso-launchd"),
           asserts=lambda code, text: [("LaunchAgents unchanged", snapshot(PLIST.parent) == agents_before)])
     h.run("M8-install", [CLI, "service", "install"], {0})
-    idle = wait_for(lambda: launchd_state()["state"] != "running", 900, 2)
+    idle = launchd_drain()
     h.check("M8-idle-after-install", idle, "no run left running after install")
     plist = {}
     try:
@@ -1229,9 +1340,22 @@ def g8_launchd(h):
     commit("C13 auto on", {"loadout.toml": manifest({"auto": "true"})})
     run_launchd(h, "M8-run-reenabled", 0, lambda: [("file c12", read(target) == hello("c12"))])
     if h.args.long_timer:
+        # v5 (standing 169): settle every earlier kickstart first, then prove a NEW run that the
+        # harness did not request (StartInterval) applied C14. v4 could credit a pending kickstart.
+        settled = launchd_drain()
+        base = launchd_state()
+        run_before, _ = supervisor_run()
+        t0 = time.time()
         c14 = commit("C14 interval", {"files/hello.txt": hello("c14")})
-        h.check("M8-start-interval-fires", wait_for(lambda: head() == c14, 18 * 60, 10),
-                "StartInterval applied C14 within 18 minutes")
+
+        def fired():
+            run_after, mtime = supervisor_run()
+            return (launchd_completed(launchd_state(), base["runs"]) and run_after not in (None, run_before)
+                    and mtime is not None and mtime >= t0 and head() == c14 and read(target) == hello("c14"))
+        ok = settled and wait_for(fired, 18 * 60, 10)
+        h.check("M8-start-interval-fires", ok,
+                "settled baseline (runs %s, run %s), then a scheduled run with no kickstart applied C14 within 18 minutes"
+                % (base["runs"], run_before))
     native_formats(h, "M8-native-formats")
     status_json_case(h, "M8-definition-matches")
     unicode_job(h, service_toml)
