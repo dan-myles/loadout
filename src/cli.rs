@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{apply, doctor, plan, rollback, status, validate};
+use crate::commands::{apply, doctor, plan, rollback, service, status, update, validate};
 use crate::context::Context;
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,10 @@ pub enum Command {
     Plan(plan::Args),
     /// Bring this machine in line with the loadout
     Apply(apply::Args),
+    /// Fetch loadout's clone of the loadout, fast-forward it, and apply it
+    Update(update::Args),
+    /// Install, remove, or check the scheduled background update
+    Service(service::Args),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,11 @@ pub fn main() -> ExitCode {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<Exit> {
+    if let Command::Update(args) = &cli.command
+        && args.recorded()
+    {
+        return update::run_recorded(args);
+    }
     let context = Context::from_env()?;
     match cli.command {
         Command::Doctor(args) => doctor::run(&args, &context),
@@ -72,5 +81,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
         Command::Rollback(args) => rollback::run(&args, &context),
         Command::Plan(args) => plan::run(&args, &context),
         Command::Apply(args) => apply::run(&args, &context),
+        Command::Update(args) => update::run(&args, &context),
+        Command::Service(args) => service::run(&args, &context),
     }
 }

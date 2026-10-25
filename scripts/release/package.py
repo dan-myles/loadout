@@ -21,6 +21,9 @@ import zipfile
 from pathlib import Path
 
 PACKAGE = "loadout"
+# Windows archives also ship the GUI-subsystem launcher the Scheduled Task runs, beside
+# loadout.exe; it starts loadout.exe from its own folder, so the two always travel together.
+COMPANION = "loadout-background"
 EXTRA_FILES = ("README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE")
 ZIP_EPOCH_FLOOR = 315532800  # 1980-01-01, the earliest timestamp zip can store
 
@@ -96,23 +99,28 @@ def host_can_run(target):
     return target.startswith(arch + "-") and system is not None and system in target
 
 
-def smoke_test(binary, target, version, required=False):
+def binaries(target):
+    names = [PACKAGE] + ([COMPANION] if is_windows(target) else [])
+    return [name + (".exe" if is_windows(target) else "") for name in names]
+
+
+def smoke_test(binary, target, version, required=False, name=PACKAGE):
     if not host_can_run(target):
         if required:
             raise ReleaseError(f"--require-smoke: this host cannot execute {target}")
         print(f"smoke test skipped: this host cannot execute {target}", file=sys.stderr)
         return
     output = run([str(binary), "--version"])
-    if output.split()[:2] != [PACKAGE, version]:
+    if output.split()[:2] != [name, version]:
         raise ReleaseError(
-            f"{binary.name} --version printed {output.strip()!r}, expected '{PACKAGE} {version}'"
+            f"{binary.name} --version printed {output.strip()!r}, expected '{name} {version}'"
         )
     print(f"smoke test passed: {output.strip()}", file=sys.stderr)
 
 
-def members(root, binary, target):
+def members(root, executables, target):
     prefix = f"{PACKAGE}-{target}"
-    entries = [(f"{prefix}/{binary.name}", binary.read_bytes(), 0o755)]
+    entries = [(f"{prefix}/{binary.name}", binary.read_bytes(), 0o755) for binary in executables]
     for name in EXTRA_FILES:
         path = root / name
         if path.is_symlink():
@@ -190,16 +198,16 @@ def main(argv=None):
     epoch = source_date_epoch(root)
 
     print(run(["rustc", "-vV"], cwd=root), file=sys.stderr)
-    run(
-        ["cargo", "build", "--release", "--locked", "--target", args.target, "--bin", PACKAGE],
-        cwd=root,
-        env=build_env(root, args.target, epoch),
-    )
-    exe = PACKAGE + (".exe" if is_windows(args.target) else "")
-    binary = target_dir / args.target / "release" / exe
-    smoke_test(binary, args.target, version, args.require_smoke)
+    names = binaries(args.target)
+    build = ["cargo", "build", "--release", "--locked", "--target", args.target]
+    for name in names:
+        build += ["--bin", Path(name).stem]
+    run(build, cwd=root, env=build_env(root, args.target, epoch))
+    executables = [target_dir / args.target / "release" / name for name in names]
+    for executable in executables:
+        smoke_test(executable, args.target, version, args.require_smoke, name=executable.stem)
 
-    prefix, entries = members(root, binary, args.target)
+    prefix, entries = members(root, executables, args.target)
     out_dir = (args.out_dir or target_dir / "dist").resolve()
     archive, checksum = write_archive(out_dir, prefix, entries, args.target, epoch)
     print(checksum.read_text(encoding="ascii"), end="")

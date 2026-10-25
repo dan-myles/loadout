@@ -16,4 +16,5 @@ pub mod reserved;
 pub mod resolve;
 pub mod source;
 pub mod state;
+pub mod sync;
 pub mod template;

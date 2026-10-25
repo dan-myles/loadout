@@ -20,7 +20,7 @@ use nix::unistd::Pid;
 #[cfg(windows)]
 use process_wrap::std::{ChildWrapper, CommandWrap, CreationFlags, JobObject};
 
-use super::{Containment, Invocation, WORKER_NONCE};
+use super::{Containment, GIT_REDIRECTS, Invocation, WORKER_NONCE};
 
 /// How long loadout waits for one installed-query's (or doctor's query's) own process. Generous:
 /// a query can refresh a source index or fetch an API. Stopping what it leaves behind is bounded
@@ -152,6 +152,9 @@ impl fmt::Display for QueryError {
 /// change winget's language, which follows Windows' display language.)
 fn command(invocation: &Invocation) -> Command {
     let mut command = Command::new(&invocation.program);
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
     command
         .args(&invocation.args)
         .envs(invocation.env.iter().copied())

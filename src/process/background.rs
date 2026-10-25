@@ -159,6 +159,10 @@ pub enum Error {
 #[error("refusing to run as a background worker: {0}")]
 pub struct Refused(String);
 
+/// `CREATE_NO_WINDOW` from the Windows process creation flags.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 const MAGIC: &str = "LOADOUT-WORKER";
 const VERSION: &str = "1";
 const NONCE_BYTES: usize = 32;
@@ -296,7 +300,9 @@ fn from_query(error: QueryError) -> Error {
 /// that, every failure stops the whole job within the same, unrenewed deadline.
 #[cfg(windows)]
 fn run(mut worker: Command, nonce: &str, setup: Instant, limits: Limits) -> Result<Outcome, Error> {
-    worker.creation_flags(loadout_winproc::CREATE_SUSPENDED.0);
+    // No console window: the scheduled launcher has none, and a console program it starts
+    // would otherwise open one at every run.
+    worker.creation_flags(loadout_winproc::CREATE_SUSPENDED.0 | CREATE_NO_WINDOW);
     let mut child = worker
         .spawn()
         .map_err(|error| Error::Setup(format!("cannot start it: {error}")))?;
