@@ -95,7 +95,12 @@ fn outcome_at<'a>(report: &'a apply::Report, path: &Path) -> &'a Outcome {
     report
         .outcomes
         .iter()
-        .find(|(action, _)| action.target == plan::Target::Path { path: path.to_path_buf() })
+        .find(|(action, _)| {
+            action.target
+                == plan::Target::Path {
+                    path: path.to_path_buf(),
+                }
+        })
         .map(|(_, outcome)| outcome)
         .unwrap_or_else(|| panic!("no outcome for {}: {:#?}", path.display(), report.outcomes))
 }
@@ -110,9 +115,18 @@ fn apply_writes_records_and_a_second_apply_changes_nothing_and_starts_no_run() {
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(!report.failed(), "{report:#?}");
     assert!(!report.unhealthy());
-    assert_eq!(outcome_at(&report, &machine.home.join(".a")), &Outcome::Done);
-    assert_eq!(fs::read_to_string(machine.home.join(".a")).unwrap(), "first");
-    assert_eq!(fs::read_to_string(machine.home.join(".b")).unwrap(), "second");
+    assert_eq!(
+        outcome_at(&report, &machine.home.join(".a")),
+        &Outcome::Done
+    );
+    assert_eq!(
+        fs::read_to_string(machine.home.join(".a")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        fs::read_to_string(machine.home.join(".b")).unwrap(),
+        "second"
+    );
     assert!(report.run.is_some());
     let runs = machine.runs();
     assert_eq!(runs.len(), 1);
@@ -121,17 +135,21 @@ fn apply_writes_records_and_a_second_apply_changes_nothing_and_starts_no_run() {
 
     let again = machine.apply(INTERACTIVE).unwrap();
     assert_eq!(again.run, None, "a run with nothing to write starts no run");
-    assert!(again
-        .outcomes
-        .iter()
-        .all(|(_, outcome)| *outcome == Outcome::Unchanged));
+    assert!(
+        again
+            .outcomes
+            .iter()
+            .all(|(_, outcome)| *outcome == Outcome::Unchanged)
+    );
     assert_eq!(machine.runs().len(), 1, "no empty journal was created");
-    assert!(machine
-        .plan()
-        .plan
-        .actions
-        .iter()
-        .all(|action| action.change == Change::Unchanged));
+    assert!(
+        machine
+            .plan()
+            .plan
+            .actions
+            .iter()
+            .all(|action| action.change == Change::Unchanged)
+    );
 }
 
 #[test]
@@ -187,7 +205,10 @@ fn an_unowned_target_is_replaced_only_by_interactive_apply() {
             mode: Mode::Background,
         })
         .unwrap();
-    assert!(matches!(outcome_at(&background, &target), Outcome::Skipped(_)));
+    assert!(matches!(
+        outcome_at(&background, &target),
+        Outcome::Skipped(_)
+    ));
     assert!(background.unhealthy());
     assert_eq!(fs::read_to_string(&target).unwrap(), "the user's");
     assert!(machine.runs().is_empty(), "nothing was journaled");
@@ -211,9 +232,15 @@ fn an_item_the_loadout_drops_is_removed_and_rollback_brings_it_back() {
         &Outcome::Removed
     );
     assert!(!machine.home.join(".b").exists());
-    assert_eq!(fs::read_to_string(machine.home.join(".a")).unwrap(), "first");
+    assert_eq!(
+        fs::read_to_string(machine.home.join(".a")).unwrap(),
+        "first"
+    );
     state::rollback(&machine.context, None).unwrap();
-    assert_eq!(fs::read_to_string(machine.home.join(".b")).unwrap(), "second");
+    assert_eq!(
+        fs::read_to_string(machine.home.join(".b")).unwrap(),
+        "second"
+    );
 }
 
 #[test]
@@ -226,8 +253,12 @@ fn a_second_apply_while_the_lock_is_held_is_refused_and_a_held_lock_can_be_passe
     };
     assert!(!machine.home.join(".a").exists());
 
-    let report = apply::run_under_lock(&machine.context, &machine.loadout, lock, INTERACTIVE).unwrap();
-    assert_eq!(outcome_at(&report, &machine.home.join(".a")), &Outcome::Done);
+    let report =
+        apply::run_under_lock(&machine.context, &machine.loadout, lock, INTERACTIVE).unwrap();
+    assert_eq!(
+        outcome_at(&report, &machine.home.join(".a")),
+        &Outcome::Done
+    );
     state::lock(&machine.context).expect("run_under_lock releases the lock it was given");
 }
 
@@ -292,7 +323,11 @@ fn a_user_file_keeps_its_execute_bit_and_instructions_never_get_one() {
          [instructions.global]\nsource = \"AGENTS.md\"\n",
     );
     for source in ["bin/tool", "AGENTS.md"] {
-        fs::set_permissions(machine.loadout.join(source), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            machine.loadout.join(source),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
     }
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(!report.failed(), "{report:#?}");
@@ -314,7 +349,10 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, String> {
             let metadata = fs::symlink_metadata(&path).unwrap();
             let kind = metadata.file_type();
             if kind.is_symlink() {
-                out.insert(relative, format!("link {}", fs::read_link(&path).unwrap().display()));
+                out.insert(
+                    relative,
+                    format!("link {}", fs::read_link(&path).unwrap().display()),
+                );
             } else if kind.is_dir() {
                 out.insert(relative, format!("dir {}", mode(&metadata)));
                 walk(root, &path, out);
@@ -350,8 +388,19 @@ fn change_at<'a>(built: &'a plan::Built, path: &Path) -> &'a Change {
         .plan
         .actions
         .iter()
-        .find(|action| action.target == plan::Target::Path { path: path.to_path_buf() })
-        .unwrap_or_else(|| panic!("no action for {}: {:#?}", path.display(), built.plan.actions))
+        .find(|action| {
+            action.target
+                == plan::Target::Path {
+                    path: path.to_path_buf(),
+                }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no action for {}: {:#?}",
+                path.display(),
+                built.plan.actions
+            )
+        })
         .change
 }
 
@@ -372,13 +421,20 @@ fn an_owned_file_declared_again_through_a_link_is_never_removed() {
         "{:#?}",
         built.plan.actions
     );
-    assert_eq!(change_at(&built, &machine.home.join("alias/tool")), &Change::Adopt);
+    assert_eq!(
+        change_at(&built, &machine.home.join("alias/tool")),
+        &Change::Adopt
+    );
 
     let before = fs::read(&real).unwrap();
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(matches!(outcome_at(&report, &real), Outcome::Blocked(_)));
     assert!(report.unhealthy());
-    assert_eq!(fs::read(&real).unwrap(), before, "the declared file survives");
+    assert_eq!(
+        fs::read(&real).unwrap(),
+        before,
+        "the declared file survives"
+    );
     assert!(
         !snapshot(&machine.home)
             .keys()
@@ -409,9 +465,18 @@ fn two_owned_spellings_of_one_file_are_never_removed_while_one_is_declared_or_bo
             id: path.file_name().unwrap().to_string_lossy().into_owned(),
             agent: None,
         },
-        target: plan::Target::Path { path: path.to_path_buf() },
+        target: plan::Target::Path {
+            path: path.to_path_buf(),
+        },
         change: Change::Adopt,
-        prior: state::observe(&machine.context, &machine.loadout, &plan::Target::Path { path: path.to_path_buf() }).unwrap(),
+        prior: state::observe(
+            &machine.context,
+            &machine.loadout,
+            &plan::Target::Path {
+                path: path.to_path_buf(),
+            },
+        )
+        .unwrap(),
         content: Some(content.clone()),
     };
     let mut adopt_via = adopt(&via);
@@ -421,7 +486,8 @@ fn two_owned_spellings_of_one_file_are_never_removed_while_one_is_declared_or_bo
     };
     let lock = state::lock(&machine.context).unwrap();
     let mut records = State::load(&machine.context).unwrap();
-    let mut run = state::Run::begin(&machine.context, &machine.loadout, lock, &records, &fixture).unwrap();
+    let mut run =
+        state::Run::begin(&machine.context, &machine.loadout, lock, &records, &fixture).unwrap();
     for action in &fixture.actions {
         run.write(action, &content).unwrap();
     }
@@ -430,7 +496,11 @@ fn two_owned_spellings_of_one_file_are_never_removed_while_one_is_declared_or_bo
 
     machine.manifest("[files.via]\nsource = \"tool\"\ntarget = \"~/alias/tool\"\n");
     let built = machine.plan();
-    assert!(matches!(change_at(&built, &real), Change::Blocked(_)), "{:#?}", built.plan.actions);
+    assert!(
+        matches!(change_at(&built, &real), Change::Blocked(_)),
+        "{:#?}",
+        built.plan.actions
+    );
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(matches!(outcome_at(&report, &real), Outcome::Blocked(_)));
     assert_eq!(fs::read_to_string(&real).unwrap(), "x");
@@ -459,7 +529,8 @@ fn two_declared_spellings_of_one_file_are_invalid_before_any_write_with_equal_or
             "[files.a]\nsource = \"a\"\ntarget = \"~/real/tool\"\n[files.b]\nsource = \"b\"\ntarget = \"~/alias/tool\"\n",
         );
         let before = snapshot(&machine.home);
-        let Err(apply::Error::Plan(plan::Error::Invalid(diagnostics))) = machine.apply(INTERACTIVE) else {
+        let Err(apply::Error::Plan(plan::Error::Invalid(diagnostics))) = machine.apply(INTERACTIVE)
+        else {
             panic!("two writers of one file must be invalid: {first} {second}");
         };
         assert!(
@@ -483,8 +554,14 @@ fn distinct_files_through_a_folder_link_are_both_written() {
     );
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(!report.failed() && !report.unhealthy(), "{report:#?}");
-    assert_eq!(fs::read_to_string(machine.home.join("real/a")).unwrap(), "a");
-    assert_eq!(fs::read_to_string(machine.home.join("real/b")).unwrap(), "b");
+    assert_eq!(
+        fs::read_to_string(machine.home.join("real/a")).unwrap(),
+        "a"
+    );
+    assert_eq!(
+        fs::read_to_string(machine.home.join("real/b")).unwrap(),
+        "b"
+    );
 }
 
 #[test]
@@ -503,7 +580,10 @@ fn a_lock_for_another_state_dir_is_refused_before_any_work_on_every_route() {
         let before = snapshot(&machine.home);
         let result = apply::run_under_lock(&machine.context, &machine.loadout, wrong, INTERACTIVE);
         assert!(
-            matches!(result, Err(apply::Error::State(state::Error::WrongLock { .. }))),
+            matches!(
+                result,
+                Err(apply::Error::State(state::Error::WrongLock { .. }))
+            ),
             "{manifest:?}: {result:?}"
         );
         assert_eq!(snapshot(&machine.home), before, "{manifest:?}");
@@ -524,8 +604,12 @@ fn a_lock_taken_through_a_link_to_the_same_state_dir_is_accepted() {
     std::os::unix::fs::symlink(&machine.state, &link).unwrap();
     let through_link = context_for(&machine.home, &link);
     let lock = state::lock(&through_link).unwrap();
-    let report = apply::run_under_lock(&machine.context, &machine.loadout, lock, INTERACTIVE).unwrap();
-    assert_eq!(outcome_at(&report, &machine.home.join(".a")), &Outcome::Done);
+    let report =
+        apply::run_under_lock(&machine.context, &machine.loadout, lock, INTERACTIVE).unwrap();
+    assert_eq!(
+        outcome_at(&report, &machine.home.join(".a")),
+        &Outcome::Done
+    );
     state::lock(&machine.context).expect("the lock is released once the report is built");
 }
 
@@ -539,7 +623,10 @@ fn on_linux_an_alias_and_a_case_spelling_in_an_unproven_folder_are_both_blocked_
             "[files.a]\nsource = \"a\"\ntarget = \"~/alias/Foo\"\n[files.b]\nsource = \"b\"\ntarget = \"~/real/foo\"\n",
         );
         let built = machine.plan();
-        for path in [machine.home.join("alias/Foo"), machine.home.join("real/foo")] {
+        for path in [
+            machine.home.join("alias/Foo"),
+            machine.home.join("real/foo"),
+        ] {
             assert!(
                 matches!(change_at(&built, &path), Change::Blocked(reason) if reason.contains("can't tell how")),
                 "an empty deciding folder proves nothing: {:#?}",
@@ -549,7 +636,11 @@ fn on_linux_an_alias_and_a_case_spelling_in_an_unproven_folder_are_both_blocked_
         let before = snapshot(&machine.home);
         let report = machine.apply(INTERACTIVE).unwrap();
         assert!(report.unhealthy());
-        assert_eq!(snapshot(&machine.home), before, "neither spelling was written");
+        assert_eq!(
+            snapshot(&machine.home),
+            before,
+            "neither spelling was written"
+        );
     }
 }
 
@@ -564,8 +655,14 @@ fn on_linux_a_proven_case_sensitive_folder_keeps_an_alias_and_a_case_spelling_ap
     );
     let report = machine.apply(INTERACTIVE).unwrap();
     assert!(!report.failed() && !report.unhealthy(), "{report:#?}");
-    assert_eq!(fs::read_to_string(machine.home.join("real/Foo")).unwrap(), "a");
-    assert_eq!(fs::read_to_string(machine.home.join("real/foo")).unwrap(), "b");
+    assert_eq!(
+        fs::read_to_string(machine.home.join("real/Foo")).unwrap(),
+        "a"
+    );
+    assert_eq!(
+        fs::read_to_string(machine.home.join("real/foo")).unwrap(),
+        "b"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -582,7 +679,10 @@ fn on_linux_an_owned_real_spelling_and_a_declared_alias_case_spelling_follow_the
         &Change::Remove,
         "real/foo proves its folder case-sensitive, so the two spellings are two files"
     );
-    assert_eq!(change_at(&built, &machine.home.join("alias/Foo")), &Change::Create);
+    assert_eq!(
+        change_at(&built, &machine.home.join("alias/Foo")),
+        &Change::Create
+    );
 }
 
 #[test]
@@ -625,7 +725,10 @@ fn a_wrong_lock_is_refused_before_the_interrupted_gate_on_every_route() {
         let wrong = state::lock(&context_for(&machine.home, &other.path().join("state"))).unwrap();
         let result = apply::run_under_lock(&machine.context, &machine.loadout, wrong, INTERACTIVE);
         assert!(
-            matches!(result, Err(apply::Error::State(state::Error::WrongLock { .. }))),
+            matches!(
+                result,
+                Err(apply::Error::State(state::Error::WrongLock { .. }))
+            ),
             "{manifest:?}: the interrupted gate would have answered first: {result:?}"
         );
         assert_eq!(machine.runs(), before_runs, "{manifest:?}");

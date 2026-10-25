@@ -156,15 +156,27 @@ fn under_lock(
         (lock, None, None)
     } else {
         let filtered = Plan {
-            actions: journaled.iter().map(|index| actions[*index].clone()).collect(),
+            actions: journaled
+                .iter()
+                .map(|index| actions[*index].clone())
+                .collect(),
         };
         let mut run = Run::begin(context, &built.checkout, lock, &state, &filtered)?;
         let id = run.id().to_owned();
         for index in &journaled {
-            outcomes[*index] = Some(execute(&mut run, context, &built.checkout, &actions[*index]));
+            outcomes[*index] = Some(execute(
+                &mut run,
+                context,
+                &built.checkout,
+                &actions[*index],
+            ));
         }
         let (lock, finished) = run.finish_with_lock(&mut state);
-        (lock, Some(id), finished.err().map(|error| error.to_string()))
+        (
+            lock,
+            Some(id),
+            finished.err().map(|error| error.to_string()),
+        )
     };
 
     for index in &installs {
@@ -278,9 +290,9 @@ fn verify(context: &Context, checkout: &Path, action: &Action, content: &Content
         (Ok(_), Ok(_)) => Outcome::Mismatch(format!(
             "{label} doesn't hold what loadout wrote; its file system may not keep execute bits"
         )),
-        (Err(error), _) | (_, Err(error)) => {
-            Outcome::Mismatch(format!("cannot check what loadout wrote to {label}: {error}"))
-        }
+        (Err(error), _) | (_, Err(error)) => Outcome::Mismatch(format!(
+            "cannot check what loadout wrote to {label}: {error}"
+        )),
     }
 }
 
@@ -357,16 +369,30 @@ mod tests {
 
     #[test]
     fn only_writable_file_and_entry_actions_reach_the_journal() {
-        for change in [Change::Create, Change::Update, Change::Adopt, Change::Remove] {
-            assert!(journaled(&action(path(), change.clone()), INTERACTIVE), "{change:?}");
+        for change in [
+            Change::Create,
+            Change::Update,
+            Change::Adopt,
+            Change::Remove,
+        ] {
+            assert!(
+                journaled(&action(path(), change.clone()), INTERACTIVE),
+                "{change:?}"
+            );
         }
         for change in [
             Change::Unchanged,
             Change::Blocked("b".to_owned()),
             Change::Unsupported("u".to_owned()),
         ] {
-            assert!(!journaled(&action(path(), change.clone()), INTERACTIVE), "{change:?}");
-            assert!(!journaled(&action(Target::None, change.clone()), INTERACTIVE), "{change:?}");
+            assert!(
+                !journaled(&action(path(), change.clone()), INTERACTIVE),
+                "{change:?}"
+            );
+            assert!(
+                !journaled(&action(Target::None, change.clone()), INTERACTIVE),
+                "{change:?}"
+            );
         }
         let program = action(
             Target::Program {

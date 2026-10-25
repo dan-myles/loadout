@@ -55,7 +55,9 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     );
     for (action, outcome) in &report.outcomes {
         let (name, detail) = describe(outcome);
-        let detail = detail.map(|detail| format!(": {detail}")).unwrap_or_default();
+        let detail = detail
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
         println!(
             "  {name:<17} {}  ({}){detail}",
             state::label(&action.target),

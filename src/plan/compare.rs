@@ -35,7 +35,9 @@ pub(super) fn actions(
                 continue;
             }
         };
-        let record = state.record(&desired.target).map(|record| record.sha256.as_str());
+        let record = state
+            .record(&desired.target)
+            .map(|record| record.sha256.as_str());
         match state::observe(context, loadout, &desired.target) {
             Ok(observed) => actions.push(assemble(desired, observed, record, &wanted)?),
             Err(failure) => actions.push(refused(
@@ -124,7 +126,8 @@ fn places(context: &Context, actions: &mut [Action]) -> Result<(Vec<Option<Place
                 unknown = true;
                 places.push(None);
                 if !matches!(action.change, Change::Unsupported(_) | Change::Blocked(_)) {
-                    action.change = Change::Blocked(format!("{reason}, so it writes nothing there"));
+                    action.change =
+                        Change::Blocked(format!("{reason}, so it writes nothing there"));
                     action.content = None;
                 }
             }
@@ -140,7 +143,10 @@ fn places(context: &Context, actions: &mut [Action]) -> Result<(Vec<Option<Place
 /// record the loadout no longer declares becomes a removal, blocked too when it migrates, and
 /// left out when its file, map, and key are declared as written under another contract, so the
 /// plan holds one action for that identity.
-#[expect(clippy::too_many_arguments, reason = "one pass over the records needs every input")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass over the records needs every input"
+)]
 fn removals(
     state: &State,
     context: &Context,
@@ -287,10 +293,7 @@ fn same_key(declared: &Target, owned: &Target) -> bool {
     match (declared, owned) {
         (
             Target::Entry {
-                file,
-                pointer,
-                key,
-                ..
+                file, pointer, key, ..
             },
             Target::Entry {
                 file: owned_file,
@@ -298,7 +301,9 @@ fn same_key(declared: &Target, owned: &Target) -> bool {
                 key: owned_key,
                 ..
             },
-        ) => file == owned_file && pointer == owned_pointer && key == owned_key && declared != owned,
+        ) => {
+            file == owned_file && pointer == owned_pointer && key == owned_key && declared != owned
+        }
         _ => false,
     }
 }
@@ -345,7 +350,9 @@ enum Role {
     /// A declaration blocked as an ownership migration. It still counts against other writers
     /// when it would write, but the retained old ownership, not its new contract, guards the
     /// place against everything else.
-    Migrating { writes: bool },
+    Migrating {
+        writes: bool,
+    },
     Removal,
 }
 
@@ -408,7 +415,8 @@ fn relate_all(
                 role(first, one, declared, owned),
                 role(second, other, declared, owned),
             );
-            let writer = |role: Role| matches!(role, Role::Writer | Role::Migrating { writes: true });
+            let writer =
+                |role: Role| matches!(role, Role::Writer | Role::Migrating { writes: true });
             let relevant = match roles {
                 (Role::Removal, Role::Removal) => true,
                 (Role::Removal, Role::Writer | Role::Silent)
@@ -642,7 +650,10 @@ mod tests {
     fn every_disk_and_record_combination_has_one_change() {
         for is_entry in [false, true] {
             assert_eq!(change(is_entry, &Observed::Absent, None), Change::Create);
-            assert_eq!(change(is_entry, &Observed::Absent, Some(R)), Change::Drifted);
+            assert_eq!(
+                change(is_entry, &Observed::Absent, Some(R)),
+                Change::Drifted
+            );
             assert_eq!(change(is_entry, &present(D), None), Change::Adopt);
             assert_eq!(change(is_entry, &present(D), Some(D)), Change::Unchanged);
             assert_eq!(change(is_entry, &present(D), Some(R)), Change::Update);
@@ -689,7 +700,9 @@ mod tests {
 
     fn desired(target: Target) -> Desired {
         let content = match &target {
-            Target::Entry { .. } => super::super::Content::Entry(serde_json::json!({"command": "docs"})),
+            Target::Entry { .. } => {
+                super::super::Content::Entry(serde_json::json!({"command": "docs"}))
+            }
             _ => super::super::Content::File(super::super::FileContent {
                 bytes: b"x".to_vec(),
                 executable: false,
@@ -711,7 +724,10 @@ mod tests {
         let action = assemble(desired(entry("docs")), present(H), None, D).unwrap();
         assert!(matches!(action.change, Change::Blocked(_)), "{action:?}");
         assert_eq!(action.prior, present(H), "the observation stays as seen");
-        assert!(action.content.is_none(), "a blocked entry carries nothing to write");
+        assert!(
+            action.content.is_none(),
+            "a blocked entry carries nothing to write"
+        );
         super::super::Plan {
             actions: vec![action],
         }
@@ -821,7 +837,13 @@ mod tests {
         State::load(&machine.context).unwrap()
     }
 
-    fn mcp_at(file: PathBuf, format: McpFormat, pointer: &str, key: &str, shape: McpShape) -> Target {
+    fn mcp_at(
+        file: PathBuf,
+        format: McpFormat,
+        pointer: &str,
+        key: &str,
+        shape: McpShape,
+    ) -> Target {
         Target::Entry {
             file,
             format,
@@ -831,7 +853,11 @@ mod tests {
         }
     }
 
-    fn compared(machine: &Machine, desired: Vec<Desired>, state: &State) -> (Vec<Action>, Diagnostics) {
+    fn compared(
+        machine: &Machine,
+        desired: Vec<Desired>,
+        state: &State,
+    ) -> (Vec<Action>, Diagnostics) {
         let mut problems = Diagnostics::default();
         let actions = super::actions(
             Produced {
@@ -853,12 +879,36 @@ mod tests {
         let file = machine.home.join("custom.json");
         for (owned, declared) in [
             (
-                mcp_at(file.clone(), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson),
-                mcp_at(file.clone(), McpFormat::Json, "/mcpServers", "docs", McpShape::PiJson),
+                mcp_at(
+                    file.clone(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "docs",
+                    McpShape::CursorJson,
+                ),
+                mcp_at(
+                    file.clone(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "docs",
+                    McpShape::PiJson,
+                ),
             ),
             (
-                mcp_at(file.clone(), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson),
-                mcp_at(file.clone(), McpFormat::Jsonc, "/mcpServers", "docs", McpShape::CursorJson),
+                mcp_at(
+                    file.clone(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "docs",
+                    McpShape::CursorJson,
+                ),
+                mcp_at(
+                    file.clone(),
+                    McpFormat::Jsonc,
+                    "/mcpServers",
+                    "docs",
+                    McpShape::CursorJson,
+                ),
             ),
         ] {
             let state = owning(&machine, std::slice::from_ref(&owned));
@@ -905,14 +955,21 @@ mod tests {
         let writers = |pairs: [(McpFormat, &str, &str, McpShape); 2]| {
             pairs
                 .into_iter()
-                .map(|(format, pointer, key, shape)| desired(mcp_at(file.clone(), format, pointer, key, shape)))
+                .map(|(format, pointer, key, shape)| {
+                    desired(mcp_at(file.clone(), format, pointer, key, shape))
+                })
                 .collect::<Vec<_>>()
         };
         let state = State::default();
         for conflicting in [
             writers([
                 (McpFormat::Json, "/servers", "group", McpShape::CursorJson),
-                (McpFormat::Json, "/servers/group", "env", McpShape::CursorJson),
+                (
+                    McpFormat::Json,
+                    "/servers/group",
+                    "env",
+                    McpShape::CursorJson,
+                ),
             ]),
             writers([
                 (McpFormat::Json, "/mcpServers", "my_docs", McpShape::PiJson),
@@ -920,24 +977,52 @@ mod tests {
             ]),
             writers([
                 (McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson),
-                (McpFormat::Jsonc, "/elsewhere", "search", McpShape::CursorJson),
+                (
+                    McpFormat::Jsonc,
+                    "/elsewhere",
+                    "search",
+                    McpShape::CursorJson,
+                ),
             ]),
         ] {
             let (_, problems) = compared(&machine, conflicting, &state);
-            assert!(problems.has_errors(), "a conflicting pair is invalid before any write");
+            assert!(
+                problems.has_errors(),
+                "a conflicting pair is invalid before any write"
+            );
         }
         for apart in [
             writers([
                 (McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson),
-                (McpFormat::Json, "/mcpServers", "search", McpShape::CursorJson),
+                (
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "search",
+                    McpShape::CursorJson,
+                ),
             ]),
             writers([
-                (McpFormat::Json, "/mcp~1servers", "docs", McpShape::CursorJson),
+                (
+                    McpFormat::Json,
+                    "/mcp~1servers",
+                    "docs",
+                    McpShape::CursorJson,
+                ),
                 (McpFormat::Json, "/mcp", "servers", McpShape::CursorJson),
             ]),
             writers([
-                (McpFormat::Json, "/mcpServers", "my_docs", McpShape::CursorJson),
-                (McpFormat::Json, "/mcpServers", "my-docs", McpShape::CursorJson),
+                (
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "my_docs",
+                    McpShape::CursorJson,
+                ),
+                (
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "my-docs",
+                    McpShape::CursorJson,
+                ),
             ]),
         ] {
             let (actions, problems) = compared(&machine, apart, &state);
@@ -963,7 +1048,12 @@ mod tests {
     fn roles(machine: &Machine, actions: &mut [Action], declared: usize) -> Diagnostics {
         let places: Vec<Option<Place>> = actions
             .iter()
-            .map(|action| Some(identity::place(&machine.context, identity::file(&action.target).unwrap()).unwrap()))
+            .map(|action| {
+                Some(
+                    identity::place(&machine.context, identity::file(&action.target).unwrap())
+                        .unwrap(),
+                )
+            })
             .collect();
         let mut problems = Diagnostics::default();
         let owned = Owned {
@@ -979,14 +1069,30 @@ mod tests {
     }
 
     #[test]
-    fn an_owned_parent_key_is_never_removed_under_a_declared_child_and_neither_is_the_child_under_a_parent() {
+    fn an_owned_parent_key_is_never_removed_under_a_declared_child_and_neither_is_the_child_under_a_parent()
+     {
         let machine = machine();
         let file = machine.home.join("custom.json");
-        let parent = mcp_at(file.clone(), McpFormat::Json, "/servers", "group", McpShape::CursorJson);
-        let child = mcp_at(file.clone(), McpFormat::Json, "/servers/group", "env", McpShape::CursorJson);
+        let parent = mcp_at(
+            file.clone(),
+            McpFormat::Json,
+            "/servers",
+            "group",
+            McpShape::CursorJson,
+        );
+        let child = mcp_at(
+            file.clone(),
+            McpFormat::Json,
+            "/servers/group",
+            "env",
+            McpShape::CursorJson,
+        );
         for (declared, owned) in [(child.clone(), parent.clone()), (parent, child)] {
             let mut actions = vec![
-                planned(declared, Change::Blocked("an unowned key differs".to_owned())),
+                planned(
+                    declared,
+                    Change::Blocked("an unowned key differs".to_owned()),
+                ),
                 planned(owned, Change::Remove),
             ];
             let problems = roles(&machine, &mut actions, 1);
@@ -1008,8 +1114,26 @@ mod tests {
         let machine = machine();
         let file = machine.home.join("custom.json");
         let mut actions = vec![
-            planned(mcp_at(file.clone(), McpFormat::Json, "/servers", "group", McpShape::CursorJson), Change::Remove),
-            planned(mcp_at(file, McpFormat::Json, "/servers/group", "env", McpShape::CursorJson), Change::Remove),
+            planned(
+                mcp_at(
+                    file.clone(),
+                    McpFormat::Json,
+                    "/servers",
+                    "group",
+                    McpShape::CursorJson,
+                ),
+                Change::Remove,
+            ),
+            planned(
+                mcp_at(
+                    file,
+                    McpFormat::Json,
+                    "/servers/group",
+                    "env",
+                    McpShape::CursorJson,
+                ),
+                Change::Remove,
+            ),
         ];
         roles(&machine, &mut actions, 0);
         for action in &actions {
@@ -1036,9 +1160,15 @@ mod tests {
             executable: false,
         }));
         let problems = roles(&machine, &mut actions, 2);
-        assert!(problems.is_empty(), "an unsupported item writes nothing: {problems:?}");
+        assert!(
+            problems.is_empty(),
+            "an unsupported item writes nothing: {problems:?}"
+        );
         assert_eq!(actions[1].change, Change::Update);
-        assert!(matches!(&actions[2].change, Change::Blocked(_)), "{actions:#?}");
+        assert!(
+            matches!(&actions[2].change, Change::Blocked(_)),
+            "{actions:#?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1125,8 +1255,16 @@ mod tests {
                         let state = owning(&machine, std::slice::from_ref(&owned));
                         let (actions, problems) = compared(&machine, order, &state);
                         assert!(problems.is_empty(), "{problems:?}");
-                        assert!(kept_then_migrated(of(&actions, &declared)), "{:?}", reasons(&actions));
-                        assert!(kept_then_migrated(of(&actions, &owned)), "{:?}", reasons(&actions));
+                        assert!(
+                            kept_then_migrated(of(&actions, &declared)),
+                            "{:?}",
+                            reasons(&actions)
+                        );
+                        assert!(
+                            kept_then_migrated(of(&actions, &owned)),
+                            "{:?}",
+                            reasons(&actions)
+                        );
                         assert!(of(&actions, &owned).content.is_none());
                         assert!(
                             !migrated(of(&actions, &other)),
@@ -1146,7 +1284,8 @@ mod tests {
     /// another shape is a migration, though the two shapes' logical addresses differ.
     #[cfg(unix)]
     #[test]
-    fn a_still_declared_owned_key_guards_its_stored_key_against_an_aliased_declaration_under_another_shape() {
+    fn a_still_declared_owned_key_guards_its_stored_key_against_an_aliased_declaration_under_another_shape()
+     {
         for (owned_shape, other_shape) in [
             (McpShape::CursorJson, McpShape::PiJson),
             (McpShape::PiJson, McpShape::CursorJson),
@@ -1176,7 +1315,8 @@ mod tests {
                             continue;
                         }
                         let state = owning(&machine, std::slice::from_ref(&owned));
-                        let (mut desired_list, mut unsupported) = (vec![desired(other.clone())], Vec::new());
+                        let (mut desired_list, mut unsupported) =
+                            (vec![desired(other.clone())], Vec::new());
                         if exact_unsupported {
                             unsupported.push(Action::unsupported(
                                 ItemRef {
@@ -1205,13 +1345,28 @@ mod tests {
                         )
                         .unwrap();
                         assert!(problems.is_empty(), "{problems:?}");
-                        assert_eq!(actions.len(), 2, "no removal for the still-declared record: {actions:#?}");
-                        assert!(kept_then_migrated(of(&actions, &other)), "{:?}", reasons(&actions));
+                        assert_eq!(
+                            actions.len(),
+                            2,
+                            "no removal for the still-declared record: {actions:#?}"
+                        );
+                        assert!(
+                            kept_then_migrated(of(&actions, &other)),
+                            "{:?}",
+                            reasons(&actions)
+                        );
                         let exact = of(&actions, &owned);
                         if exact_unsupported {
-                            assert!(matches!(exact.change, Change::Unsupported(_)), "unsupported stays as it is");
+                            assert!(
+                                matches!(exact.change, Change::Unsupported(_)),
+                                "unsupported stays as it is"
+                            );
                         } else {
-                            assert!(!migrated(exact), "the exact old declaration is no migration: {:?}", reasons(&actions));
+                            assert!(
+                                !migrated(exact),
+                                "the exact old declaration is no migration: {:?}",
+                                reasons(&actions)
+                            );
                         }
                         super::super::Plan { actions }.check().unwrap();
                         assert_eq!(State::load(&machine.context).unwrap().records().count(), 1);
@@ -1274,10 +1429,34 @@ mod tests {
             let machine = machine();
             linked(&machine);
             let in_dir = |dir: &str| machine.home.join(dir).join("custom.json");
-            let owned = mcp_at(in_dir(owned_dir), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson);
-            let old_compatible = mcp_at(in_dir(owned_dir), McpFormat::Json, "/mcpServers", "old", McpShape::CursorJson);
-            let incompatible = mcp_at(in_dir(other_dir), McpFormat::Jsonc, "/mcpServers", "search", McpShape::CursorJson);
-            let compatible = mcp_at(in_dir(other_dir), McpFormat::Json, "/mcpServers", "search", McpShape::CursorJson);
+            let owned = mcp_at(
+                in_dir(owned_dir),
+                McpFormat::Json,
+                "/mcpServers",
+                "docs",
+                McpShape::CursorJson,
+            );
+            let old_compatible = mcp_at(
+                in_dir(owned_dir),
+                McpFormat::Json,
+                "/mcpServers",
+                "old",
+                McpShape::CursorJson,
+            );
+            let incompatible = mcp_at(
+                in_dir(other_dir),
+                McpFormat::Jsonc,
+                "/mcpServers",
+                "search",
+                McpShape::CursorJson,
+            );
+            let compatible = mcp_at(
+                in_dir(other_dir),
+                McpFormat::Json,
+                "/mcpServers",
+                "search",
+                McpShape::CursorJson,
+            );
             let whole_file = Desired {
                 item: ItemRef {
                     kind: ItemKind::File,
@@ -1294,10 +1473,22 @@ mod tests {
             };
             let owners = owning(&machine, std::slice::from_ref(&owned));
 
-            let (actions, problems) = with_unsupported(&machine, vec![desired(incompatible.clone())], vec![unsupported_at(owned.clone())], &owners);
+            let (actions, problems) = with_unsupported(
+                &machine,
+                vec![desired(incompatible.clone())],
+                vec![unsupported_at(owned.clone())],
+                &owners,
+            );
             assert!(problems.is_empty(), "{problems:?}");
-            assert_eq!(actions.len(), 2, "no removal and no second action for the old record: {actions:#?}");
-            assert!(matches!(of(&actions, &owned).change, Change::Unsupported(_)), "unsupported stays as it is");
+            assert_eq!(
+                actions.len(),
+                2,
+                "no removal and no second action for the old record: {actions:#?}"
+            );
+            assert!(
+                matches!(of(&actions, &owned).change, Change::Unsupported(_)),
+                "unsupported stays as it is"
+            );
             let blocked = of(&actions, &incompatible);
             assert!(guarded_by_old(blocked), "{:?}", reasons(&actions));
             assert!(
@@ -1308,21 +1499,48 @@ mod tests {
             assert!(blocked.content.is_none());
             super::super::Plan { actions }.check().unwrap();
 
-            let (actions, problems) = with_unsupported(&machine, vec![whole_file.clone()], vec![unsupported_at(owned.clone())], &owners);
+            let (actions, problems) = with_unsupported(
+                &machine,
+                vec![whole_file.clone()],
+                vec![unsupported_at(owned.clone())],
+                &owners,
+            );
             assert!(problems.is_empty(), "{problems:?}");
             let path = of(&actions, &whole_file.target);
-            assert!(guarded_by_old(path), "a whole-file writer of the owned document: {:?}", reasons(&actions));
+            assert!(
+                guarded_by_old(path),
+                "a whole-file writer of the owned document: {:?}",
+                reasons(&actions)
+            );
             assert!(path.content.is_none());
-            assert_eq!(path.prior, Observed::Absent, "the prior stays what was observed");
+            assert_eq!(
+                path.prior,
+                Observed::Absent,
+                "the prior stays what was observed"
+            );
             super::super::Plan { actions }.check().unwrap();
 
-            let (actions, problems) = with_unsupported(&machine, vec![desired(compatible.clone())], vec![unsupported_at(owned.clone())], &owners);
+            let (actions, problems) = with_unsupported(
+                &machine,
+                vec![desired(compatible.clone())],
+                vec![unsupported_at(owned.clone())],
+                &owners,
+            );
             assert!(problems.is_empty(), "{problems:?}");
-            assert!(!guarded_by_old(of(&actions, &compatible)), "same format, another key: {:?}", reasons(&actions));
+            assert!(
+                !guarded_by_old(of(&actions, &compatible)),
+                "same format, another key: {:?}",
+                reasons(&actions)
+            );
             super::super::Plan { actions }.check().unwrap();
 
             let both = owning(&machine, &[owned.clone(), old_compatible.clone()]);
-            let (actions, problems) = with_unsupported(&machine, Vec::new(), vec![unsupported_at(owned.clone())], &both);
+            let (actions, problems) = with_unsupported(
+                &machine,
+                Vec::new(),
+                vec![unsupported_at(owned.clone())],
+                &both,
+            );
             assert!(problems.is_empty(), "{problems:?}");
             let removal = of(&actions, &old_compatible);
             assert!(
@@ -1333,31 +1551,74 @@ mod tests {
             super::super::Plan { actions }.check().unwrap();
 
             let unowned = State::default();
-            let (actions, problems) = with_unsupported(&machine, vec![desired(incompatible.clone())], vec![unsupported_at(owned.clone())], &unowned);
+            let (actions, problems) = with_unsupported(
+                &machine,
+                vec![desired(incompatible.clone())],
+                vec![unsupported_at(owned.clone())],
+                &unowned,
+            );
             assert!(problems.is_empty(), "{problems:?}");
-            assert!(!guarded_by_old(of(&actions, &incompatible)), "nothing is owned: {:?}", reasons(&actions));
+            assert!(
+                !guarded_by_old(of(&actions, &incompatible)),
+                "nothing is owned: {:?}",
+                reasons(&actions)
+            );
             super::super::Plan { actions }.check().unwrap();
-            assert_eq!(State::load(&machine.context).unwrap().records().count(), 2, "the records are never changed");
+            assert_eq!(
+                State::load(&machine.context).unwrap().records().count(),
+                2,
+                "the records are never changed"
+            );
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_still_declared_owned_key_beside_a_distinct_key_or_the_same_contract_keeps_the_writer_rules() {
+    fn a_still_declared_owned_key_beside_a_distinct_key_or_the_same_contract_keeps_the_writer_rules()
+     {
         let machine = machine();
         linked(&machine);
-        let owned = mcp_at(machine.home.join("alias/custom.json"), McpFormat::Json, "/mcpServers", "my_docs", McpShape::CursorJson);
+        let owned = mcp_at(
+            machine.home.join("alias/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "my_docs",
+            McpShape::CursorJson,
+        );
         let state = owning(&machine, std::slice::from_ref(&owned));
 
-        let distinct = mcp_at(machine.home.join("real/custom.json"), McpFormat::Json, "/mcpServers", "other", McpShape::PiJson);
-        let (actions, problems) = compared(&machine, vec![desired(owned.clone()), desired(distinct.clone())], &state);
+        let distinct = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "other",
+            McpShape::PiJson,
+        );
+        let (actions, problems) = compared(
+            &machine,
+            vec![desired(owned.clone()), desired(distinct.clone())],
+            &state,
+        );
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(!migrated(of(&actions, &distinct)), "a distinct stored key: {:?}", reasons(&actions));
+        assert!(
+            !migrated(of(&actions, &distinct)),
+            "a distinct stored key: {:?}",
+            reasons(&actions)
+        );
         super::super::Plan { actions }.check().unwrap();
 
-        let same = mcp_at(machine.home.join("real/custom.json"), McpFormat::Json, "/mcpServers", "my_docs", McpShape::CursorJson);
+        let same = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "my_docs",
+            McpShape::CursorJson,
+        );
         let (_, problems) = compared(&machine, vec![desired(owned), desired(same)], &state);
-        assert!(problems.has_errors(), "two current writers of one key stay invalid");
+        assert!(
+            problems.has_errors(),
+            "two current writers of one key stay invalid"
+        );
     }
 
     /// Two old contracts on one stored key (two spellings of one document) both guard it, and
@@ -1367,19 +1628,43 @@ mod tests {
     fn every_old_contract_on_one_stored_key_adds_its_own_reason_once() {
         let machine = machine();
         linked(&machine);
-        let cursor = mcp_at(machine.home.join("alias/custom.json"), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson);
-        let claude = mcp_at(machine.home.join("real/custom.json"), McpFormat::Json, "/mcpServers", "docs", McpShape::ClaudeJson);
-        let declared = mcp_at(machine.home.join("real/custom.json"), McpFormat::Json, "/mcpServers", "docs", McpShape::PiJson);
+        let cursor = mcp_at(
+            machine.home.join("alias/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "docs",
+            McpShape::CursorJson,
+        );
+        let claude = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "docs",
+            McpShape::ClaudeJson,
+        );
+        let declared = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "docs",
+            McpShape::PiJson,
+        );
         let state = owning(&machine, &[cursor, claude]);
         let (actions, problems) = compared(&machine, vec![desired(declared.clone())], &state);
         assert!(problems.is_empty(), "{problems:?}");
         let Change::Blocked(reason) = &of(&actions, &declared).change else {
             panic!("{actions:#?}");
         };
-        assert!(reason.contains(ENTRY_REFUSAL), "the first refusal stays: {reason}");
+        assert!(
+            reason.contains(ENTRY_REFUSAL),
+            "the first refusal stays: {reason}"
+        );
         assert_eq!(reason.matches("as json cursor-json").count(), 1, "{reason}");
         assert_eq!(reason.matches("as json claude-json").count(), 1, "{reason}");
-        assert!(reason.find(ENTRY_REFUSAL) < reason.find("doesn't convert"), "{reason}");
+        assert!(
+            reason.find(ENTRY_REFUSAL) < reason.find("doesn't convert"),
+            "{reason}"
+        );
         super::super::Plan { actions }.check().unwrap();
     }
 
@@ -1388,12 +1673,28 @@ mod tests {
     fn an_owned_key_reached_through_a_link_under_the_same_contract_is_no_migration() {
         let machine = machine();
         linked(&machine);
-        let owned = mcp_at(machine.home.join("alias/custom.json"), McpFormat::Json, "/mcpServers", "my_docs", McpShape::CursorJson);
-        let declared = mcp_at(machine.home.join("real/custom.json"), McpFormat::Json, "/mcpServers", "my_docs", McpShape::CursorJson);
+        let owned = mcp_at(
+            machine.home.join("alias/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "my_docs",
+            McpShape::CursorJson,
+        );
+        let declared = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "my_docs",
+            McpShape::CursorJson,
+        );
         let state = owning(&machine, std::slice::from_ref(&owned));
         let (actions, problems) = compared(&machine, vec![desired(declared.clone())], &state);
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(!migrated(of(&actions, &declared)), "{:?}", reasons(&actions));
+        assert!(
+            !migrated(of(&actions, &declared)),
+            "{:?}",
+            reasons(&actions)
+        );
         assert!(!migrated(of(&actions, &owned)), "{:?}", reasons(&actions));
         super::super::Plan { actions }.check().unwrap();
     }
@@ -1405,7 +1706,15 @@ mod tests {
     fn a_retained_old_contract_guards_the_document_against_siblings_under_another_format() {
         let machine = machine();
         let file = machine.home.join("custom.json");
-        let at = |format, key: &str| mcp_at(file.clone(), format, "/mcpServers", key, McpShape::CursorJson);
+        let at = |format, key: &str| {
+            mcp_at(
+                file.clone(),
+                format,
+                "/mcpServers",
+                key,
+                McpShape::CursorJson,
+            )
+        };
         let owned_docs = at(McpFormat::Json, "docs");
         let owned_search = at(McpFormat::Json, "search");
         let declared_docs = at(McpFormat::Jsonc, "docs");
@@ -1413,14 +1722,28 @@ mod tests {
         let json_sibling = at(McpFormat::Json, "third");
 
         for order in [
-            vec![desired(declared_docs.clone()), desired(jsonc_sibling.clone())],
-            vec![desired(jsonc_sibling.clone()), desired(declared_docs.clone())],
+            vec![
+                desired(declared_docs.clone()),
+                desired(jsonc_sibling.clone()),
+            ],
+            vec![
+                desired(jsonc_sibling.clone()),
+                desired(declared_docs.clone()),
+            ],
         ] {
             let state = owning(&machine, std::slice::from_ref(&owned_docs));
             let (actions, problems) = compared(&machine, order, &state);
             assert!(problems.is_empty(), "{problems:?}");
-            assert_eq!(actions.len(), 2, "one migration action and the sibling, no removal: {actions:#?}");
-            assert!(kept_then_migrated(of(&actions, &declared_docs)), "{:?}", reasons(&actions));
+            assert_eq!(
+                actions.len(),
+                2,
+                "one migration action and the sibling, no removal: {actions:#?}"
+            );
+            assert!(
+                kept_then_migrated(of(&actions, &declared_docs)),
+                "{:?}",
+                reasons(&actions)
+            );
             assert!(
                 matches!(&of(&actions, &jsonc_sibling).change, Change::Blocked(reason) if reason.contains(ENTRY_REFUSAL) && reason.contains("still owns") && reason.contains("json cursor-json")),
                 "{:?}",
@@ -1432,7 +1755,11 @@ mod tests {
         let state = owning(&machine, &[owned_docs.clone(), owned_search.clone()]);
         let (actions, problems) = compared(&machine, vec![desired(declared_docs.clone())], &state);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(actions.len(), 2, "the migration and the old search's removal: {actions:#?}");
+        assert_eq!(
+            actions.len(),
+            2,
+            "the migration and the old search's removal: {actions:#?}"
+        );
         assert!(
             !matches!(&of(&actions, &owned_search).change, Change::Blocked(reason) if reason.contains("still owns") || reason.contains("loadout owns")),
             "the old json search is judged against the old json docs, which it doesn't touch, not against the new jsonc declaration: {:?}",
@@ -1441,8 +1768,18 @@ mod tests {
         super::super::Plan { actions }.check().unwrap();
 
         let state = owning(&machine, std::slice::from_ref(&owned_docs));
-        let (actions, problems) = compared(&machine, vec![desired(declared_docs.clone()), desired(json_sibling.clone())], &state);
-        assert!(problems.has_errors(), "two current formats in one document stay invalid");
+        let (actions, problems) = compared(
+            &machine,
+            vec![
+                desired(declared_docs.clone()),
+                desired(json_sibling.clone()),
+            ],
+            &state,
+        );
+        assert!(
+            problems.has_errors(),
+            "two current formats in one document stay invalid"
+        );
         drop(actions);
 
         let state = owning(&machine, std::slice::from_ref(&owned_docs));
@@ -1468,7 +1805,10 @@ mod tests {
         )
         .unwrap();
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(matches!(of(&actions, &jsonc_sibling).change, Change::Unsupported(_)));
+        assert!(matches!(
+            of(&actions, &jsonc_sibling).change,
+            Change::Unsupported(_)
+        ));
         super::super::Plan { actions }.check().unwrap();
     }
 
@@ -1476,10 +1816,26 @@ mod tests {
     fn an_unchanged_contract_retains_nothing_and_guards_no_compatible_sibling() {
         let machine = machine();
         let file = machine.home.join("custom.json");
-        let docs = mcp_at(file.clone(), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson);
-        let search = mcp_at(file, McpFormat::Json, "/mcpServers", "search", McpShape::CursorJson);
+        let docs = mcp_at(
+            file.clone(),
+            McpFormat::Json,
+            "/mcpServers",
+            "docs",
+            McpShape::CursorJson,
+        );
+        let search = mcp_at(
+            file,
+            McpFormat::Json,
+            "/mcpServers",
+            "search",
+            McpShape::CursorJson,
+        );
         let state = owning(&machine, std::slice::from_ref(&docs));
-        let (actions, problems) = compared(&machine, vec![desired(docs.clone()), desired(search.clone())], &state);
+        let (actions, problems) = compared(
+            &machine,
+            vec![desired(docs.clone()), desired(search.clone())],
+            &state,
+        );
         assert!(problems.is_empty(), "{problems:?}");
         for target in [&docs, &search] {
             assert!(
@@ -1496,14 +1852,44 @@ mod tests {
     fn a_retained_old_contract_reached_through_a_link_guards_siblings_too() {
         let machine = machine();
         linked(&machine);
-        let owned = mcp_at(machine.home.join("alias/custom.json"), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson);
-        let declared = mcp_at(machine.home.join("real/custom.json"), McpFormat::Jsonc, "/mcpServers", "docs", McpShape::CursorJson);
-        let sibling = mcp_at(machine.home.join("real/custom.json"), McpFormat::Jsonc, "/mcpServers", "search", McpShape::CursorJson);
+        let owned = mcp_at(
+            machine.home.join("alias/custom.json"),
+            McpFormat::Json,
+            "/mcpServers",
+            "docs",
+            McpShape::CursorJson,
+        );
+        let declared = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Jsonc,
+            "/mcpServers",
+            "docs",
+            McpShape::CursorJson,
+        );
+        let sibling = mcp_at(
+            machine.home.join("real/custom.json"),
+            McpFormat::Jsonc,
+            "/mcpServers",
+            "search",
+            McpShape::CursorJson,
+        );
         let state = owning(&machine, std::slice::from_ref(&owned));
-        let (actions, problems) = compared(&machine, vec![desired(sibling.clone()), desired(declared.clone())], &state);
+        let (actions, problems) = compared(
+            &machine,
+            vec![desired(sibling.clone()), desired(declared.clone())],
+            &state,
+        );
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(kept_then_migrated(of(&actions, &declared)), "{:?}", reasons(&actions));
-        assert!(kept_then_migrated(of(&actions, &owned)), "{:?}", reasons(&actions));
+        assert!(
+            kept_then_migrated(of(&actions, &declared)),
+            "{:?}",
+            reasons(&actions)
+        );
+        assert!(
+            kept_then_migrated(of(&actions, &owned)),
+            "{:?}",
+            reasons(&actions)
+        );
         assert!(
             matches!(&of(&actions, &sibling).change, Change::Blocked(reason) if reason.contains(ENTRY_REFUSAL) && reason.contains("still owns")),
             "{:?}",
@@ -1532,9 +1918,20 @@ mod tests {
                 executable: false,
             }),
         };
-        let (_, problems) = compared(&machine, vec![file("real/tool"), file("alias/tool")], &State::default());
-        assert!(problems.has_errors(), "equal bytes don't make two writers one");
-        let (actions, problems) = compared(&machine, vec![file("real/a"), file("alias/b")], &State::default());
+        let (_, problems) = compared(
+            &machine,
+            vec![file("real/tool"), file("alias/tool")],
+            &State::default(),
+        );
+        assert!(
+            problems.has_errors(),
+            "equal bytes don't make two writers one"
+        );
+        let (actions, problems) = compared(
+            &machine,
+            vec![file("real/a"), file("alias/b")],
+            &State::default(),
+        );
         assert!(problems.is_empty(), "{problems:?}");
         assert!(actions.iter().all(|action| action.change == Change::Create));
     }

@@ -81,8 +81,19 @@ fn at<'a>(built: &'a plan::Built, path: &Path) -> &'a Action {
         .plan
         .actions
         .iter()
-        .find(|action| action.target == Target::Path { path: path.to_path_buf() })
-        .unwrap_or_else(|| panic!("no action for {}: {:#?}", path.display(), built.plan.actions))
+        .find(|action| {
+            action.target
+                == Target::Path {
+                    path: path.to_path_buf(),
+                }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no action for {}: {:#?}",
+                path.display(),
+                built.plan.actions
+            )
+        })
 }
 
 fn file_bytes(action: &Action) -> &[u8] {
@@ -117,7 +128,10 @@ fn a_fresh_machine_plans_a_create_for_each_file_skill_and_instructions_and_write
     ]);
     let built = build(&machine).unwrap();
     let gitconfig = at(&built, &machine.home.join(".gitconfig"));
-    let skill = at(&built, &machine.home.join(".claude").join("skills").join("review"));
+    let skill = at(
+        &built,
+        &machine.home.join(".claude").join("skills").join("review"),
+    );
     let instructions = at(&built, &machine.home.join(".claude").join("CLAUDE.md"));
     for action in [gitconfig, skill, instructions] {
         assert_eq!(action.change, Change::Create, "{action:?}");
@@ -248,7 +262,10 @@ fn an_unowned_target_that_matches_is_adopted_and_one_that_differs_is_replaced() 
     fs::write(machine.home.join(".same"), "same").unwrap();
     fs::write(machine.home.join(".other"), "the user's").unwrap();
     let built = build(&machine).unwrap();
-    assert_eq!(at(&built, &machine.home.join(".same")).change, Change::Adopt);
+    assert_eq!(
+        at(&built, &machine.home.join(".same")).change,
+        Change::Adopt
+    );
     let other = at(&built, &machine.home.join(".other"));
     assert_eq!(other.change, Change::Replace);
     assert!(matches!(other.prior, Observed::Present { .. }));
@@ -276,7 +293,10 @@ fn agents_without_an_instructions_file_get_unsupported_actions_with_no_target() 
         .collect();
     assert_eq!(none.len(), 2, "{:#?}", built.plan.actions);
     for action in none {
-        assert!(matches!(action.change, Change::Unsupported(_)), "{action:?}");
+        assert!(
+            matches!(action.change, Change::Unsupported(_)),
+            "{action:?}"
+        );
         assert_eq!(action.prior, Observed::Absent);
         assert!(action.content.is_none());
     }
@@ -318,14 +338,8 @@ fn an_interrupted_run_blocks_every_new_plan_until_it_is_rolled_back() {
     let built = build(&machine).unwrap();
     let lock = state::lock(&machine.context).unwrap();
     let state = State::load(&machine.context).unwrap();
-    let run = state::Run::begin(
-        &machine.context,
-        &built.checkout,
-        lock,
-        &state,
-        &built.plan,
-    )
-    .unwrap();
+    let run =
+        state::Run::begin(&machine.context, &built.checkout, lock, &state, &built.plan).unwrap();
     drop(run);
     let Err(plan::Error::Blocked(message)) = build(&machine) else {
         panic!("an interrupted run must block planning");
@@ -337,15 +351,13 @@ fn an_interrupted_run_blocks_every_new_plan_until_it_is_rolled_back() {
 
 #[test]
 fn an_unowned_mcp_server_that_differs_is_blocked_and_its_file_is_never_touched() {
-    let machine = machine(&[
-        (
-            "loadout.toml",
-            &format!(
-                "{HEADER}[agents]\nenabled = [\"claude\"]\n\
+    let machine = machine(&[(
+        "loadout.toml",
+        &format!(
+            "{HEADER}[agents]\nenabled = [\"claude\"]\n\
                  [mcp.docs]\ncommand = \"docs-server\"\n"
-            ),
         ),
-    ]);
+    )]);
     let claude = machine.home.join(".claude.json");
     let original = "{\"oauthAccount\":{\"id\":\"SENTINEL\"},\"mcpServers\":{\"docs\":{\"type\":\"stdio\",\"command\":\"the-users-own\",\"args\":[],\"env\":{}}}}";
     fs::write(&claude, original).unwrap();
@@ -465,13 +477,18 @@ fn an_owned_key_refused_for_its_agent_keeps_guarding_its_document_through_a_link
             fs::create_dir_all(&machine.state).unwrap();
             fs::write(
                 machine.state.join("state.json"),
-                serde_json::to_vec(&serde_json::json!({ "version": 1, "records": [record] })).unwrap(),
+                serde_json::to_vec(&serde_json::json!({ "version": 1, "records": [record] }))
+                    .unwrap(),
             )
             .unwrap();
         }
         let built = build(&machine).expect("a refusal is a typed plan, not an error");
         let actions = &built.plan.actions;
-        assert_eq!(actions.len(), 2, "no removal and no action for the old record: {actions:#?}");
+        assert_eq!(
+            actions.len(),
+            2,
+            "no removal and no action for the old record: {actions:#?}"
+        );
         let refused = actions
             .iter()
             .find(|action| action.target == docs)
@@ -495,11 +512,18 @@ fn an_owned_key_refused_for_its_agent_keeps_guarding_its_document_through_a_link
             owned,
             "{reason}"
         );
-        assert!(reason.contains("needs the mcp module"), "the first refusal stays: {reason}");
+        assert!(
+            reason.contains("needs the mcp module"),
+            "the first refusal stays: {reason}"
+        );
         assert!(!actions.iter().any(|action| action.change == Change::Remove));
         built.plan.check().unwrap();
         let records = State::load(&machine.context).unwrap();
-        assert_eq!(records.records().count(), usize::from(owned), "the record stays as it was");
+        assert_eq!(
+            records.records().count(),
+            usize::from(owned),
+            "the record stays as it was"
+        );
         assert!(!machine.home.join("real").join("custom.json").exists());
     }
 }

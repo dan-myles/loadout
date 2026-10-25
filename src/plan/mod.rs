@@ -261,19 +261,24 @@ pub fn build(
     options: Options,
 ) -> Result<Built, Error> {
     interrupted(context)?;
-    let (loadout, mut warnings) = Loadout::load_guarded(checkout, context).map_err(Error::Invalid)?;
+    let (loadout, mut warnings) =
+        Loadout::load_guarded(checkout, context).map_err(Error::Invalid)?;
     let root = loadout.root.clone();
     let facts = machine::detect(context).map_err(|error| match error {
         machine::Error::Invalid { .. } => Error::Blocked(format!(
             "this machine's saved identity is invalid: {error}; doctor shows the details"
         )),
-        other => Error::Runtime(anyhow::Error::new(other).context("cannot read this machine's facts")),
+        other => {
+            Error::Runtime(anyhow::Error::new(other).context("cannot read this machine's facts"))
+        }
     })?;
-    let (resolved, resolve_warnings) = resolve::resolve(&loadout, &facts).map_err(Error::Invalid)?;
+    let (resolved, resolve_warnings) =
+        resolve::resolve(&loadout, &facts).map_err(Error::Invalid)?;
     warnings.extend(resolve_warnings);
 
     let mut problems = Diagnostics::default();
-    let sources = Sources::new(context, &root).map_err(|message| Error::Invalid(one("", message)))?;
+    let sources =
+        Sources::new(context, &root).map_err(|message| Error::Invalid(one("", message)))?;
     let mut produced = files::produce(&resolved, &facts, context, &root, &sources, &mut problems);
     match agents::materialize(&resolved, context, &root) {
         Ok((desired, unsupported)) => {

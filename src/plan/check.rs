@@ -26,7 +26,9 @@ impl Plan {
                 Target::Entry {
                     file, pointer, key, ..
                 } => Identity::Entry(file.clone(), pointer.clone(), key.clone()),
-                Target::Program { manager, package } => Identity::Program(*manager, package.clone()),
+                Target::Program { manager, package } => {
+                    Identity::Program(*manager, package.clone())
+                }
             };
             if !seen.insert(identity) {
                 return Err(format!("{} appears twice in the plan", describe(action)));
@@ -54,7 +56,11 @@ fn shape(action: &Action) -> Result<(), &'static str> {
             let prior = match action.change {
                 Change::Install | Change::Unsupported(_) | Change::Blocked(_) => Observed::Absent,
                 Change::Unchanged => Observed::Installed,
-                _ => return Err("a program can only be installed, unchanged, unsupported, or blocked"),
+                _ => {
+                    return Err(
+                        "a program can only be installed, unchanged, unsupported, or blocked",
+                    );
+                }
             };
             if action.prior != prior {
                 return Err("a program action's prior doesn't fit its change");
@@ -84,7 +90,10 @@ fn shape(action: &Action) -> Result<(), &'static str> {
                         return Err("a write needs content of its target's kind");
                     }
                 }
-                Change::Remove | Change::Unchanged | Change::Unsupported(_) | Change::Blocked(_) => {
+                Change::Remove
+                | Change::Unchanged
+                | Change::Unsupported(_)
+                | Change::Blocked(_) => {
                     if action.content.is_some() {
                         return Err("only a write carries content");
                     }
@@ -167,8 +176,16 @@ mod tests {
     fn several_valid_none_actions_share_a_plan() {
         let none = |change| action(Target::None, change, Observed::Absent, None);
         check(vec![
-            Action::unsupported(item(ItemKind::Instructions, "a"), Target::None, "no file".into()),
-            Action::unsupported(item(ItemKind::Instructions, "b"), Target::None, "no file".into()),
+            Action::unsupported(
+                item(ItemKind::Instructions, "a"),
+                Target::None,
+                "no file".into(),
+            ),
+            Action::unsupported(
+                item(ItemKind::Instructions, "b"),
+                Target::None,
+                "no file".into(),
+            ),
             none(Change::Blocked("isolated".into())),
             none(Change::Blocked("isolated".into())),
         ])
@@ -188,7 +205,12 @@ mod tests {
                 },
                 None,
             ),
-            action(Target::None, Change::Blocked("b".into()), Observed::Absent, Some(file())),
+            action(
+                Target::None,
+                Change::Blocked("b".into()),
+                Observed::Absent,
+                Some(file()),
+            ),
         ] {
             assert!(check(vec![bad.clone()]).is_err(), "{bad:?}");
         }
@@ -196,7 +218,14 @@ mod tests {
 
     #[test]
     fn a_concrete_destination_twice_is_refused() {
-        let create = || action(path("/h/.a"), Change::Create, Observed::Absent, Some(file()));
+        let create = || {
+            action(
+                path("/h/.a"),
+                Change::Create,
+                Observed::Absent,
+                Some(file()),
+            )
+        };
         assert!(check(vec![create(), create()]).is_err());
         let entry_write = |key: &str| {
             let mut target = entry();
@@ -228,8 +257,22 @@ mod tests {
     #[test]
     fn writes_need_content_of_their_kind_and_entries_are_never_replaced() {
         let tree = Content::Tree(BTreeMap::new());
-        check(vec![action(path("/h/.s"), Change::Create, Observed::Absent, Some(tree))]).unwrap();
-        assert!(check(vec![action(path("/h/.a"), Change::Update, Observed::Absent, None)]).is_err());
+        check(vec![action(
+            path("/h/.s"),
+            Change::Create,
+            Observed::Absent,
+            Some(tree),
+        )])
+        .unwrap();
+        assert!(
+            check(vec![action(
+                path("/h/.a"),
+                Change::Update,
+                Observed::Absent,
+                None
+            )])
+            .is_err()
+        );
         assert!(
             check(vec![action(
                 path("/h/.a"),
@@ -250,7 +293,15 @@ mod tests {
             )])
             .is_err()
         );
-        assert!(check(vec![action(path("/h/.a"), Change::Install, Observed::Absent, None)]).is_err());
+        assert!(
+            check(vec![action(
+                path("/h/.a"),
+                Change::Install,
+                Observed::Absent,
+                None
+            )])
+            .is_err()
+        );
     }
 
     #[test]
@@ -258,7 +309,13 @@ mod tests {
         let seen = || Observed::Present {
             sha256: "a".repeat(64),
         };
-        check(vec![action(entry(), Change::Blocked("not owned".into()), seen(), None)]).unwrap();
+        check(vec![action(
+            entry(),
+            Change::Blocked("not owned".into()),
+            seen(),
+            None,
+        )])
+        .unwrap();
         assert!(
             check(vec![action(
                 entry(),
@@ -269,7 +326,13 @@ mod tests {
             .is_err()
         );
         assert!(
-            check(vec![action(entry(), Change::Unsupported("u".into()), seen(), None)]).is_err()
+            check(vec![action(
+                entry(),
+                Change::Unsupported("u".into()),
+                seen(),
+                None
+            )])
+            .is_err()
         );
         assert!(
             check(vec![action(

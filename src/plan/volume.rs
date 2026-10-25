@@ -126,7 +126,10 @@ mod tests {
     fn only_paths_that_differ_by_case_alone_are_pairs_with_their_deciding_folders() {
         assert_eq!(case_pair(Path::new("/h/.a"), Path::new("/h/.b")), None);
         assert_eq!(case_pair(Path::new("/h/.a"), Path::new("/h/.a")), None);
-        assert_eq!(case_pair(Path::new("/h/alias/Foo"), Path::new("/h/real/foo")), None);
+        assert_eq!(
+            case_pair(Path::new("/h/alias/Foo"), Path::new("/h/real/foo")),
+            None
+        );
         assert_eq!(
             case_pair(Path::new("/h/x/Foo"), Path::new("/h/x/foo")),
             Some(CasePair {

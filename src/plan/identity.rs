@@ -66,10 +66,14 @@ pub(super) enum Verdict {
     Disjoint,
     /// They are one destination, or one sits inside the other. `case` names the folder whose
     /// proven case-insensitivity made two spellings one, when that is how they met.
-    Conflict { case: Option<PathBuf> },
+    Conflict {
+        case: Option<PathBuf>,
+    },
     /// They might be one destination: the folder that decides couldn't be shown to tell the
     /// two spellings apart or not.
-    Unknown { dir: PathBuf },
+    Unknown {
+        dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +210,11 @@ pub(super) fn relate(
             let Some(pair) = volume::case_pair(a, b) else {
                 continue;
             };
-            let relation = if pair.same { Relation::Same } else { Relation::Nested };
+            let relation = if pair.same {
+                Relation::Same
+            } else {
+                Relation::Nested
+            };
             if apart(one.0, other.0, relation) {
                 continue;
             }
@@ -301,11 +309,26 @@ mod tests {
             ["mcp/servers", "a~b", "docs"]
         );
         assert_eq!(address("/a~01", "k", McpShape::CursorJson), ["a~1", "k"]);
-        assert_eq!(address("/mcpServers", "my_docs", McpShape::PiJson), ["mcpServers", "my-docs"]);
-        assert_eq!(address("/mcpServers", "my_docs", McpShape::CursorJson), ["mcpServers", "my_docs"]);
-        assert!(nested(&address("/servers", "group", McpShape::ClaudeJson), &address("/servers/group", "env", McpShape::ClaudeJson)));
-        assert!(nested(&address("/servers/group", "env", McpShape::ClaudeJson), &address("/servers", "group", McpShape::ClaudeJson)));
-        assert!(!nested(&address("/mcpServers", "docs", McpShape::ClaudeJson), &address("/mcpServers", "search", McpShape::ClaudeJson)));
+        assert_eq!(
+            address("/mcpServers", "my_docs", McpShape::PiJson),
+            ["mcpServers", "my-docs"]
+        );
+        assert_eq!(
+            address("/mcpServers", "my_docs", McpShape::CursorJson),
+            ["mcpServers", "my_docs"]
+        );
+        assert!(nested(
+            &address("/servers", "group", McpShape::ClaudeJson),
+            &address("/servers/group", "env", McpShape::ClaudeJson)
+        ));
+        assert!(nested(
+            &address("/servers/group", "env", McpShape::ClaudeJson),
+            &address("/servers", "group", McpShape::ClaudeJson)
+        ));
+        assert!(!nested(
+            &address("/mcpServers", "docs", McpShape::ClaudeJson),
+            &address("/mcpServers", "search", McpShape::ClaudeJson)
+        ));
         assert_eq!(address("/a~1b", "k", McpShape::ClaudeJson), ["a/b", "k"]);
         assert!(!nested(
             &address("/a~1b", "k", McpShape::ClaudeJson),
@@ -314,37 +337,90 @@ mod tests {
     }
 
     #[test]
-    fn entries_in_one_document_conflict_on_nested_addresses_pi_names_or_formats_and_not_otherwise() {
+    fn entries_in_one_document_conflict_on_nested_addresses_pi_names_or_formats_and_not_otherwise()
+    {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         let context = context(&home);
         let doc = || home.join("custom.json");
-        assert_eq!(exact(&context, &entry(doc(), "/servers", "group"), &entry(doc(), "/servers/group", "env")), CONFLICT);
-        assert_eq!(exact(&context, &entry(doc(), "/servers/group", "env"), &entry(doc(), "/servers", "group")), CONFLICT);
-        assert_eq!(exact(&context, &entry(doc(), "/mcpServers", "docs"), &entry(doc(), "/mcpServers", "search")), Verdict::Disjoint);
         assert_eq!(
             exact(
                 &context,
-                &mcp(doc(), McpFormat::Json, "/mcpServers", "my_docs", McpShape::PiJson),
-                &mcp(doc(), McpFormat::Json, "/mcpServers", "my-docs", McpShape::PiJson)
+                &entry(doc(), "/servers", "group"),
+                &entry(doc(), "/servers/group", "env")
             ),
             CONFLICT
         );
         assert_eq!(
             exact(
                 &context,
-                &mcp(doc(), McpFormat::Json, "/mcpServers", "docs", McpShape::CursorJson),
-                &mcp(doc(), McpFormat::Jsonc, "/other", "search", McpShape::CursorJson)
+                &entry(doc(), "/servers/group", "env"),
+                &entry(doc(), "/servers", "group")
+            ),
+            CONFLICT
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &entry(doc(), "/mcpServers", "docs"),
+                &entry(doc(), "/mcpServers", "search")
+            ),
+            Verdict::Disjoint
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &mcp(
+                    doc(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "my_docs",
+                    McpShape::PiJson
+                ),
+                &mcp(
+                    doc(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "my-docs",
+                    McpShape::PiJson
+                )
+            ),
+            CONFLICT
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &mcp(
+                    doc(),
+                    McpFormat::Json,
+                    "/mcpServers",
+                    "docs",
+                    McpShape::CursorJson
+                ),
+                &mcp(
+                    doc(),
+                    McpFormat::Jsonc,
+                    "/other",
+                    "search",
+                    McpShape::CursorJson
+                )
             ),
             CONFLICT,
             "one file has one format"
         );
         assert_eq!(
-            exact(&context, &entry(doc(), "/mcp~1servers", "docs"), &entry(doc(), "/mcp", "servers")),
+            exact(
+                &context,
+                &entry(doc(), "/mcp~1servers", "docs"),
+                &entry(doc(), "/mcp", "servers")
+            ),
             Verdict::Disjoint,
             "an escaped slash is part of one name"
         );
-        assert_eq!(exact(&context, &at(doc()), &entry(doc(), "/mcpServers", "docs")), CONFLICT);
+        assert_eq!(
+            exact(&context, &at(doc()), &entry(doc(), "/mcpServers", "docs")),
+            CONFLICT
+        );
     }
 
     #[test]
@@ -352,8 +428,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         let context = context(&home);
-        assert_eq!(exact(&context, &at(home.join(".tool")), &at(home.join(".tool/settings"))), CONFLICT);
-        assert_eq!(exact(&context, &at(home.join(".tool")), &at(home.join(".tools"))), Verdict::Disjoint);
+        assert_eq!(
+            exact(
+                &context,
+                &at(home.join(".tool")),
+                &at(home.join(".tool/settings"))
+            ),
+            CONFLICT
+        );
+        assert_eq!(
+            exact(&context, &at(home.join(".tool")), &at(home.join(".tools"))),
+            Verdict::Disjoint
+        );
     }
 
     #[cfg(unix)]
@@ -364,15 +450,44 @@ mod tests {
         fs::create_dir(home.join("real")).unwrap();
         std::os::unix::fs::symlink("real", home.join("alias")).unwrap();
         let context = context(&home);
-        assert_eq!(exact(&context, &at(home.join("alias/tool")), &at(home.join("real/tool"))), CONFLICT);
-        assert_eq!(exact(&context, &at(home.join("alias")), &at(home.join("real/tool"))), CONFLICT);
-        assert_eq!(exact(&context, &at(home.join("alias/a")), &at(home.join("real/b"))), Verdict::Disjoint);
         assert_eq!(
-            exact(&context, &entry(home.join("alias/mcp.json"), "/servers", "group"), &entry(home.join("real/mcp.json"), "/servers/group", "env")),
+            exact(
+                &context,
+                &at(home.join("alias/tool")),
+                &at(home.join("real/tool"))
+            ),
             CONFLICT
         );
         assert_eq!(
-            exact(&context, &entry(home.join("alias/mcp.json"), "/mcpServers", "docs"), &entry(home.join("real/mcp.json"), "/mcpServers", "other")),
+            exact(
+                &context,
+                &at(home.join("alias")),
+                &at(home.join("real/tool"))
+            ),
+            CONFLICT
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &at(home.join("alias/a")),
+                &at(home.join("real/b"))
+            ),
+            Verdict::Disjoint
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &entry(home.join("alias/mcp.json"), "/servers", "group"),
+                &entry(home.join("real/mcp.json"), "/servers/group", "env")
+            ),
+            CONFLICT
+        );
+        assert_eq!(
+            exact(
+                &context,
+                &entry(home.join("alias/mcp.json"), "/mcpServers", "docs"),
+                &entry(home.join("real/mcp.json"), "/mcpServers", "other")
+            ),
             Verdict::Disjoint
         );
     }
@@ -402,13 +517,21 @@ mod tests {
                 case: Some(home.join("real"))
             }
         );
-        assert!(asked.borrow().contains(&home.join("real")), "the real folder decides");
+        assert!(
+            asked.borrow().contains(&home.join("real")),
+            "the real folder decides"
+        );
         let sensitive = as_case(Case::Sensitive);
-        assert_eq!(verdict(&context, &foo, &bar, Some(&sensitive)), Verdict::Disjoint);
+        assert_eq!(
+            verdict(&context, &foo, &bar, Some(&sensitive)),
+            Verdict::Disjoint
+        );
         let unknown = as_case(Case::Unknown);
         assert_eq!(
             verdict(&context, &foo, &bar, Some(&unknown)),
-            Verdict::Unknown { dir: home.join("real") }
+            Verdict::Unknown {
+                dir: home.join("real")
+            }
         );
         let keys = (
             entry(home.join("alias/Mcp.json"), "/mcpServers", "docs"),
@@ -420,7 +543,12 @@ mod tests {
             "compatible keys in one document stay apart, case or not"
         );
         assert_eq!(
-            verdict(&context, &at(home.join("alias/a")), &at(home.join("real/b")), Some(&insensitive)),
+            verdict(
+                &context,
+                &at(home.join("alias/a")),
+                &at(home.join("real/b")),
+                Some(&insensitive)
+            ),
             Verdict::Disjoint
         );
     }
@@ -433,17 +561,34 @@ mod tests {
         let one = at(home.join("X/foo"));
         let other = at(home.join("x/Foo"));
         let mixed = |prefix: &Path| {
-            let case = if prefix == home { Case::Insensitive } else { Case::Unknown };
+            let case = if prefix == home {
+                Case::Insensitive
+            } else {
+                Case::Unknown
+            };
             (prefix.to_path_buf(), case)
         };
-        assert!(matches!(verdict(&context, &one, &other, Some(&mixed)), Verdict::Unknown { .. }));
+        assert!(matches!(
+            verdict(&context, &one, &other, Some(&mixed)),
+            Verdict::Unknown { .. }
+        ));
         let split = |prefix: &Path| {
-            let case = if prefix == home { Case::Insensitive } else { Case::Sensitive };
+            let case = if prefix == home {
+                Case::Insensitive
+            } else {
+                Case::Sensitive
+            };
             (prefix.to_path_buf(), case)
         };
-        assert_eq!(verdict(&context, &one, &other, Some(&split)), Verdict::Disjoint);
+        assert_eq!(
+            verdict(&context, &one, &other, Some(&split)),
+            Verdict::Disjoint
+        );
         let all = |prefix: &Path| (prefix.to_path_buf(), Case::Insensitive);
-        assert!(matches!(verdict(&context, &one, &other, Some(&all)), Verdict::Conflict { case: Some(_) }));
+        assert!(matches!(
+            verdict(&context, &one, &other, Some(&all)),
+            Verdict::Conflict { case: Some(_) }
+        ));
     }
 
     #[test]

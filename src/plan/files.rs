@@ -61,7 +61,10 @@ pub(super) fn produce(
             let Ok(text) = std::str::from_utf8(&copy.bytes) else {
                 problems.push(error(
                     &format!("files.{id}.source"),
-                    format!("{} is not UTF-8 text, which a template must be", name.display()),
+                    format!(
+                        "{} is not UTF-8 text, which a template must be",
+                        name.display()
+                    ),
                 ));
                 continue;
             };

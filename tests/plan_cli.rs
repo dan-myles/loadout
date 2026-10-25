@@ -76,7 +76,10 @@ fn plan_lists_each_change_and_writes_nothing() {
     assert_eq!(code(&output), 0, "{text}");
     assert!(text.contains("create"), "{text}");
     assert!(text.contains("(files.git)"), "{text}");
-    assert!(text.contains("2 of 2 actions would change this machine"), "{text}");
+    assert!(
+        text.contains("2 of 2 actions would change this machine"),
+        "{text}"
+    );
     assert!(!sandbox.state.exists());
     assert_eq!(fs::read_dir(&sandbox.home).unwrap().count(), 0);
 }
@@ -111,7 +114,11 @@ fn apply_then_plan_and_status_show_a_converged_machine() {
 
     let plan = sandbox.with_loadout("plan", &[]);
     assert_eq!(code(&plan), 0);
-    assert!(stdout(&plan).contains("0 of 2 actions would change this machine"), "{}", stdout(&plan));
+    assert!(
+        stdout(&plan).contains("0 of 2 actions would change this machine"),
+        "{}",
+        stdout(&plan)
+    );
     assert_eq!(code(&sandbox.run(&["status"])), 0);
 }
 

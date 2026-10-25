@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod apply;
 pub mod cli;
 pub mod commands;
 pub mod context;
@@ -12,7 +13,6 @@ pub mod platform;
 pub mod programs;
 pub mod reserved;
 pub mod resolve;
+pub mod source;
 pub mod state;
 pub mod template;
-pub mod source;
-pub mod apply;
