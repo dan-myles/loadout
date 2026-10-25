@@ -1503,6 +1503,32 @@ mod tests {
             "{}",
             describe(&unasked)
         );
+
+        // The first print (the registration check) finds the agent; the second (its arguments)
+        // finds it gone. A definite absence after a successful query is a mismatch, never a match.
+        let count = fakes.dir.path().join("launchctl.count");
+        fakes.tool(
+            "launchctl",
+            &format!(
+                "n=$(($(cat '{count}' 2>/dev/null || echo 0) + 1)); echo $n > '{count}'; if [ $n -ge 2 ]; then echo 'Could not find service \"dev.loadout.update\"' >&2; exit 113; fi; {}",
+                printed(exe_text),
+                count = count.display()
+            ),
+        );
+        let vanished = status(&fakes.context).unwrap();
+        assert!(
+            vanished
+                .scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.registered),
+            "the first query found it"
+        );
+        assert!(!vanished.healthy(), "{}", describe(&vanished));
+        assert!(
+            describe(&vanished).contains("doesn't have"),
+            "{}",
+            describe(&vanished)
+        );
     }
 
     /// A registered Windows task whose definition can't be read back is never healthy, even
@@ -1519,18 +1545,38 @@ mod tests {
             "schtasks",
             "case \"$4\" in /XML) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
         );
-        let status = status(&fakes.context).unwrap();
+        let denied = status(&fakes.context).unwrap();
         assert!(
-            status
+            denied
                 .scheduler
                 .as_ref()
                 .is_some_and(|scheduler| scheduler.registered)
         );
-        assert!(!status.healthy(), "{}", describe(&status));
+        assert!(!denied.healthy(), "{}", describe(&denied));
         assert!(
-            describe(&status).contains("Access is denied"),
+            describe(&denied).contains("Access is denied"),
             "{}",
-            describe(&status)
+            describe(&denied)
+        );
+
+        // The plain `/Query` finds the task, then `/Query /XML` can't: a definite absence after
+        // a successful query is a mismatch, never a match.
+        fakes.tool(
+            "schtasks",
+            "case \"$4\" in /XML) echo 'ERROR: The system cannot find the file specified.' >&2; exit 1;; esac",
+        );
+        let vanished = status(&fakes.context).unwrap();
+        assert!(
+            vanished
+                .scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.registered)
+        );
+        assert!(!vanished.healthy(), "{}", describe(&vanished));
+        assert!(
+            describe(&vanished).contains("no task Loadout Update"),
+            "{}",
+            describe(&vanished)
         );
     }
 
