@@ -57,6 +57,7 @@ mod unix {
 
     const TARGET: &str = "x86_64-unknown-linux-musl";
     const ASSET: &str = "loadout-x86_64-unknown-linux-musl.tar.gz";
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
     type Routes = Arc<Mutex<BTreeMap<String, (u16, Vec<(String, String)>, Vec<u8>)>>>;
 
@@ -205,17 +206,54 @@ mod unix {
             installed(&self.exe, false, TARGET, &Version::new(1, 0, 0))
         }
 
+        /// Every entry of the folder: a file's bytes, a link's target, or a folder marker.
         fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
             fs::read_dir(self.dir.path())
                 .unwrap()
                 .map(|entry| {
                     let entry = entry.unwrap();
-                    (
-                        entry.file_name().into_string().unwrap(),
-                        fs::read(entry.path()).unwrap(),
-                    )
+                    let kind = entry.file_type().unwrap();
+                    let content = if kind.is_symlink() {
+                        let target = fs::read_link(entry.path()).unwrap();
+                        [b"link:".as_slice(), target.as_os_str().as_encoded_bytes()].concat()
+                    } else if kind.is_dir() {
+                        b"folder".to_vec()
+                    } else {
+                        fs::read(entry.path()).unwrap()
+                    };
+                    (entry.file_name().into_string().unwrap(), content)
                 })
                 .collect()
+        }
+
+        fn launcher(&self) -> PathBuf {
+            self.exe.with_file_name("loadout-background.exe")
+        }
+
+        /// The record install.ps1 writes: schema 1, or schema 2 naming `background` and its hash.
+        fn write_windows_record(&self, background: Option<(&Path, &str)>) {
+            let mut text = format!(
+                "{RECORD_HEADER}\nschema = {}\ninstaller = \"install.ps1\"\nrepository = \"{REPOSITORY}\"\n\
+                 source = \"https://example.invalid/loadout-{WINDOWS_TARGET}.zip\"\ntarget = \"{WINDOWS_TARGET}\"\n\
+                 version = \"1.0.0\"\narchive_sha256 = \"{}\"\nbinary = \"{}\"\nbinary_sha256 = \"{}\"\n",
+                if background.is_some() { 2 } else { 1 },
+                "a".repeat(64),
+                self.exe.display(),
+                sha256(&fs::read(&self.exe).unwrap()),
+            );
+            if let Some((path, sha)) = background {
+                text.push_str(&format!(
+                    "background = \"{}\"\nbackground_sha256 = \"{sha}\"\n",
+                    path.display()
+                ));
+            }
+            fs::write(self.record_path(), text).unwrap();
+        }
+
+        /// The binding as a Windows build sees it. `installed` takes the platform as a parameter, so
+        /// the Windows rules run here on Unix too.
+        fn windows_install(&self) -> Result<Install, String> {
+            installed(&self.exe, true, WINDOWS_TARGET, &Version::new(1, 0, 0))
         }
     }
 
@@ -406,5 +444,95 @@ mod unix {
         )
         .unwrap();
         assert!(fixture.install().is_err());
+    }
+
+    fn remove(path: &Path) {
+        if fs::symlink_metadata(path).unwrap().is_dir() {
+            fs::remove_dir(path).unwrap();
+        } else {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_schema_1_windows_install_refuses_anything_at_the_launcher_path() {
+        let fixture = Installed::new();
+        fixture.write_windows_record(None);
+        assert_eq!(fixture.windows_install().unwrap().background, None);
+        let launcher = fixture.launcher();
+        let outside = fixture.dir.path().join("elsewhere.exe");
+        fs::write(&outside, b"someone else's").unwrap();
+        let cases: Vec<(&str, Box<dyn Fn()>)> = vec![
+            (
+                "foreign file",
+                Box::new(|| fs::write(&launcher, b"someone else's launcher").unwrap()),
+            ),
+            (
+                "link to a file",
+                Box::new(|| std::os::unix::fs::symlink(&outside, &launcher).unwrap()),
+            ),
+            (
+                "dangling link",
+                Box::new(|| {
+                    std::os::unix::fs::symlink(fixture.dir.path().join("missing"), &launcher)
+                        .unwrap();
+                }),
+            ),
+            ("folder", Box::new(|| fs::create_dir(&launcher).unwrap())),
+        ];
+        for (name, make) in cases {
+            make();
+            let before = fixture.snapshot();
+            let error = fixture.windows_install().unwrap_err();
+            assert!(
+                error.contains("is not in the schema 1 record"),
+                "{name}: {error}"
+            );
+            assert_eq!(fixture.snapshot(), before, "{name} must stay as it was");
+            remove(&launcher);
+        }
+        assert!(fixture.windows_install().is_ok());
+    }
+
+    #[test]
+    fn a_schema_2_launcher_must_be_the_regular_file_its_record_names() {
+        let fixture = Installed::new();
+        let launcher = fixture.launcher();
+        fs::write(&launcher, b"launcher").unwrap();
+        let sha = sha256(b"launcher");
+        fixture.write_windows_record(Some((&launcher, &sha)));
+        assert_eq!(
+            fixture.windows_install().unwrap().background,
+            Some(launcher.clone())
+        );
+
+        // A link at the launcher path is refused, even to a file with the recorded bytes and
+        // whichever of the two paths the record names.
+        let real = fixture.exe.with_file_name("real-launcher.exe");
+        fs::rename(&launcher, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &launcher).unwrap();
+        for recorded in [&launcher, &real] {
+            fixture.write_windows_record(Some((recorded, &sha)));
+            let before = fixture.snapshot();
+            let error = fixture.windows_install().unwrap_err();
+            assert!(error.contains("is not a regular file"), "{error}");
+            assert_eq!(fixture.snapshot(), before);
+        }
+
+        fs::remove_file(&launcher).unwrap();
+        fixture.write_windows_record(Some((&launcher, &sha)));
+        assert!(
+            fixture
+                .windows_install()
+                .unwrap_err()
+                .contains("is not a regular file")
+        );
+        fs::write(&launcher, b"edited").unwrap();
+        assert!(
+            fixture
+                .windows_install()
+                .unwrap_err()
+                .contains("changed after it was installed")
+        );
     }
 }

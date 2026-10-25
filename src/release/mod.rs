@@ -340,29 +340,44 @@ fn installed(
             record.version
         ));
     }
+    let launcher = dir.join(archive::expected(true)[1]);
     let background = match (&record.background, windows) {
-        (None, _) => None,
+        (None, false) => None,
         (Some(_), false) => return Err(format!("{} is a Windows record", path.display())),
-        (Some((background, sha256)), true) => {
-            let background = canonical(Path::new(background))?;
-            if background != canonical(&dir.join(archive::expected(true)[1]))? {
+        // A schema-1 install had no launcher, so anything at its path came from somewhere else.
+        // The upgrade to schema 2 installs the launcher only where nothing is, as install.ps1 does.
+        (None, true) => match fs::symlink_metadata(&launcher) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not in the schema 1 record {}",
+                    launcher.display(),
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!("cannot inspect {}: {error}", launcher.display()));
+            }
+        },
+        (Some((recorded, sha256)), true) => {
+            // The path itself, not whatever a link there points to, must be a regular file.
+            if !fs::symlink_metadata(&launcher).is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                return Err(format!("{} is not a regular file", launcher.display()));
+            }
+            if canonical(Path::new(recorded))? != canonical(&launcher)? {
                 return Err(format!(
                     "{} names another background launcher",
                     path.display()
                 ));
             }
-            if !fs::symlink_metadata(&background)
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                return Err(format!("{} is not a regular file", background.display()));
-            }
-            if sha256_file(&background)? != *sha256 {
+            if sha256_file(&launcher)? != *sha256 {
                 return Err(format!(
                     "{} changed after it was installed",
-                    background.display()
+                    launcher.display()
                 ));
             }
-            Some(background)
+            Some(launcher)
         }
     };
     Ok(Install {
