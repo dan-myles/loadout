@@ -7,11 +7,29 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use loadout::context::Context;
 use loadout::platform::Os;
 use loadout::state;
 use loadout::sync;
+
+/// The state lock, taken once no other process holds it. When this test just dropped an earlier
+/// lock, a child that another test thread is starting can hold a copy of that lock's descriptor
+/// until it execs, so this waits up to 5 seconds for `state::busy` to clear before taking the
+/// lock. Still held then, or any error, fails the test.
+fn relock(context: &Context) -> state::Lock {
+    let until = Instant::now() + Duration::from_secs(5);
+    while state::busy(context).unwrap() {
+        assert!(
+            Instant::now() < until,
+            "the state lock is still held 5 seconds later"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    state::lock(context).unwrap()
+}
 
 const LOADOUT: &str = "[loadout]\nversion = 1\n\
                        [files.notes]\nsource = \"files/notes\"\ntarget = \"~/notes.md\"\n";
@@ -99,7 +117,7 @@ impl Machine {
     /// Loadout's clone, made the way `init` makes it.
     fn clone(&self) -> PathBuf {
         let context = self.context();
-        let lock = state::lock(&context).unwrap();
+        let lock = relock(&context);
         let path = self.remote.to_str().unwrap().replace('\\', "/");
         let url = if path.starts_with('/') {
             format!("file://{path}")
@@ -223,7 +241,7 @@ fn an_interrupted_run_blocks_update_before_the_fetch() {
     let machine = Machine::new(LOADOUT);
     let clone = machine.clone();
     let context = machine.context();
-    let lock = state::lock(&context).unwrap();
+    let lock = relock(&context);
     let run = state::Run::begin(
         &context,
         &clone,
@@ -424,7 +442,7 @@ fn a_background_run_that_finds_the_lock_held_is_recorded_as_locked() {
     let machine = Machine::new(LOADOUT);
     machine.clone();
     machine.push("second\n");
-    let held = state::lock(&machine.context()).unwrap();
+    let held = relock(&machine.context());
     let output = machine.run(&["update", "--background"]);
     drop(held);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
