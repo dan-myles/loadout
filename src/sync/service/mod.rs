@@ -15,8 +15,8 @@ mod systemd;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -551,16 +551,36 @@ fn required(context: &Context, program: &str, args: &[&str]) -> Result<Captured,
     }
 }
 
-/// Writes a scheduler file the user owns, through a temporary file renamed into place.
+/// Writes a scheduler file the user owns: into a new temporary file beside it, under a name
+/// unique to this write and created with `create_new`, so a file or link already at that name is
+/// never opened or followed; then renamed over the target, which replaces a link there instead
+/// of writing through it. A failure removes only the temporary file this call created.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io("create", parent))?;
     }
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".loadout-tmp");
+    temp.push(format!(
+        ".{}-{}.loadout-tmp",
+        std::process::id(),
+        super::stamp_nanos()
+    ));
     let temp = PathBuf::from(temp);
-    fs::write(&temp, bytes).map_err(io("write", &temp))?;
-    fs::rename(&temp, path).map_err(io("replace", path))
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(io("create", &temp))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(io("write", &temp));
+    drop(file);
+    let published = written.and_then(|()| fs::rename(&temp, path).map_err(io("replace", path)));
+    if published.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    published
 }
 
 /// Removes a scheduler file loadout wrote, if it is there.
@@ -675,6 +695,54 @@ mod tests {
     #[test]
     fn xml_escapes_every_special_character() {
         assert_eq!(xml(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    }
+
+    /// A file or link already at a temporary name, and a link at the target, never receive the
+    /// bytes: the target becomes a regular file with them, and everything outside keeps its
+    /// bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temporary_name_or_linked_target_is_never_written_through() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("temp-sentinel"), "SENTINEL-TEMP").unwrap();
+        fs::write(outside.join("target-sentinel"), "SENTINEL-TARGET").unwrap();
+        let target = dir.path().join("units").join("loadout-update.service");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let planted = target.with_file_name("loadout-update.service.loadout-tmp");
+        symlink(outside.join("temp-sentinel"), &planted).unwrap();
+        symlink(outside.join("target-sentinel"), &target).unwrap();
+
+        write(&target, b"NEW UNIT").unwrap();
+
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.is_file(), "the target is now a regular file");
+        assert_eq!(fs::read(&target).unwrap(), b"NEW UNIT");
+        assert_eq!(
+            fs::read(outside.join("temp-sentinel")).unwrap(),
+            b"SENTINEL-TEMP"
+        );
+        assert_eq!(
+            fs::read(outside.join("target-sentinel")).unwrap(),
+            b"SENTINEL-TARGET"
+        );
+        assert!(
+            fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let names: Vec<String> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "only the target and the planted link remain: {names:?}"
+        );
     }
 
     #[test]
