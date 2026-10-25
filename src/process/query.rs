@@ -1637,6 +1637,35 @@ mod tests {
         Invocation::new(Path::new("/bin/sh"), ["-c", script])
     }
 
+    /// A manager loses every inherited git redirection, but keeps the caller's transient git
+    /// configuration (credential helper, extra headers, URL rewrites) as the caller set it.
+    #[test]
+    fn a_manager_keeps_transient_git_config_and_loses_git_redirections() {
+        let command = command(&sh("true"));
+        let envs: Vec<_> = command.get_envs().collect();
+        let set = |name: &str| {
+            envs.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| *value)
+        };
+        for name in [
+            "GIT_INDEX_FILE",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+        ] {
+            assert_eq!(set(name), Some(None), "{name} is removed");
+        }
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert_eq!(set(name), None, "{name} is inherited untouched");
+        }
+    }
+
     #[test]
     fn a_query_that_never_finishes_is_stopped_at_its_deadline() {
         let started = Instant::now();

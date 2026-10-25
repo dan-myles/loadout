@@ -558,8 +558,9 @@ fn doctor_reports_the_clone_the_service_and_the_background_run() {
     );
 }
 
-/// A fake `git` that records its argv and the prompt variables, then says the clone has no
-/// branch, so `update` stops at the first query.
+/// A fake `git` that records its argv, the prompt variables, the redirection variables and the
+/// transient configuration variables, then says the clone has no branch, so `update` stops at the
+/// first query.
 #[cfg(unix)]
 fn fake_git(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -569,7 +570,7 @@ fn fake_git(dir: &Path) -> PathBuf {
     fs::write(
         bin.join("git"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" \"index=$GIT_INDEX_FILE dir=$GIT_DIR\" >> '{}'\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" \"prompt=$GIT_TERMINAL_PROMPT\" \"index=$GIT_INDEX_FILE dir=$GIT_DIR\" \"config=$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_VALUE_0 $GIT_CONFIG_PARAMETERS\" >> '{}'\nexit 1\n",
             log.display()
         ),
     )
@@ -590,6 +591,10 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("GIT_INDEX_FILE", root.join("planted-index"))
         .env("GIT_DIR", root.join("planted-repo"))
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "loadout-sentinel-helper")
+        .env("GIT_CONFIG_PARAMETERS", "'http.extraheader'='Sentinel'")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
@@ -614,4 +619,12 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
             .all(|line| line == "index= dir="),
         "no inherited index or repository may reach git: {log}"
     );
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("config="))
+            .all(|line| line
+                == "config=1 credential.helper loadout-sentinel-helper 'http.extraheader'='Sentinel'"),
+        "the caller's transient git configuration reaches git unchanged: {log}"
+    );
+    assert!(log.contains("config=1"), "{log}");
 }

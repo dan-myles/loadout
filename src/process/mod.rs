@@ -24,9 +24,15 @@ pub(crate) use query::{Captured, QueryError, install, query};
 pub(crate) const WORKER_NONCE: &str = "LOADOUT_WORKER_NONCE";
 
 /// Git variables that would point a git process, or one a manager runs, at another repository,
-/// index, object store, or configuration than the one on its command line. None is inherited by
-/// a subprocess loadout starts: loadout names its own clone explicitly, and a variable left in
-/// the caller's environment (by a git hook or a script, say) must not redirect a read or a write.
+/// index, or object store than the one on its command line. None is inherited by a subprocess
+/// loadout starts: loadout names its own clone explicitly, and a variable left in the caller's
+/// environment (by a git hook or a script, say) must not redirect a read or a write.
+///
+/// The transient configuration variables (`GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_<n>` and
+/// `GIT_CONFIG_VALUE_<n>`, and `GIT_CONFIG_PARAMETERS`) are deliberately not here: they carry
+/// the user's credential helper, extra headers, proxy, and URL rewrites, which managers and
+/// loadout's own git need. Git applies an explicit `-c` after them, so the settings loadout's
+/// own git calls pass with `-c` still win.
 pub(crate) const GIT_REDIRECTS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -44,8 +50,6 @@ pub(crate) const GIT_REDIRECTS: &[&str] = &[
     "GIT_EXEC_PATH",
     "GIT_PREFIX",
     "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
     "GIT_CEILING_DIRECTORIES",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
