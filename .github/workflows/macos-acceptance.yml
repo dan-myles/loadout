@@ -1,6 +1,8 @@
 # Native macOS acceptance of one exact head on the free hosted macos-15 and macos-15-intel
 # runners: the real release archive, install.sh, init/update and a real launchd agent, run by
-# tests/vm-acceptance/guest/linux_acceptance.py --mode macos. Manual dispatch only.
+# tests/vm-acceptance/guest/linux_acceptance.py --mode macos. It never runs on a plain push: start
+# it by hand with the commit to test, or by adding the native-acceptance label to a pull request
+# from this repository, which tests that pull request's head commit.
 name: macOS native acceptance
 on:
   workflow_dispatch:
@@ -8,13 +10,21 @@ on:
       head:
         description: exact 40-hex commit under test
         required: true
+  pull_request:
+    types: [labeled]
 permissions:
   contents: read
 jobs:
   macos:
     name: acceptance ${{ matrix.target }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'native-acceptance' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 100
+    env:
+      REQUESTED_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head }}
     strategy:
       fail-fast: false
       matrix:
@@ -22,13 +32,21 @@ jobs:
           - { os: macos-15, target: aarch64-apple-darwin }
           - { os: macos-15-intel, target: x86_64-apple-darwin }
     steps:
+      - name: Validate the requested head
+        id: head
+        run: |
+          if [[ ! $REQUESTED_HEAD =~ ^[0-9a-f]{40}$ ]]; then
+            echo "the requested head must be a full 40-hex commit" >&2
+            exit 1
+          fi
+          echo "sha=$REQUESTED_HEAD" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.head }}
+          ref: ${{ steps.head.outputs.sha }}
           path: loadout
           persist-credentials: false
       - name: Bind the exact head
-        run: test "$(git -C loadout rev-parse HEAD)" = "${{ inputs.head }}"
+        run: test "$(git -C loadout rev-parse HEAD)" = "$REQUESTED_HEAD"
       - name: Install the pinned toolchain
         working-directory: loadout
         run: rustup toolchain install --no-self-update && rustup target add "${{ matrix.target }}"
@@ -47,7 +65,7 @@ jobs:
           cp loadout/scripts/release/install.sh "$IN/install.sh"
           python3 -I "$A/host/release_fixture.py" linux --target "${{ matrix.target }}" \
             --archive "$RUNNER_TEMP/dist/loadout-${{ matrix.target }}.tar.gz" --version "$VERSION" --out "$IN/release"
-          python3 -I - "$IN" "${{ inputs.head }}" "$VERSION" <<'PY'
+          python3 -I - "$IN" "$REQUESTED_HEAD" "$VERSION" <<'PY'
           import json, sys
           from pathlib import Path
           root, head, version = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
