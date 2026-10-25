@@ -108,13 +108,8 @@ fn foreground(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     match apply::run_under_lock(context, &checkout, lock, options) {
         Ok(report) => {
             let exit = shown::print(&report)?;
-            match self_update(context, &checkout, &report)? {
-                SelfUpdate::Cancelled => {
-                    println!("cancelled: {}", apply::CANCELLED);
-                    Ok(Exit::Unhealthy)
-                }
-                SelfUpdate::Off | SelfUpdate::Done(_) => Ok(exit),
-            }
+            let outcome = self_update(context, &checkout, &report)?;
+            Ok(foreground_exit(&outcome, exit))
         }
         Err(error) => shown::refused(error),
     }
@@ -219,26 +214,7 @@ fn background_update(context: &Context, record: &mut LastRun) -> anyhow::Result<
         Ok(report) => {
             summarize(&report, record);
             let exit = shown::print(&report)?;
-            match self_update(context, &checkout, &report) {
-                Ok(SelfUpdate::Off) => Ok(exit),
-                Ok(SelfUpdate::Done(line)) => {
-                    if record.message.is_none() {
-                        record.message = Some(line);
-                    }
-                    Ok(exit)
-                }
-                Ok(SelfUpdate::Cancelled) => {
-                    println!("cancelled: {}", apply::CANCELLED);
-                    record.cancelled = true;
-                    record.message = Some(apply::CANCELLED.to_owned());
-                    Ok(Exit::Unhealthy)
-                }
-                Err(error) => {
-                    record.result = RunResult::Failed;
-                    record.message = Some(format!("{error:#}"));
-                    Err(error)
-                }
-            }
+            recorded(self_update(context, &checkout, &report), record, exit)
         }
         Err(error) => {
             record.result = match &error {
@@ -312,7 +288,53 @@ fn self_update_with<R>(
         Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
     };
     println!("{line}");
+    // Cancelled while the lookup or the install ran: what happened is shown, but the run was
+    // stopped, so it ends as cancelled, not as a clean or skipped update. A real error above
+    // already returned and keeps its exit 1.
+    if context.containment.is_cancelled() {
+        return Ok(SelfUpdate::Cancelled);
+    }
     Ok(SelfUpdate::Done(line))
+}
+
+/// The foreground's exit after the self-update step: a cancellation ends the run unhealthy (4).
+fn foreground_exit(outcome: &SelfUpdate, exit: Exit) -> Exit {
+    if *outcome == SelfUpdate::Cancelled {
+        println!("cancelled: {}", apply::CANCELLED);
+        return Exit::Unhealthy;
+    }
+    exit
+}
+
+/// The worker's record and exit after the self-update step. A cancellation records the run as
+/// cancelled with the usual message and ends it unhealthy (4); a real error records the run as
+/// failed and keeps the error (exit 1); otherwise the self-update's line is the message unless
+/// the run already has one.
+fn recorded(
+    outcome: anyhow::Result<SelfUpdate>,
+    record: &mut LastRun,
+    exit: Exit,
+) -> anyhow::Result<Exit> {
+    match outcome {
+        Ok(SelfUpdate::Off) => Ok(exit),
+        Ok(SelfUpdate::Done(line)) => {
+            if record.message.is_none() {
+                record.message = Some(line);
+            }
+            Ok(exit)
+        }
+        Ok(SelfUpdate::Cancelled) => {
+            println!("cancelled: {}", apply::CANCELLED);
+            record.cancelled = true;
+            record.message = Some(apply::CANCELLED.to_owned());
+            Ok(Exit::Unhealthy)
+        }
+        Err(error) => {
+            record.result = RunResult::Failed;
+            record.message = Some(format!("{error:#}"));
+            Err(error)
+        }
+    }
 }
 
 /// Counts and labels for `last-run.json`: how each action ended, and every action that didn't
@@ -463,6 +485,151 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, SelfUpdate::Done("cli: updated".to_owned()));
         assert!(installed.get());
+    }
+
+    #[test]
+    fn a_cancellation_during_a_lookup_that_finds_nothing_ends_cancelled() {
+        let context = supervised();
+        let outcome = self_update_with(
+            &context,
+            |context| {
+                cancel(context);
+                Ok(None::<()>)
+            },
+            |()| panic!("nothing to install"),
+            |()| String::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+    }
+
+    #[test]
+    fn a_cancellation_during_a_lookup_that_is_skipped_ends_cancelled_without_installing() {
+        let context = supervised();
+        let installed = Cell::new(false);
+        let outcome = self_update_with(
+            &context,
+            |context| {
+                cancel(context);
+                Err::<Option<()>, _>(release::Error::Isolated)
+            },
+            |()| {
+                installed.set(true);
+                Ok(())
+            },
+            |()| String::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+        assert!(!installed.get());
+    }
+
+    #[test]
+    fn a_cancellation_during_a_successful_install_ends_cancelled() {
+        let context = supervised();
+        let outcome = self_update_with(
+            &context,
+            |_| Ok(Some(())),
+            |()| {
+                cancel(&context);
+                Ok(())
+            },
+            |()| "cli: updated".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+    }
+
+    #[test]
+    fn a_cancellation_during_an_install_another_one_holds_ends_cancelled() {
+        let context = supervised();
+        let outcome = self_update_with(
+            &context,
+            |_| Ok(Some(())),
+            |()| {
+                cancel(&context);
+                Err(release::Error::Busy {
+                    dir: PathBuf::from("/bin"),
+                })
+            },
+            |()| String::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+    }
+
+    #[test]
+    fn a_real_install_error_keeps_failing_even_when_the_run_was_also_cancelled() {
+        let context = supervised();
+        let outcome = self_update_with(
+            &context,
+            |_| Ok(Some(())),
+            |()| {
+                cancel(&context);
+                Err(release::Error::Download {
+                    detail: "connection reset".to_owned(),
+                })
+            },
+            |()| String::new(),
+        );
+        assert!(outcome.is_err(), "exit 1 outranks the cancellation");
+    }
+
+    #[test]
+    fn the_worker_records_a_cancelled_self_update_as_cancelled_and_exits_four() {
+        let mut record = LastRun::new(0, RunResult::Applied, 0);
+        let exit = recorded(Ok(SelfUpdate::Cancelled), &mut record, Exit::Success).unwrap();
+        assert_eq!(exit.code(), 4);
+        assert!(record.cancelled);
+        assert_eq!(record.message.as_deref(), Some(apply::CANCELLED));
+        assert_eq!(
+            record.result,
+            RunResult::Applied,
+            "the apply itself ran to its report"
+        );
+    }
+
+    #[test]
+    fn the_worker_records_a_real_self_update_error_as_failed() {
+        let mut record = LastRun::new(0, RunResult::Applied, 0);
+        let outcome = recorded(
+            Err(anyhow::anyhow!("self-update failed")),
+            &mut record,
+            Exit::Success,
+        );
+        assert!(outcome.is_err());
+        assert_eq!(record.result, RunResult::Failed);
+        assert!(!record.cancelled);
+    }
+
+    #[test]
+    fn the_worker_keeps_the_apply_exit_and_records_a_done_line_only_without_a_message() {
+        let mut record = LastRun::new(0, RunResult::Applied, 0);
+        let exit = recorded(
+            Ok(SelfUpdate::Done("cli: up to date".to_owned())),
+            &mut record,
+            Exit::Unhealthy,
+        )
+        .unwrap();
+        assert_eq!(exit, Exit::Unhealthy);
+        assert_eq!(record.message.as_deref(), Some("cli: up to date"));
+        assert!(!record.cancelled);
+    }
+
+    #[test]
+    fn the_foreground_ends_unhealthy_only_when_cancelled() {
+        assert_eq!(
+            foreground_exit(&SelfUpdate::Cancelled, Exit::Success),
+            Exit::Unhealthy
+        );
+        assert_eq!(
+            foreground_exit(&SelfUpdate::Done(String::new()), Exit::Success),
+            Exit::Success
+        );
+        assert_eq!(
+            foreground_exit(&SelfUpdate::Off, Exit::Unhealthy),
+            Exit::Unhealthy
+        );
     }
 
     #[test]
