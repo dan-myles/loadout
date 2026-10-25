@@ -108,8 +108,13 @@ fn foreground(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     match apply::run_under_lock(context, &checkout, lock, options) {
         Ok(report) => {
             let exit = shown::print(&report)?;
-            self_update(context, &checkout, &report)?;
-            Ok(exit)
+            match self_update(context, &checkout, &report)? {
+                SelfUpdate::Cancelled => {
+                    println!("cancelled: {}", apply::CANCELLED);
+                    Ok(Exit::Unhealthy)
+                }
+                SelfUpdate::Off | SelfUpdate::Done(_) => Ok(exit),
+            }
         }
         Err(error) => shown::refused(error),
     }
@@ -215,11 +220,18 @@ fn background_update(context: &Context, record: &mut LastRun) -> anyhow::Result<
             summarize(&report, record);
             let exit = shown::print(&report)?;
             match self_update(context, &checkout, &report) {
-                Ok(line) => {
+                Ok(SelfUpdate::Off) => Ok(exit),
+                Ok(SelfUpdate::Done(line)) => {
                     if record.message.is_none() {
-                        record.message = line;
+                        record.message = Some(line);
                     }
                     Ok(exit)
+                }
+                Ok(SelfUpdate::Cancelled) => {
+                    println!("cancelled: {}", apply::CANCELLED);
+                    record.cancelled = true;
+                    record.message = Some(apply::CANCELLED.to_owned());
+                    Ok(Exit::Unhealthy)
                 }
                 Err(error) => {
                     record.result = RunResult::Failed;
@@ -242,31 +254,65 @@ fn background_update(context: &Context, record: &mut LastRun) -> anyhow::Result<
     }
 }
 
+/// What the self-update step did after an apply.
+#[derive(Debug, PartialEq, Eq)]
+enum SelfUpdate {
+    /// Not attempted: the apply failed or was cancelled, or the loadout sets `cli = false`.
+    Off,
+    /// Asked for a newer release; the line it printed.
+    Done(String),
+    /// The run was cancelled after its report and before a release request started, so none was
+    /// made.
+    Cancelled,
+}
+
 /// Self-update after an apply that ran to its report, when the loadout's resolved `[update] cli`
 /// is true (section 8). It never runs after a failed apply (already exit 1) or a cancelled one,
-/// so it starts no work in a run that is stopping and never hides the apply's exit. A skip
-/// (isolation, an unmanaged binary, no release, another install holding the folder) is shown
-/// and keeps the apply's exit; any other error fails the update. Returns the line it printed.
-fn self_update(
-    context: &Context,
-    checkout: &Path,
-    report: &Report,
-) -> anyhow::Result<Option<String>> {
+/// so it starts no work in a run that is stopping and never hides the apply's exit. The live
+/// cancellation is checked again before the release request and before the install, so a run
+/// cancelled after its report starts neither; a request already under way is not interrupted. A
+/// skip (isolation, an unmanaged binary, no release, another install holding the folder) is
+/// shown and keeps the apply's exit; any other error fails the update.
+fn self_update(context: &Context, checkout: &Path, report: &Report) -> anyhow::Result<SelfUpdate> {
     if report.cancelled || report.failed() || !sync::settings(context, checkout)?.cli {
-        return Ok(None);
+        return Ok(SelfUpdate::Off);
     }
-    let line = match release::latest(context) {
-        Ok(None) => "cli: up to date".to_owned(),
-        Ok(Some(newer)) => match release::install(&newer) {
-            Ok(()) => format!("cli: updated {} to {}", newer.current(), newer.version()),
-            Err(error) if error.skipped() => format!("cli: not updated: {error}"),
-            Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
+    self_update_with(
+        context,
+        release::latest,
+        release::install,
+        |newer: &release::Release| {
+            format!("cli: updated {} to {}", newer.current(), newer.version())
         },
+    )
+}
+
+fn self_update_with<R>(
+    context: &Context,
+    latest: impl FnOnce(&Context) -> Result<Option<R>, release::Error>,
+    install: impl FnOnce(&R) -> Result<(), release::Error>,
+    updated: impl FnOnce(&R) -> String,
+) -> anyhow::Result<SelfUpdate> {
+    if context.containment.is_cancelled() {
+        return Ok(SelfUpdate::Cancelled);
+    }
+    let line = match latest(context) {
+        Ok(None) => "cli: up to date".to_owned(),
+        Ok(Some(newer)) => {
+            if context.containment.is_cancelled() {
+                return Ok(SelfUpdate::Cancelled);
+            }
+            match install(&newer) {
+                Ok(()) => updated(&newer),
+                Err(error) if error.skipped() => format!("cli: not updated: {error}"),
+                Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
+            }
+        }
         Err(error) if error.skipped() => format!("cli: not updated: {error}"),
         Err(error) => return Err(anyhow::Error::new(error).context("self-update failed")),
     };
     println!("{line}");
-    Ok(Some(line))
+    Ok(SelfUpdate::Done(line))
 }
 
 /// Counts and labels for `last-run.json`: how each action ended, and every action that didn't
@@ -325,5 +371,124 @@ fn exit_code(code: u8) -> anyhow::Result<Exit> {
         _ => anyhow::bail!(
             "the background run failed or had to be stopped; `loadout status` and the background records say why"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::platform::Os;
+    use crate::process::Containment;
+
+    /// A supervised background context, the only kind a supervisor can cancel.
+    fn supervised() -> Context {
+        let base =
+            Context::resolve(Os::current().unwrap(), |_| None, Some(PathBuf::from("/h"))).unwrap();
+        Context {
+            containment: Containment::inherited_for_tests(),
+            ..base
+        }
+    }
+
+    fn cancel(context: &Context) {
+        context
+            .containment
+            .cancel()
+            .expect("only a supervised run can be cancelled")
+            .cancel();
+    }
+
+    #[test]
+    fn a_run_cancelled_after_its_report_makes_no_release_request() {
+        let context = supervised();
+        cancel(&context);
+        let asked = Cell::new(false);
+        let outcome = self_update_with(
+            &context,
+            |_| {
+                asked.set(true);
+                Ok(Some(()))
+            },
+            |()| panic!("a cancelled run never installs"),
+            |()| String::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+        assert!(
+            !asked.get(),
+            "no release request starts after the cancellation"
+        );
+    }
+
+    #[test]
+    fn a_cancellation_between_discovery_and_install_installs_nothing() {
+        let context = supervised();
+        let installed = Cell::new(false);
+        let outcome = self_update_with(
+            &context,
+            |context| {
+                cancel(context);
+                Ok(Some(()))
+            },
+            |()| {
+                installed.set(true);
+                Ok(())
+            },
+            |()| String::new(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Cancelled);
+        assert!(
+            !installed.get(),
+            "a newer release found before the cancellation isn't installed"
+        );
+    }
+
+    #[test]
+    fn without_a_cancellation_a_newer_release_is_installed() {
+        let context = supervised();
+        let installed = Cell::new(false);
+        let outcome = self_update_with(
+            &context,
+            |_| Ok(Some(())),
+            |()| {
+                installed.set(true);
+                Ok(())
+            },
+            |()| "cli: updated".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(outcome, SelfUpdate::Done("cli: updated".to_owned()));
+        assert!(installed.get());
+    }
+
+    #[test]
+    fn a_skip_is_shown_and_any_other_release_error_fails_the_update() {
+        let context = supervised();
+        let skipped = self_update_with(
+            &context,
+            |_| Err::<Option<()>, _>(release::Error::Isolated),
+            |()| Ok(()),
+            |()| String::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&skipped, SelfUpdate::Done(line) if line.starts_with("cli: not updated:")),
+            "{skipped:?}"
+        );
+        let failed = self_update_with(
+            &context,
+            |_| Ok(Some(())),
+            |()| {
+                Err(release::Error::Download {
+                    detail: "connection reset".to_owned(),
+                })
+            },
+            |()| String::new(),
+        );
+        assert!(failed.is_err(), "a real install error is not a skip");
     }
 }
