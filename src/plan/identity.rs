@@ -556,6 +556,27 @@ mod tests {
         );
     }
 
+    /// On Windows a place itself folds ASCII case, so two spellings that differ only by case are
+    /// one destination before any folder is asked, whatever a probe would say.
+    #[cfg(windows)]
+    #[test]
+    fn windows_spellings_that_differ_only_by_case_are_one_destination_without_a_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let context = context(&home);
+        let one = at(home.join("X/foo"));
+        let other = at(home.join("x/Foo"));
+        let sensitive = |prefix: &Path| (prefix.to_path_buf(), Case::Sensitive);
+        for probe in [None, Some(&sensitive as Probe<'_>)] {
+            assert_eq!(
+                verdict(&context, &one, &other, probe),
+                Verdict::Conflict { case: None }
+            );
+        }
+    }
+
+    /// Linux and macOS: the folders that hold the differing spellings decide.
+    #[cfg(not(windows))]
     #[test]
     fn mixed_deciding_folders_need_every_difference_proven_insensitive() {
         let dir = tempfile::tempdir().unwrap();
