@@ -386,12 +386,62 @@ class InstallPs1FunctionTest(unittest.TestCase):
                 ok, fail = directory / "ok", directory / "fail"
                 self.assertEqual((ok / "loadout-background.exe").read_bytes(), b"new launcher")
                 self.assertEqual((ok / "loadout.exe").read_bytes(), b"new main")
-                self.assertEqual(sorted(path.name for path in ok.iterdir()), ["loadout-background.exe", "loadout.exe"])
+                # The asides it made are returned, launcher first, and left for the caller.
+                asides = [Path(path) for path in results[0]["value"]]
+                self.assertEqual([path.parent for path in asides], [ok, ok])
+                self.assertTrue(asides[0].name.startswith(".loadout-background.exe.old."))
+                self.assertTrue(asides[1].name.startswith(".loadout.exe.old."))
+                self.assertEqual([path.read_bytes() for path in asides], [b"old launcher", b"old main"])
+                self.assertEqual(sorted(path.name for path in ok.iterdir()),
+                                 sorted(["loadout-background.exe", "loadout.exe"] + [path.name for path in asides]))
                 self.assertIn("previous ones are back", results[1]["error"])
                 self.assertEqual((fail / "loadout-background.exe").read_bytes(), b"old launcher")
                 self.assertEqual((fail / "loadout.exe").read_bytes(), b"old main")
                 self.assertEqual((fail / ".loadout-background.exe.new.a").read_bytes(), b"new launcher")
                 self.assertFalse(any(".old." in path.name for path in fail.iterdir()))
+
+
+    def test_asides_are_deleted_only_after_the_record_is_published(self):
+        def build(directory):
+            calls = []
+            for case, record_dir in (("published", None), ("record-fails", "missing")):
+                folder = directory / case
+                folder.mkdir()
+                (folder / "loadout-background.exe").write_bytes(b"old launcher")
+                (folder / "loadout.exe").write_bytes(b"old main")
+                (folder / ".loadout-background.exe.new.a").write_bytes(b"new launcher")
+                (folder / ".loadout.exe.new.b").write_bytes(b"new main")
+                (folder / ".loadout.install.toml.new.c").write_bytes(b"new record")
+                (folder / ".loadout.exe.old.keep").write_bytes(b"someone else's")
+                pairs = [
+                    [str(folder / ".loadout-background.exe.new.a"), str(folder / "loadout-background.exe")],
+                    [str(folder / ".loadout.exe.new.b"), str(folder / "loadout.exe")],
+                ]
+                # A record destination in a folder that doesn't exist can't be written.
+                record = folder / record_dir / "loadout.install.toml" if record_dir else folder / "loadout.install.toml"
+                calls.append({"fn": "Publish-Install",
+                              "args": ["@owned", pairs, str(folder / ".loadout.install.toml.new.c"), str(record)]})
+            return calls
+
+        outcomes = self.assert_outcomes(build, [True, False])
+        for shell, (directory, _, results) in outcomes.items():
+            with self.subTest(shell=shell):
+                published, failed = directory / "published", directory / "record-fails"
+                self.assertEqual((published / "loadout.install.toml").read_bytes(), b"new record")
+                self.assertEqual(sorted(path.name for path in published.iterdir()),
+                                 [".loadout.exe.old.keep", "loadout-background.exe", "loadout.exe", "loadout.install.toml"])
+                self.assertEqual((published / ".loadout.exe.old.keep").read_bytes(), b"someone else's")
+
+                self.assertIn("could not be written", results[1]["error"])
+                self.assertIn("the previous binaries are kept as", results[1]["error"])
+                self.assertEqual((failed / "loadout.exe").read_bytes(), b"new main")
+                self.assertEqual((failed / "loadout-background.exe").read_bytes(), b"new launcher")
+                kept = {path.name: path.read_bytes() for path in failed.iterdir() if ".old." in path.name}
+                self.assertEqual(kept.pop(".loadout.exe.old.keep"), b"someone else's")
+                self.assertEqual(sorted(kept.values()), [b"old launcher", b"old main"])
+                for name in kept:
+                    self.assertIn(name, results[1]["error"])
+                self.assertEqual((failed / ".loadout.install.toml.new.c").read_bytes(), b"new record")
 
 
 class RuntimeIsolationControlTest(unittest.TestCase):

@@ -193,9 +193,11 @@ Neither script installs git; each names the per-OS command instead.
      completed move is undone in reverse, each attempted even when another can't be. Files that
      can't be moved back stay where they are and are named in the error. Then the record is
      replaced (`File.Replace`, no backup).
-   - The script deletes its own aside copies once the record is in place. One that is still
-     running can't be deleted and stays; the script never deletes an aside it didn't make in that
-     run, whatever its name. Self-update keeps a ledger of its own (below).
+   - The script deletes its own aside copies only once the record is in place. If the record
+     can't be written they stay, and the error names them, so the previous binaries can be
+     recovered. One that is still running can't be deleted and stays; the script never deletes an
+     aside it didn't make in that run, whatever its name. Self-update keeps a ledger of its own
+     (below).
 10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
     shell profiles or `PATH`.
 11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
