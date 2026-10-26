@@ -114,10 +114,22 @@ struct Install {
     background: Option<PathBuf>,
 }
 
-/// Whether a strictly newer release than the running CLI is published. `Ok(None)` means the
-/// running CLI is the newest release (or newer), so none is offered. Reads nothing but the
-/// running binary, its record, and one HTTPS redirect.
-pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
+/// Which published releases [`latest`] considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Stable releases only: the one GitHub's `releases/latest` names, which is never a
+    /// prerelease. A stable client never moves onto a prerelease.
+    Stable,
+    /// Every published release, prereleases (test builds) included: the highest version in the
+    /// releases list. Only `loadout update --prerelease` asks for it.
+    Prerelease,
+}
+
+/// Whether a strictly newer release than the running CLI is published on `channel`. `Ok(None)`
+/// means the running CLI is the newest such release (or newer), so none is offered. Reads
+/// nothing but the running binary, its record, and GitHub: one HTTPS redirect for
+/// [`Channel::Stable`], the public releases list for [`Channel::Prerelease`].
+pub fn latest(context: &Context, channel: Channel) -> Result<Option<Release>, Error> {
     let install = managed(context)?;
     let target = target().ok_or_else(not_a_release_build)?;
     find(
@@ -126,6 +138,7 @@ pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
         target,
         running_version(),
         context.containment.clone(),
+        channel,
     )
 }
 
@@ -407,20 +420,25 @@ fn find(
     target: &'static str,
     current: Version,
     containment: Containment,
+    channel: Channel,
 ) -> Result<Option<Release>, Error> {
-    let tag = match source
-        .latest()
-        .map_err(|detail| Error::Download { detail })?
-    {
+    let found = match channel {
+        Channel::Stable => source.latest(),
+        Channel::Prerelease => source.newest(),
+    };
+    let tag = match found.map_err(|detail| Error::Download { detail })? {
         Latest::None => return Err(Error::NoRelease),
         Latest::Tag(tag) => tag,
     };
-    let version = tag
-        .strip_prefix('v')
-        .and_then(|version| Version::parse(version).ok())
-        .filter(|version| version.pre.is_empty())
+    let version = download::tag_version(&tag)
+        .filter(|version| channel == Channel::Prerelease || version.pre.is_empty())
         .ok_or_else(|| Error::Verify {
-            detail: format!("the latest release tag {tag:?} is not vX.Y.Z"),
+            detail: match channel {
+                Channel::Stable => format!("the latest release tag {tag:?} is not vX.Y.Z"),
+                Channel::Prerelease => {
+                    format!("the newest release tag {tag:?} is not vX.Y.Z or vX.Y.Z-<prerelease>")
+                }
+            },
         })?;
     if version <= current {
         return Ok(None);

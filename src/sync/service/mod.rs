@@ -1,4 +1,4 @@
-//! The per-user scheduled job that runs `loadout update --background` (architecture section 8):
+//! The per-user scheduled job that runs `loadout sync --background` (architecture section 8):
 //! a systemd user timer on Linux, a launchd agent on macOS, a Scheduled Task on Windows. Each is
 //! installed for the current user only, with no elevation, and never under `LOADOUT_HOME`
 //! isolation, because every scheduler acts on the real user whatever `Context` says.
@@ -553,6 +553,11 @@ fn definition(path: &Path) -> Result<Option<String>, String> {
         .map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
 
+/// The answer for a job older loadout versions registered. It runs the legacy `loadout update
+/// --background`, which still syncs, so it keeps working, but `service install` should replace
+/// it; `describe` adds that.
+pub(super) const LEGACY: &str = "the job was registered by an older loadout and runs the legacy `loadout update --background`, which still syncs but is no longer the scheduled command";
+
 /// The answer for a definition that isn't the one this record would install.
 fn differs_from_record(what: &str) -> String {
     format!(
@@ -570,7 +575,7 @@ pub(super) fn checks(context: &Context) -> Vec<Check> {
         Check::new(
             name,
             CheckStatus::Info,
-            "no background update is installed; `loadout service install` adds one",
+            "no background sync is installed; `loadout service install` adds one",
         )
     } else if status.healthy() && status.advice.is_empty() {
         let every = status
@@ -1373,6 +1378,35 @@ mod tests {
             "another executable"
         );
 
+        // The units older versions wrote run the legacy `loadout update --background`: still a
+        // sync, so recognized as this record's job, but to be re-registered.
+        plant(&service);
+        fs::write(
+            &service,
+            systemd::legacy_service_unit(exe_text, own.to_str().unwrap()),
+        )
+        .unwrap();
+        fs::write(&timer, systemd::legacy_timer_unit(60)).unwrap();
+        let legacy = status(&fakes.context).unwrap();
+        assert_eq!(legacy.mismatch.as_deref(), Some(LEGACY));
+        assert!(!legacy.healthy());
+        assert!(
+            describe(&legacy).contains("legacy `loadout update --background`")
+                && describe(&legacy).contains("run `loadout service install` again"),
+            "{}",
+            describe(&legacy)
+        );
+        // A legacy unit for another record is a plain mismatch, never taken for this job.
+        fs::write(
+            &service,
+            systemd::legacy_service_unit(exe_text, other_state.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_ne!(
+            status(&fakes.context).unwrap().mismatch.as_deref(),
+            Some(LEGACY)
+        );
+
         write_units(exe_text, own.to_str().unwrap());
         fs::remove_file(&timer).unwrap();
         fs::create_dir(&timer).unwrap();
@@ -1473,15 +1507,31 @@ mod tests {
         let plist = launchd::file(&fakes.context);
         plant(&plist);
         fs::write(&plist, launchd::plist(exe_text, own_text, 60)).unwrap();
-        let printed = |exe: &str| {
+        let printed_as = |exe: &str, verb: &str| {
             format!(
-                "printf 'gui/501/dev.loadout.update = {{\\n\\targuments = {{\\n\\t\\t%s\\n\\t\\tupdate\\n\\t\\t--background\\n\\t\\t--service\\n\\t\\t%s\\n\\t}}\\n}}\\n' '{exe}' '{own_text}'"
+                "printf 'gui/501/dev.loadout.update = {{\\n\\targuments = {{\\n\\t\\t%s\\n\\t\\t{verb}\\n\\t\\t--background\\n\\t\\t--service\\n\\t\\t%s\\n\\t}}\\n}}\\n' '{exe}' '{own_text}'"
             )
         };
+        let printed = |exe: &str| printed_as(exe, "sync");
 
         fakes.tool("launchctl", &printed(exe_text));
         let matching = status(&fakes.context).unwrap();
         assert!(matching.healthy(), "{}", describe(&matching));
+
+        // The agent older versions loaded runs the legacy `loadout update --background`, whether
+        // its plist is the legacy one or a new one whose reload hasn't happened yet.
+        fakes.tool("launchctl", &printed_as(exe_text, "update"));
+        let loaded_legacy = status(&fakes.context).unwrap();
+        assert_eq!(loaded_legacy.mismatch.as_deref(), Some(LEGACY));
+        fs::write(&plist, launchd::legacy_plist(exe_text, own_text, 60)).unwrap();
+        let legacy = status(&fakes.context).unwrap();
+        assert_eq!(legacy.mismatch.as_deref(), Some(LEGACY));
+        assert!(
+            describe(&legacy).contains("run `loadout service install` again"),
+            "{}",
+            describe(&legacy)
+        );
+        fs::write(&plist, launchd::plist(exe_text, own_text, 60)).unwrap();
 
         fakes.tool("launchctl", &printed("/opt/old/loadout"));
         let stale = status(&fakes.context).unwrap();

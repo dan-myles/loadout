@@ -487,9 +487,7 @@ fn variables_and_update_merge_per_key_and_field_over_defaults() {
     let tree = tree(&[
         (
             "loadout.toml",
-            &root(
-                "[machines.box]\ntags = [\"t\"]\n[variables]\na = 1\nb = true\n[update]\ncli = false\n",
-            ),
+            &root("[machines.box]\ntags = [\"t\"]\n[variables]\na = 1\nb = true\n"),
         ),
         ("os/linux.toml", "[update]\ninterval_minutes = 30\n"),
         (
@@ -502,15 +500,44 @@ fn variables_and_update_merge_per_key_and_field_over_defaults() {
     assert_eq!(resolved.variables["b"], text("text"));
     assert!(!resolved.update.auto);
     assert_eq!(resolved.update.interval_minutes, 30);
-    assert!(!resolved.update.cli);
     let windows = tree.clean("other", Os::Windows);
     assert!(windows.update.auto);
     assert_eq!(windows.update.interval_minutes, 60);
-    assert!(!windows.update.cli);
 
     let bare = self::tree(&[("loadout.toml", &root(""))]).clean("any", Os::Macos);
     assert_eq!(bare.update, resolve::Update::default());
     assert!(bare.variables.is_empty());
+}
+
+/// `[update] cli` once turned the CLI self-update after each update on or off. Existing loadouts
+/// that set it stay valid, but it does nothing: the settings resolve as if it weren't there, and
+/// a warning says so, in every layer that sets it.
+#[test]
+fn the_legacy_update_cli_key_is_accepted_with_a_warning_and_changes_nothing() {
+    for value in ["true", "false"] {
+        let tree = tree(&[
+            (
+                "loadout.toml",
+                &root(&format!("[update]\ncli = {value}\ninterval_minutes = 30\n")),
+            ),
+            ("os/linux.toml", "[update]\ncli = true\n"),
+        ]);
+        let (resolved, warnings) = tree.ok("any", Os::Linux);
+        assert_eq!(
+            resolved.update,
+            resolve::Update {
+                auto: true,
+                interval_minutes: 30,
+            },
+            "cli = {value}"
+        );
+        assert_eq!(
+            warnings.matches("update.cli").count(),
+            2,
+            "one warning for each layer: {warnings}"
+        );
+        assert!(warnings.contains("`loadout update`"), "{warnings}");
+    }
 }
 
 #[test]

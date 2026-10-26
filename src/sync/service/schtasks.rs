@@ -2,7 +2,7 @@
 //! `schtasks /Create /XML`. It runs only while the user is logged on (an interactive token, so
 //! no password is stored), with least privilege, and never two at once. It starts the GUI
 //! launcher beside `loadout.exe`, so no console window opens at each run; the launcher runs the
-//! same supervisor as `loadout update --background`.
+//! same supervisor as `loadout sync --background`.
 
 use super::{Error, LAUNCHER, Scheduler, failed, query, query_output, required, xml};
 use crate::context::Context;
@@ -50,7 +50,7 @@ fn task_xml(launcher: &str, service: &str, interval_minutes: u32) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
          \x20 <RegistrationInfo>\r\n\
-         \x20   <Description>loadout background update</Description>\r\n\
+         \x20   <Description>loadout background sync</Description>\r\n\
          \x20 </RegistrationInfo>\r\n\
          \x20 <Triggers>\r\n\
          \x20   <TimeTrigger>\r\n\

@@ -2,7 +2,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{apply, doctor, init, plan, rollback, service, status, update, validate};
+use crate::commands::{
+    apply, doctor, init, plan, rollback, service, status, sync, update, validate,
+};
 use crate::context::Context;
 
 #[derive(Debug, Parser)]
@@ -32,10 +34,13 @@ pub enum Command {
     /// Bring this machine in line with the loadout
     Apply(apply::Args),
     /// Fetch loadout's clone of the loadout, fast-forward it, and apply it
+    Sync(sync::Args),
+    /// Update the loadout CLI itself to the newest release
+    #[command(visible_alias = "upgrade")]
     Update(update::Args),
-    /// Install, remove, or check the scheduled background update
+    /// Install, remove, or check the scheduled background sync
     Service(service::Args),
-    /// Set this machine up from a loadout: clone it, name the machine, apply, and keep it updated
+    /// Set this machine up from a loadout: clone it, name the machine, apply, and keep it synced
     Init(init::Args),
 }
 
@@ -70,10 +75,18 @@ pub fn main() -> ExitCode {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<Exit> {
-    if let Command::Update(args) = &cli.command
+    if let Command::Sync(args) = &cli.command
         && args.recorded()
     {
-        return update::run_recorded(args);
+        return sync::run_recorded(args);
+    }
+    // The scheduled job of older versions, `update --background --service FILE`, is a sync.
+    if let Command::Update(args) = &cli.command
+        && let Some(legacy) = args.legacy()
+        && legacy.recorded()
+    {
+        update::deprecated();
+        return sync::run_recorded(&legacy);
     }
     let context = Context::from_env()?;
     match cli.command {
@@ -83,6 +96,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
         Command::Rollback(args) => rollback::run(&args, &context),
         Command::Plan(args) => plan::run(&args, &context),
         Command::Apply(args) => apply::run(&args, &context),
+        Command::Sync(args) => sync::run(&args, &context),
         Command::Update(args) => update::run(&args, &context),
         Command::Service(args) => service::run(&args, &context),
         Command::Init(args) => init::run(&args, &context),

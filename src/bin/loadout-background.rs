@@ -1,4 +1,4 @@
-//! The Windows Scheduled Task's program: the background update's supervisor, built for the GUI
+//! The Windows Scheduled Task's program: the background sync's supervisor, built for the GUI
 //! subsystem so no console window opens at each run. It starts `loadout.exe` from its own
 //! folder as the worker. On other systems it does nothing.
 #![cfg_attr(windows, windows_subsystem = "windows")]

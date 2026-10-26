@@ -129,6 +129,8 @@ impl Condition {
 pub struct UpdatePatch {
     pub auto: Option<bool>,
     pub interval_minutes: Option<u32>,
+    /// Legacy: once turned the CLI self-update after each update on or off. Accepted so
+    /// existing loadouts stay valid, but it does nothing and validation warns about it.
     pub cli: Option<bool>,
 }
 

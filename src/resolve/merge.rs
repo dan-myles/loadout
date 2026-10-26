@@ -315,7 +315,6 @@ pub(super) fn merge(loadout: &Loadout, facts: &Facts, diagnostics: &mut Diagnost
             let current = &mut merged.update;
             current.auto = update.auto.unwrap_or(current.auto);
             current.interval_minutes = update.interval_minutes.unwrap_or(current.interval_minutes);
-            current.cli = update.cli.unwrap_or(current.cli);
         }
         if let Some(agents) = &layer.agents {
             if let Some(enabled) = &agents.enabled {

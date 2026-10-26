@@ -1,5 +1,5 @@
 //! Loadout's own clone of the loadout, kept with the system `git` (architecture section 8), and
-//! the background update that keeps it current: the scheduled job (`service`) and the records a
+//! the background sync that keeps it current: the scheduled job (`service`) and the records a
 //! background run leaves for `status` and `doctor` (`background`).
 //!
 //! The clone lives at `<state>/loadout`. `clone` and `fetch` take the state lock by reference,
@@ -325,7 +325,7 @@ fn checkout_check(context: &Context) -> Check {
             name,
             CheckStatus::Warn,
             format!(
-                "{} from {origin}: {reason}; `loadout update` won't move it",
+                "{} from {origin}: {reason}; `loadout sync` won't move it",
                 path.display()
             ),
         ),

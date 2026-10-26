@@ -11,7 +11,7 @@ pub enum Mode {
     /// `loadout apply`: may replace an unowned target after a backup, and honours `--force` and
     /// `--elevated`.
     Interactive,
-    /// The background update: never replaces, forces, elevates, or prompts.
+    /// The background sync: never replaces, forces, elevates, or prompts.
     Background,
 }
 

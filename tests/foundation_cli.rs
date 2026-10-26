@@ -66,13 +66,17 @@ fn help_lists_only_working_commands() {
     assert!(help.contains("rollback"), "{help}");
     assert!(help.contains("plan"), "{help}");
     assert!(help.contains("apply"), "{help}");
-    for command in ["update", "service", "init"] {
+    for command in ["sync", "update", "service", "init"] {
         assert!(
             help.lines()
                 .any(|line| line.trim_start().starts_with(command)),
             "{command} must be advertised:\n{help}"
         );
     }
+    assert!(
+        help.contains("[alias: upgrade]"),
+        "upgrade is advertised as update's alias:\n{help}"
+    );
 }
 
 #[test]

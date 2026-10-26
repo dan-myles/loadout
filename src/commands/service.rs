@@ -14,12 +14,12 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Action {
-    /// Install or replace the scheduled background update for this user, at the interval the
+    /// Install or replace the scheduled background sync for this user, at the interval the
     /// loadout sets
     Install,
-    /// Remove the scheduled background update
+    /// Remove the scheduled background sync
     Uninstall,
-    /// Show whether the background update is installed and how its last run went
+    /// Show whether the background sync is installed and how its last run went
     Status {
         /// Print the status as JSON
         #[arg(long)]
@@ -68,7 +68,7 @@ fn install(context: &Context) -> anyhow::Result<Exit> {
                 println!("warning: {warning}");
             }
             println!(
-                "installed: `{}` runs `loadout update --background` every {} minutes",
+                "installed: `{}` runs `loadout sync --background` every {} minutes",
                 installed.exe.display(),
                 installed.interval_minutes
             );
@@ -81,7 +81,7 @@ fn install(context: &Context) -> anyhow::Result<Exit> {
 fn uninstall(context: &Context) -> anyhow::Result<Exit> {
     match service::uninstall(context) {
         Ok(()) => {
-            println!("removed: no background update is scheduled");
+            println!("removed: no background sync is scheduled");
             Ok(Exit::Success)
         }
         Err(error) => refused(error),
