@@ -442,7 +442,9 @@ fn find(
                 }
             },
         })?;
-    if version <= current {
+    // Precedence, not `Ord`: a release differing only in build metadata is the same version and
+    // is never offered. The record and smoke checks still require the exact version text.
+    if !version.cmp_precedence(&current).is_gt() {
         return Ok(None);
     }
     Ok(Some(Release {

@@ -323,6 +323,10 @@ updated, already up to date or nothing is published; 4 when this binary can't be
   (`api.github.com/repos/dan-myles/loadout/releases`, every linked page up to 10 of at most 8 MiB,
   drafts and non-`v<semver>` tags skipped) and takes the highest version, prerelease or not. A
   rate limit or any unreadable answer is an error, never "up to date".
+- **Which is newer.** SemVer precedence, so `test.10` is newer than `test.2` and `1.2.0` is newer
+  than `1.2.0-test.9`. Build metadata has no precedence: `1.2.0+build.2` is the same version as
+  `1.2.0` or `1.2.0+build.1`, and is never offered to either. Once found, the install record and the
+  downloaded binary's `--version` must still name the exact version, metadata included.
 - **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
   the exact sidecar and a matching hash.
 - **Archive.** It reads the expected binaries from memory, checking each name, type and size. A

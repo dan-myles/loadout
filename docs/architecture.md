@@ -1859,7 +1859,9 @@ Automatic updates are required, so they are on by default.
     links only under the API base; drafts and tags that aren't `v<semver>` are skipped and the
     highest version wins. A rate limit, a refusal, or an oversized or malformed answer is an error.
   - **Newer only.** `Some` means a release strictly newer than the running CLI; `None` means none
-    is offered.
+    is offered. Both the ranking and this test use SemVer precedence (`Version::cmp_precedence`),
+    which ignores build metadata, so a metadata-only difference is never an update; the record and
+    `--version` checks still compare the exact version.
   - **Skips.** `Error::skipped()` covers LOADOUT_HOME isolation, a binary without a matching
     install record, no published release, and another install or self-update holding the install
     folder's lock (`Busy`). Every other error fails the self-update.

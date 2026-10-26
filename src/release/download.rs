@@ -116,13 +116,14 @@ impl Source {
         Ok(Latest::Tag(tag.to_owned()))
     }
 
-    /// The newest published release of any kind, prereleases included: the highest
-    /// `v<semver>` tag in the public releases list (`/repos/<repository>/releases`, no token).
-    /// Drafts and tags that aren't `v<semver>` are skipped. Every page the list links to is read,
-    /// up to [`LIST_PAGES`] pages of at most [`LIST_LIMIT`] bytes each, and only pages under this
-    /// source's API base are followed. A longer list, an answer that isn't a release list, or a
-    /// request GitHub refuses (its API allows 60 unauthenticated requests an hour) is an error,
-    /// never an empty list.
+    /// The newest published release of any kind, prereleases included: the `v<semver>` tag of
+    /// highest semver precedence in the public releases list (`/repos/<repository>/releases`, no
+    /// token). Build metadata has no precedence, so of tags that differ only in it the first
+    /// listed (GitHub lists the newest first) is kept. Drafts and tags that aren't `v<semver>`
+    /// are skipped. Every page the list links to is read, up to [`LIST_PAGES`] pages of at most
+    /// [`LIST_LIMIT`] bytes each, and only pages under this source's API base are followed. A
+    /// longer list, an answer that isn't a release list, or a request GitHub refuses (its API
+    /// allows 60 unauthenticated requests an hour) is an error, never an empty list.
     pub(super) fn newest(&self) -> Result<Latest, String> {
         let agent = self.agent(MAX_REDIRECTS, false);
         let mut url = format!(
@@ -165,7 +166,9 @@ impl Source {
                 .map_err(|error| format!("{url} didn't answer with a release list: {error}"))?;
             for release in listed.into_iter().filter(|release| !release.draft) {
                 if let Some(version) = tag_version(&release.tag_name)
-                    && newest.as_ref().is_none_or(|(best, _)| version > *best)
+                    && newest
+                        .as_ref()
+                        .is_none_or(|(best, _)| version.cmp_precedence(best).is_gt())
                 {
                     newest = Some((version, release.tag_name));
                 }

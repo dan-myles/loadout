@@ -343,14 +343,35 @@ mod unix {
         fixture: &Installed,
         channel: Channel,
     ) -> Result<Option<Release>, Error> {
+        release_from(server, fixture, channel, "1.0.0")
+    }
+
+    /// The release offered to a CLI running `current`.
+    fn release_from(
+        server: &Server,
+        fixture: &Installed,
+        channel: Channel,
+        current: &str,
+    ) -> Result<Option<Release>, Error> {
         find(
             &server.source(),
             fixture.install().unwrap(),
             TARGET,
-            Version::new(1, 0, 0),
+            Version::parse(current).unwrap(),
             Containment::OwnGroup,
             channel,
         )
+    }
+
+    /// The tag the prerelease channel offers a CLI running 1.0.0 when the list is `tags`.
+    fn newest_of(server: &Server, fixture: &Installed, tags: &[&str]) -> String {
+        let listed: Vec<(&str, bool, bool)> = tags.iter().map(|tag| (*tag, false, true)).collect();
+        server.route(LIST, 200, &[], &page(&listed));
+        release_on(server, fixture, Channel::Prerelease)
+            .unwrap()
+            .unwrap()
+            .tag()
+            .to_owned()
     }
 
     const LIST: &str = "/repos/dan-myles/loadout/releases?per_page=100";
@@ -461,6 +482,91 @@ mod unix {
             release_on(&server, &fixture, Channel::Prerelease),
             Err(Error::NoRelease)
         ));
+    }
+
+    #[test]
+    fn releases_are_ranked_by_semver_precedence_which_ignores_build_metadata() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (tags, newest) in [
+            // Equal precedence: the first listed, which GitHub lists as the newest, is kept.
+            (
+                &["v1.3.0-test.1+build.1", "v1.3.0-test.1+build.2"][..],
+                "v1.3.0-test.1+build.1",
+            ),
+            (
+                &["v1.3.0-test.1+build.2", "v1.3.0-test.1+build.1"],
+                "v1.3.0-test.1+build.2",
+            ),
+            // Numeric identifiers compare as numbers.
+            (&["v1.3.0-test.2", "v1.3.0-test.10"], "v1.3.0-test.10"),
+            (&["v1.3.0-test.10", "v1.3.0-test.2"], "v1.3.0-test.10"),
+            // A stable release outranks its own prereleases.
+            (&["v1.3.0-test.9", "v1.3.0"], "v1.3.0"),
+            (&["v1.3.0", "v1.3.0-test.9"], "v1.3.0"),
+            (
+                &["v1.3.0+build.1", "v1.3.0-test.9+build.2"],
+                "v1.3.0+build.1",
+            ),
+        ] {
+            assert_eq!(newest_of(&server, &fixture, tags), newest, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_differing_only_in_build_metadata_is_never_offered() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (current, tag) in [
+            ("1.2.3-test.1+build.1", "v1.2.3-test.1+build.2"),
+            ("1.2.3-test.1+build.2", "v1.2.3-test.1+build.1"),
+            ("1.2.3-test.1", "v1.2.3-test.1+build.1"),
+            ("1.2.3", "v1.2.3+build.1"),
+            ("1.2.3+build.1", "v1.2.3"),
+        ] {
+            server.route(LIST, 200, &[], &page(&[(tag, false, true)]));
+            assert!(
+                release_from(&server, &fixture, Channel::Prerelease, current)
+                    .unwrap()
+                    .is_none(),
+                "{current} offered {tag}"
+            );
+            if !tag.contains('-') {
+                server.publish(tag, b"unused", None);
+                assert!(
+                    release_from(&server, &fixture, Channel::Stable, current)
+                        .unwrap()
+                        .is_none(),
+                    "{current} offered stable {tag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_release_of_higher_precedence_is_offered_whatever_either_build_metadata() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (current, tag) in [
+            ("1.2.3-test.1+build.9", "v1.2.3-test.2"),
+            ("1.2.3-test.2+build.1", "v1.2.3-test.10+build.0"),
+            ("1.2.3-test.9", "v1.2.3"),
+            ("1.2.3+build.9", "v1.2.4+build.1"),
+        ] {
+            server.route(LIST, 200, &[], &page(&[(tag, false, true)]));
+            let release = release_from(&server, &fixture, Channel::Prerelease, current)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{current} was not offered {tag}"));
+            assert_eq!(release.tag(), tag);
+            assert_eq!(release.current(), current);
+            if !tag.contains('-') {
+                server.publish(tag, b"unused", None);
+                let stable = release_from(&server, &fixture, Channel::Stable, current)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{current} was not offered stable {tag}"));
+                assert_eq!(stable.tag(), tag);
+            }
+        }
     }
 
     /// A releases-list answer, and what its error must say: name, status, headers, body, text.
