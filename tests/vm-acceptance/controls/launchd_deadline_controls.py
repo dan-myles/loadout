@@ -5,7 +5,9 @@ verdict, and both callers driven against a scripted launchd and process table. N
 touches launchd or signals a real process; the real-process controls use only children this
 script starts.
 
-  python3 -I tests/vm-acceptance/controls/launchd_deadline_controls.py
+  python3 -I tests/vm-acceptance/controls/launchd_deadline_controls.py [DRIVER]
+
+DRIVER defaults to guest/linux_acceptance.py beside this folder.
 """
 
 import importlib.util
@@ -19,7 +21,7 @@ import time
 import types
 from pathlib import Path
 
-DRIVER = Path(__file__).resolve().parents[1] / "guest" / "linux_acceptance.py"
+DRIVER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "guest" / "linux_acceptance.py"
 spec = importlib.util.spec_from_file_location("linux_acceptance", DRIVER)
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
@@ -179,7 +181,7 @@ def drive(case, table, listed, records, last):
             d.launchd_deadline_case(h, background)
         else:
             d.launchd_soft_cancel_case(h, background, target)
-        return h.records[case], killed
+        return h.records[case], killed, h.records, (d.FAKE_STATE / "hang").exists()
     finally:
         os.kill = real_kill
         for name, value in saved.items():
@@ -204,12 +206,17 @@ for name, table, lst, want, needle in (
          listed, "fail", "installer pid 100 not captured"),
         ("installer still alive", {100: [present(100)], 200: [present(200), ("absent", None)]},
          listed, "fail", "captured installer processes terminated")):
-    (status, detail), killed = drive("M8-deadline", table, lst, timed_out, "1")
+    (status, detail), killed, records, held = drive("M8-deadline", table, lst, timed_out, "1")
     check("deadline caller: %s -> %s" % (name, want), status == want and needle in detail, "%s: %s" % (status, detail))
+    check("deadline caller: %s: signals nothing and releases the hold" % name, killed == [] and not held,
+          "killed %r, hold still present %s" % (killed, held))
+    survivors = records.get("M8-deadline-survivors-not-signalled")
     if name == "installer still alive":
-        check("deadline caller kills only a verified-alive identity", killed == [100], repr(killed))
-    if name == "installer query unavailable afterwards":
-        check("deadline caller never signals an unavailable identity", killed == [], repr(killed))
+        check("deadline caller reports the unsignalled survivor", survivors is not None and survivors[0] == "observe"
+              and "(100, " in survivors[1] and "refused" in survivors[1], repr(survivors))
+    else:
+        check("deadline caller: %s: no survivor receipt without a verified-alive identity" % name,
+              survivors is None, repr(survivors))
 
 soft = {"supervisor.json": {"outcome": "exited", "cancelled": True, "code": 4, "run": RUN},
         "last-run.json": {"cancelled": True, "exit": 4, "result": "applied", "message": "cancelled at the soft deadline",
@@ -230,8 +237,9 @@ for name, table, lst, want, needle in (
         ("worker query unavailable afterwards", {100: [present(100), present(100), ("absent", None)],
                                                  200: [present(200), ("unavailable", "exit 2")]},
          listed, "fail", "worker exited")):
-    (status, detail), _ = drive("M8-soft-cancel-receipt", table, lst, soft, "4")
+    (status, detail), killed, _, _ = drive("M8-soft-cancel-receipt", table, lst, soft, "4")
     check("soft-cancel caller: %s -> %s" % (name, want), status == want and needle in detail, "%s: %s" % (status, detail))
+    check("soft-cancel caller: %s: signals nothing" % name, killed == [], repr(killed))
 
 print("all controls passed" if not failures else "%d control(s) failed" % failures)
 sys.exit(1 if failures else 0)

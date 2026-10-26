@@ -1506,8 +1506,12 @@ def launchd_deadline_case(h, records):
     h.record("M8-deadline", "fail" if failures else "pass",
              detail="; ".join(failures) or "timed out after %ss; installers %s and workers %s gone"
              % (evidence.get("seconds"), evidence.get("installers"), evidence.get("workers")))
-    for pid, _ in evidence.get("installers_alive", []) + evidence.get("workers_alive", []):
-        os.kill(pid, signal.SIGKILL)
+    # A pid saved earlier is no proof the process holding it now is ours, so survivors are only
+    # reported; releasing the hold (above) is the only cleanup.
+    survivors = evidence.get("installers_alive", []) + evidence.get("workers_alive", [])
+    if survivors:
+        h.record("M8-deadline-survivors-not-signalled", "observe",
+                 detail="harness cleanup refused: %s left unsignalled after the hold was released" % survivors)
     h.run("M8-lock-free-after-deadline", [CLI, "status"], {0, 4}, observe=True)
     h.run("M8-rollback-after-deadline", [CLI, "rollback"], {0, 4}, observe=True)
     h.run("M8-update-after-deadline", [CLI, "update"], {0})
