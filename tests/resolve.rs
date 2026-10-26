@@ -522,7 +522,10 @@ fn the_legacy_update_cli_key_is_accepted_with_a_warning_and_changes_nothing() {
             ),
             ("os/linux.toml", "[update]\ncli = true\n"),
         ]);
-        let (resolved, warnings) = tree.ok("any", Os::Linux);
+        // The key is checked when the loadout is read, so its warnings come from loading.
+        let (_, loaded) = Loadout::load(tree.dir.path()).unwrap();
+        let warnings = lines(&loaded);
+        let resolved = tree.clean("any", Os::Linux);
         assert_eq!(
             resolved.update,
             resolve::Update {
@@ -536,6 +539,7 @@ fn the_legacy_update_cli_key_is_accepted_with_a_warning_and_changes_nothing() {
             2,
             "one warning for each layer: {warnings}"
         );
+        assert!(!loaded.has_errors(), "{warnings}");
         assert!(warnings.contains("`loadout update`"), "{warnings}");
     }
 }

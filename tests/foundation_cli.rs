@@ -191,6 +191,23 @@ fn missing_directory_and_root_file_are_invalid() {
     assert!(stdout(&output).contains("loadout.toml: error: cannot read"));
 }
 
+/// The legacy `[update] cli` stays valid, so existing loadouts keep working, but `validate` says
+/// it does nothing: the CLI updates only when `loadout update` runs.
+#[test]
+fn the_legacy_update_cli_key_validates_with_a_warning() {
+    for value in ["true", "false"] {
+        let (code, text) = validate_text(&format!(
+            "[loadout]\nversion = 1\n[update]\ncli = {value}\n"
+        ));
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("loadout.toml: warning: update.cli: has no effect")
+                && text.contains("`loadout update`"),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn header_is_required_and_versioned() {
     let (code, text) = validate_text("[variables]\na = \"b\"\n");

@@ -120,7 +120,7 @@ impl std::fmt::Display for Blocked {
     }
 }
 
-/// Loadout's own clone: `<state>/loadout`, the checkout `plan`, `apply`, and `update` read by
+/// Loadout's own clone: `<state>/loadout`, the checkout `plan`, `apply`, and `sync` read by
 /// default.
 pub fn checkout(context: &Context) -> PathBuf {
     context.state.join("loadout")
@@ -251,7 +251,7 @@ pub fn settings(context: &Context, checkout: &Path) -> Result<Update, Error> {
 }
 
 /// Why no new run may start on this machine yet, if one may not: the newest run didn't finish
-/// (or another run is going), or its journal can't be read. `update` checks this before it
+/// (or another run is going), or its journal can't be read. `sync` checks this before it
 /// fetches, so a blocked machine's clone doesn't move either.
 pub fn unfinished(context: &Context) -> Result<Option<String>, Error> {
     let runs = state::runs(context)?;

@@ -16,7 +16,6 @@ editor_font_size = 13
 [update]
 auto = true
 interval_minutes = 60
-cli = true
 
 [agents]
 enabled = ["claude", "codex", "opencode", "pi", "grok", "cursor", "muse", "antigravity", "devin"]
