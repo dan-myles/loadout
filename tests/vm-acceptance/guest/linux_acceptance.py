@@ -1356,6 +1356,9 @@ def g8_launchd(h):
         h.check("M8-start-interval-fires", ok,
                 "settled baseline (runs %s, run %s), then a scheduled run with no kickstart applied C14 within 18 minutes"
                 % (base["runs"], run_before))
+    if h.args.long_deadline:
+        launchd_deadline_case(h, records)
+        launchd_soft_cancel_case(h, records, target)
     native_formats(h, "M8-native-formats")
     status_json_case(h, "M8-definition-matches")
     unicode_job(h, service_toml)
@@ -1370,6 +1373,119 @@ def g8_launchd(h):
     if launchd_state()["loaded"]:
         sh(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], check=False)
         h.record("M8-guest-cleanup-plist-deleted", "observe", detail="agent was still loaded; booted out by the harness")
+
+
+def process_identity(pid):
+    """(pid, start time) from `ps`, or None when no process has that pid. A zombie still has one."""
+    started = sh(["ps", "-o", "lstart=", "-p", str(pid)], check=False)
+    return (pid, started) if started else None
+
+
+def identities_alive(identities):
+    """The captured (pid, start time) pairs still in the process table: same pid AND same start, so
+    a pid reused by another process is not mistaken for the original."""
+    return [ident for ident in identities if process_identity(ident[0]) == ident]
+
+
+def held_launchd_run(h, case, timeout, release_at=None):
+    """A kickstarted agent run whose fake install is held. Captures the installer's and worker's
+    process identities once the install is reached; with release_at (seconds after the kickstart)
+    lets the install go then. Returns the evidence the deadline and soft-cancel cases assert on."""
+    failures = []
+    if not launchd_drain():
+        failures.append("harness: the agent never settled before the kickstart")
+    base = launchd_state()
+    run_before, _ = supervisor_run()
+    t0 = time.monotonic()
+    wall0 = time.time()
+    pid, request_failure = kickstart_request()
+    evidence = {"kickstart_pid": pid, "base": base, "run_before": run_before, "failures": failures}
+    if request_failure:
+        failures.append(request_failure)
+        return evidence
+    reached = wait_for(lambda: bool(processes_matching("install pkg-cargo")), 300)
+    installers = [process_identity(p) for p, _ in processes_matching("install pkg-cargo")]
+    workers = [process_identity(p) for p, _ in processes_matching("--worker")]
+    evidence.update(reached=reached, installers=[i for i in installers if i], workers=[w for w in workers if w])
+    if not reached or not evidence["installers"]:
+        failures.append("the held install was never reached")
+    if release_at is not None:
+        time.sleep(max(0.0, t0 + release_at - time.monotonic()))
+        evidence["held_at_release"] = identities_alive(evidence["installers"])
+        (FAKE_STATE / "hang").unlink(missing_ok=True)
+    finished = wait_for(lambda: launchd_completed(launchd_state(), base["runs"]),
+                        max(0.0, t0 + timeout - time.monotonic()), 2)
+    state = launchd_state()
+    run_after, mtime = supervisor_run()
+    evidence.update(finished=finished, state=state, run_after=run_after, seconds=round(time.monotonic() - t0),
+                    installers_alive=identities_alive(evidence["installers"]),
+                    workers_alive=identities_alive(evidence["workers"]))
+    if not finished:
+        failures.append("requested run did not complete in %ss (%s)" % (timeout, json.dumps(state, sort_keys=True)))
+    if run_after in (None, run_before) or mtime is None or mtime < wall0 - 1:
+        failures.append("supervisor record names no new run (before %s, after %s)" % (run_before, run_after))
+    elif run_pid(run_after) != pid:
+        failures.append("supervisor run %s is not the kickstarted pid %s" % (run_after, pid))
+    (CASES / ("%s.evidence.json" % case)).write_text(json.dumps(evidence, indent=2, sort_keys=True, default=str))
+    return evidence
+
+
+def launchd_deadline_case(h, records):
+    """macOS: the production hard deadline (60 minutes) once, through the real agent, with the
+    install held past it. The supervisor must time the run out and exit 1, and the installer and
+    worker processes captured while held must be gone from the process table afterwards."""
+    (FAKE_STATE / "cargo").unlink(missing_ok=True)
+    (FAKE_STATE / "hang").write_text("hold\n")
+    commit("C15 deadline", {"files/hello.txt": hello("c15")})
+    evidence = held_launchd_run(h, "M8-deadline", 66 * 60)
+    (FAKE_STATE / "hang").unlink(missing_ok=True)
+    supervisor = json_file(records / "supervisor.json")
+    failures = evidence["failures"] + [label for label, ok in (
+        ("last exit code 1", evidence.get("state", {}).get("last") == "1"),
+        ("supervisor timed out", supervisor.get("outcome") == "timed-out"),
+        ("supervisor code none", supervisor.get("code") is None),
+        ("installer never finished", not (FAKE_STATE / "cargo").exists()),
+        ("captured installer processes terminated", evidence.get("installers") and not evidence.get("installers_alive")),
+        ("captured worker processes terminated", evidence.get("workers") and not evidence.get("workers_alive"))) if not ok]
+    h.record("M8-deadline", "fail" if failures else "pass",
+             detail="; ".join(failures) or "timed out after %ss; installers %s and workers %s gone"
+             % (evidence.get("seconds"), evidence.get("installers"), evidence.get("workers")))
+    for pid, _ in evidence.get("installers_alive", []) + evidence.get("workers_alive", []):
+        os.kill(pid, signal.SIGKILL)
+    h.run("M8-lock-free-after-deadline", [CLI, "status"], {0, 4}, observe=True)
+    h.run("M8-rollback-after-deadline", [CLI, "rollback"], {0, 4}, observe=True)
+    h.run("M8-update-after-deadline", [CLI, "update"], {0})
+
+
+def launchd_soft_cancel_case(h, records, target):
+    """macOS: the production soft deadline (55 minutes) asks the worker to stop while its install
+    is held; the install is let go at 57 minutes, before the hard deadline. The worker finishes by
+    itself, records cancelled with exit 4, and the supervisor exits 4 after a clean exit."""
+    (FAKE_STATE / "cargo").unlink(missing_ok=True)
+    (FAKE_STATE / "hang").write_text("hold\n")
+    commit("C15b soft cancel", {"files/hello.txt": hello("c15b")})
+    evidence = held_launchd_run(h, "M8-soft-cancel", 63 * 60, release_at=57 * 60)
+    last = json_file(records / "last-run.json")
+    supervisor = json_file(records / "supervisor.json")
+    (CASES / "M8-soft-cancel.records.json").write_text(json.dumps(
+        {"launchd": evidence.get("state"), "last-run": last, "supervisor": supervisor}, indent=2, sort_keys=True))
+    failures = evidence["failures"] + [label for label, ok in (
+        ("install still held past the soft deadline", bool(evidence.get("held_at_release"))),
+        ("last exit code 4", evidence.get("state", {}).get("last") == "4"),
+        ("worker record cancelled", last.get("cancelled") is True),
+        ("worker record exit 4", last.get("exit") == 4),
+        ("worker record result applied", last.get("result") == "applied"),
+        ("worker record says cancelled", "cancel" in str(last.get("message", "")).lower()),
+        ("supervisor exited by itself", supervisor.get("outcome") == "exited"),
+        ("supervisor saw the soft request", supervisor.get("cancelled") is True),
+        ("supervisor code 4", supervisor.get("code") == 4),
+        ("records pair by run id", supervisor.get("run") is not None and last.get("supervisor") == supervisor.get("run")),
+        ("journaled write done before the cancel", read(target) == hello("c15b")),
+        ("released installer exited", not evidence.get("installers_alive"))) if not ok]
+    h.record("M8-soft-cancel-receipt", "fail" if failures else "pass",
+             detail="; ".join(failures) or json.dumps(evidence.get("state"), sort_keys=True))
+    h.run("M8-status-after-soft-cancel", [CLI, "status"], {4})
+    h.run("M8-update-after-soft-cancel", [CLI, "update"], {0})
 
 
 def deadline_case(h, records):
