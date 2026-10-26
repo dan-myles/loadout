@@ -1050,7 +1050,10 @@ mod tests {
                      if [ -e '{root}/fail' ]; then exit 2; fi\n\
                      if [ -e '{root}/installed-a' ]; then printf 'a v1.0.0:\\n    a\\n'; fi\n\
                      exit 0\nfi\n\
-                     if [ \"$1\" = install ]; then : > '{root}/installed-'\"$2\"; exit 0; fi\n\
+                     if [ \"$1\" = install ]; then\n\
+                     if [ -e '{root}/hold' ]; then : > '{root}/install-started'\n\
+                     n=0; while [ ! -e '{root}/release' ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n + 1)); done; fi\n\
+                     : > '{root}/installed-'\"$2\"; exit 0; fi\n\
                      exit 64\n"
                 ),
             )
@@ -1241,6 +1244,43 @@ mod tests {
                     );
                     assert!(!root.join("installed-a").exists());
                 }
+                "cancel-during-install" => {
+                    let context = supervised(&context);
+                    std::fs::write(root.join("hold"), "").unwrap();
+                    let flag = context.containment.cancel().unwrap().clone();
+                    let marks = root.clone();
+                    let canceller = std::thread::spawn(move || {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                        while !marks.join("install-started").exists() {
+                            assert!(std::time::Instant::now() < deadline, "the installer never started");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        flag.cancel();
+                        std::fs::write(marks.join("release"), "").unwrap();
+                    });
+                    let report = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        BACKGROUND,
+                    )
+                    .unwrap();
+                    canceller.join().unwrap();
+                    let program = report
+                        .outcomes
+                        .iter()
+                        .find(|(action, _)| matches!(action.target, Target::Program { .. }))
+                        .unwrap();
+                    assert!(
+                        matches!(&program.1, Outcome::Skipped(reason) if reason.contains("didn't confirm")),
+                        "{report:#?}"
+                    );
+                    assert!(report.cancelled && report.unhealthy() && !report.failed(), "{report:#?}");
+                    assert!(root.join("installed-a").exists());
+                    let calls = calls();
+                    let after = calls.split_once("install a\n").map_or("", |(_, after)| after);
+                    assert_eq!(after, "", "no query starts after the cancel: {calls:?}");
+                }
                 "query-error" => {
                     let context = supervised(&context);
                     std::fs::write(root.join("fail"), "").unwrap();
@@ -1284,6 +1324,14 @@ mod tests {
         #[test]
         fn a_run_cancelled_before_its_installs_starts_no_installer() {
             scenario("cancel-before-install");
+        }
+
+        /// The production soft deadline lands while an installer runs: that installer finishes,
+        /// and the run, cancelled by then, starts no confirming query. The program is left
+        /// unconfirmed, so the run exits 4 as cancelled, not 1 as failed.
+        #[test]
+        fn a_run_cancelled_during_an_install_reports_it_unconfirmed_not_failed() {
+            scenario("cancel-during-install");
         }
 
         #[test]
