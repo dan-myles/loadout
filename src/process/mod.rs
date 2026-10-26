@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use background::{Ended, Error, LOG_CAP, Limits, Log, Outcome, Refused, handshake, supervise};
-#[cfg(unix)]
 pub(crate) use query::QueryError;
 pub(crate) use query::{Captured, Output, install, install_refused, query, query_output};
 
