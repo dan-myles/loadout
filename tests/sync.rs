@@ -15,18 +15,20 @@ use loadout::sync::{self, Blocked, Error, Fetched};
 
 /// The state lock, taken once no other process holds it. When this test just dropped an earlier
 /// lock, a child that another test thread is starting can hold a copy of that lock's descriptor
-/// until it execs, so this waits up to 5 seconds for `state::busy` to clear before taking the
-/// lock. Still held then, or any error, fails the test.
+/// until it execs, so taking it is retried for up to 5 seconds while it is `Locked`. Checking
+/// `state::busy` first and then locking raced a child spawned in between. Still held then, or
+/// any other error, fails the test.
 fn relock(context: &Context) -> state::Lock {
     let until = Instant::now() + Duration::from_secs(5);
-    while state::busy(context).unwrap() {
-        assert!(
-            Instant::now() < until,
-            "the state lock is still held 5 seconds later"
-        );
-        thread::sleep(Duration::from_millis(20));
+    loop {
+        match state::lock(context) {
+            Ok(lock) => return lock,
+            Err(state::Error::Locked { .. }) if Instant::now() < until => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("cannot take the state lock: {error}"),
+        }
     }
-    state::lock(context).unwrap()
 }
 
 /// Runs git in `dir` with a fixed identity and no signing, and returns its stdout.
