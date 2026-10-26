@@ -361,6 +361,7 @@ fn install(steps: &plan::Steps, action: &Action, options: Options) -> Outcome {
             Outcome::Blocked(error.to_string())
         }
         Err(error @ programs::Error::Unconfirmed { .. }) => Outcome::Skipped(error.to_string()),
+        Err(programs::Error::NotStarted { .. }) => Outcome::Skipped(CANCELLED.to_owned()),
         Err(error) => Outcome::Failed(error.to_string()),
     }
 }
@@ -1041,6 +1042,12 @@ mod tests {
             let bin = dir.join("bin");
             std::fs::create_dir(&bin).unwrap();
             let root = dir.display().to_string();
+            // The child's PATH holds only `bin`, so the hold's wait names the test's own `sleep`.
+            let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("sleep"))
+                .find(|path| path.is_file())
+                .expect("a sleep command on the test's PATH");
+            let sleep = sleep.display();
             let cargo = bin.join("cargo");
             std::fs::write(
                 &cargo,
@@ -1053,7 +1060,8 @@ mod tests {
                      exit 0\nfi\n\
                      if [ \"$1\" = install ]; then\n\
                      if [ -e '{root}/hold' ]; then : > '{root}/install-started'\n\
-                     n=0; while [ ! -e '{root}/release' ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n + 1)); done; fi\n\
+                     n=0; while [ ! -e '{root}/release' ] && [ $n -lt 300 ]; do '{sleep}' 0.1; n=$((n + 1)); done\n\
+                     if [ ! -e '{root}/release' ]; then echo 'never released' >&2; exit 101; fi; fi\n\
                      : > '{root}/installed-'\"$2\"; exit 0; fi\n\
                      exit 64\n"
                 ),
@@ -1290,6 +1298,37 @@ mod tests {
                         .map_or("", |(_, after)| after);
                     assert_eq!(after, "", "no query starts after the cancel: {calls:?}");
                 }
+                "cancel-at-installer-start" => {
+                    let context = supervised(&context);
+                    let _hook = observe::with(|boundary, context| {
+                        if boundary == observe::Boundary::Install {
+                            cancel(context);
+                        }
+                    });
+                    let report = run_under_lock(
+                        &context,
+                        &checkout,
+                        state::lock(&context).unwrap(),
+                        BACKGROUND,
+                    )
+                    .unwrap();
+                    let program = report
+                        .outcomes
+                        .iter()
+                        .find(|(action, _)| matches!(action.target, Target::Program { .. }))
+                        .unwrap();
+                    assert_eq!(
+                        program.1,
+                        Outcome::Skipped(CANCELLED.to_owned()),
+                        "{report:#?}"
+                    );
+                    assert!(
+                        report.cancelled && report.unhealthy() && !report.failed(),
+                        "{report:#?}"
+                    );
+                    assert_eq!(installs(&calls()), 0, "no installer started: {:?}", calls());
+                    assert!(!root.join("installed-a").exists());
+                }
                 "query-error" => {
                     let context = supervised(&context);
                     std::fs::write(root.join("fail"), "").unwrap();
@@ -1341,6 +1380,13 @@ mod tests {
         #[test]
         fn a_run_cancelled_during_an_install_reports_it_unconfirmed_not_failed() {
             scenario("cancel-during-install");
+        }
+
+        /// The cancellation lands after apply's own check and before the installer starts: U8
+        /// refuses to start it, and that refusal is a skip, not a failed spawn.
+        #[test]
+        fn a_cancel_between_the_check_and_the_installer_skips_it() {
+            scenario("cancel-at-installer-start");
         }
 
         #[test]
