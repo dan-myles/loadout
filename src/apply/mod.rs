@@ -360,6 +360,7 @@ fn install(steps: &plan::Steps, action: &Action, options: Options) -> Outcome {
         Err(error @ (programs::Error::Changed { .. } | programs::Error::NeedsElevation { .. })) => {
             Outcome::Blocked(error.to_string())
         }
+        Err(error @ programs::Error::Unconfirmed { .. }) => Outcome::Skipped(error.to_string()),
         Err(error) => Outcome::Failed(error.to_string()),
     }
 }
@@ -1252,7 +1253,10 @@ mod tests {
                     let canceller = std::thread::spawn(move || {
                         let deadline = std::time::Instant::now() + Duration::from_secs(30);
                         while !marks.join("install-started").exists() {
-                            assert!(std::time::Instant::now() < deadline, "the installer never started");
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the installer never started"
+                            );
                             std::thread::sleep(Duration::from_millis(10));
                         }
                         flag.cancel();
@@ -1275,10 +1279,15 @@ mod tests {
                         matches!(&program.1, Outcome::Skipped(reason) if reason.contains("didn't confirm")),
                         "{report:#?}"
                     );
-                    assert!(report.cancelled && report.unhealthy() && !report.failed(), "{report:#?}");
+                    assert!(
+                        report.cancelled && report.unhealthy() && !report.failed(),
+                        "{report:#?}"
+                    );
                     assert!(root.join("installed-a").exists());
                     let calls = calls();
-                    let after = calls.split_once("install a\n").map_or("", |(_, after)| after);
+                    let after = calls
+                        .split_once("install a\n")
+                        .map_or("", |(_, after)| after);
                     assert_eq!(after, "", "no query starts after the cancel: {calls:?}");
                 }
                 "query-error" => {

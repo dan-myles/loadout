@@ -39,6 +39,14 @@ pub enum Error {
     #[error("programs.{program}: only a missing program can be installed")]
     NotMissing { program: String },
     #[error(
+        "programs.{program}: {manager} finished installing {package:?}, but the background run was cancelled, so loadout didn't confirm it"
+    )]
+    Unconfirmed {
+        program: String,
+        manager: &'static str,
+        package: String,
+    },
+    #[error(
         "programs.{program}: the machine changed after the plan ({detail}), so loadout installed nothing; plan again"
     )]
     Changed { program: String, detail: String },
@@ -449,6 +457,15 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
 /// supervised run, as in `observe`.
 fn verified(program: &str, missing: &Missing) -> Result<Installed, Error> {
     let package = &missing.package;
+    // A cancellation that lands while the installer runs lets it finish, and then refuses the
+    // confirming query. That is work the run didn't do, not a failed install.
+    if missing.containment.is_cancelled() {
+        return Err(Error::Unconfirmed {
+            program: program.to_owned(),
+            manager: package.manager.id(),
+            package: package.id.clone(),
+        });
+    }
     let answer = detect::installed(
         &missing.containment,
         package.manager,
@@ -825,6 +842,24 @@ mod tests {
             let error = verified("tool", &missing).unwrap_err();
             assert!(matches!(error, Error::Detect { .. }), "{error}");
             assert!(containment.is_cancelled());
+        }
+
+        #[test]
+        fn a_run_cancelled_during_its_install_starts_no_confirming_query() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let missing = Missing {
+                package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 0)),
+                scope: Scope::User,
+                containment: containment.clone(),
+            };
+            containment.cancel().unwrap().cancel();
+            let error = verified("tool", &missing).unwrap_err();
+            assert!(matches!(error, Error::Unconfirmed { .. }), "{error}");
+            assert!(
+                !dir.path().join("cargo.calls").exists(),
+                "a cancelled run must start no query"
+            );
         }
 
         #[test]
