@@ -1355,8 +1355,8 @@ fn validated(
 #[derive(Debug)]
 pub(crate) struct InstallRefused;
 
-impl std::fmt::Display for InstallRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for InstallRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("the background run was cancelled, so loadout started no installer")
     }
 }
@@ -1368,7 +1368,7 @@ impl std::error::Error for InstallRefused {}
 pub(crate) fn install_refused(error: &io::Error) -> bool {
     error
         .get_ref()
-        .is_some_and(|inner| inner.is::<InstallRefused>())
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<InstallRefused>)
 }
 
 /// Runs an install in loadout's own process group, so `sudo` can still prompt on the terminal
