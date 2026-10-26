@@ -23,9 +23,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same pull request supersedes its packaging run; tag and manual runs finish.
+# A newer push to the same pull request supersedes its packaging run. Tag and manual runs each get
+# a group of their own, so none of them waits for, or is cancelled by, another.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
