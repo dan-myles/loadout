@@ -41,7 +41,8 @@ directory the script creates, outside the checkout, when the result is evidence 
 The result names the commit and a fingerprint of the checkout's tracked and untracked file
 contents, index and HEAD, taken before and after the gates; uncommitted changes are allowed. It
 exits 1 if the fingerprint changed or cannot be read again, and 2 without running anything if
-Git cannot describe the checkout. Ignored files and anything outside the checkout are not covered,
+Git cannot describe the checkout or a name could be misread: a newline in a file name, symlink
+target or `--fresh` path, or a file name starting with `"` or ending in a carriage return. Ignored files and anything outside the checkout are not covered,
 and an edit undone before the gates finish goes unseen. `scripts/ci/test_check.sh` exercises
 these rules in scratch repositories with a fake `cargo`; it compiles and tests nothing.
 

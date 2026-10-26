@@ -247,6 +247,79 @@ grep -q "|target=$scratch/fresh-target|" "$log" && [[ -f $scratch/fresh-target/b
   pass "fresh-outside: every cargo call built in the new directory" || fail "fresh-outside: target dir"
 [[ $(grep -c "|target=$scratch/fresh-target|" "$log") == 3 ]] || fail "fresh-outside: not every call"
 
+# Names the fingerprint cannot read unambiguously are refused; ordinary odd names are hashed. The
+# symlink, quoted-name and fresh-newline cases follow review 196's tracked-symlink-trailing-newline,
+# tracked-leading-quote-file and fresh-newline-basename-run counterexamples.
+repo=$(new_repo links) || exit 2
+ln -s destination "$repo/link" && git -C "$repo" add link && git -C "$repo" commit -qm link || exit 2
+check tracked-link-gains-newline FAKE_EDIT_ON=fmt "FAKE_EDIT=ln -sfn -- \$'destination\\n' link" -- "$repo" fmt
+expect_code tracked-link-gains-newline 1
+expect_steps tracked-link-gains-newline "fmt"
+expect_out tracked-link-gains-newline "cannot fingerprint the checkout again"
+check tracked-link-has-newline -- "$repo" fmt
+expect_code tracked-link-has-newline 2
+expect_steps tracked-link-has-newline ""
+expect_out tracked-link-has-newline "unsupported symlink target with a newline"
+ln -sfn destination "$repo/link" && ln -s destination "$repo/ulink" || exit 2
+check untracked-link-gains-newline FAKE_EDIT_ON=fmt "FAKE_EDIT=ln -sfn -- \$'destination\\n' ulink" -- "$repo" fmt
+expect_code untracked-link-gains-newline 1
+expect_steps untracked-link-gains-newline "fmt"
+expect_out untracked-link-gains-newline "cannot fingerprint the checkout again"
+check untracked-link-has-newline -- "$repo" fmt
+expect_code untracked-link-has-newline 2
+expect_steps untracked-link-has-newline ""
+ln -sfn "destination with spaces" "$repo/ulink" || exit 2
+check link-retargeted FAKE_EDIT_ON=fmt "FAKE_EDIT=ln -sfn other-destination ulink" -- "$repo" fmt
+expect_code link-retargeted 1
+
+repo=$(new_repo quoted) || exit 2
+printf 'alias\n' >"$repo/quoted.txt" && printf 'literal\n' >"$repo/\"quoted.txt\"" || exit 2
+check untracked-quoted-name FAKE_EDIT_ON=fmt "FAKE_EDIT=echo changed >>'\"quoted.txt\"'" -- "$repo" fmt
+expect_code untracked-quoted-name 2
+expect_steps untracked-quoted-name ""
+expect_out untracked-quoted-name "unsupported file name"
+git -C "$repo" add -A && git -C "$repo" commit -qm quoted || exit 2
+check tracked-quoted-name FAKE_EDIT_ON=fmt "FAKE_EDIT=echo changed >>'\"quoted.txt\"'" -- "$repo" fmt
+expect_code tracked-quoted-name 2
+expect_steps tracked-quoted-name ""
+repo=$(new_repo carriage-return) || exit 2
+printf 'alias\n' >"$repo/cr.txt" && printf 'literal\n' >"$repo/cr.txt"$'\r' || exit 2
+check carriage-return-name FAKE_EDIT_ON=fmt "FAKE_EDIT=echo changed >>\$'cr.txt\\r'" -- "$repo" fmt
+expect_code carriage-return-name 2
+expect_steps carriage-return-name ""
+expect_out carriage-return-name "unsupported file name"
+repo=$(new_repo odd-names) || exit 2
+odd='a "b" c\d.txt'
+printf 'one\n' >"$repo/$odd" && printf 'two\n' >"$repo/sp ace.txt" && printf 'three\n' >"$repo/x\"" &&
+  git -C "$repo" add -A && git -C "$repo" commit -qm odd || exit 2
+check odd-names-unchanged -- "$repo" fmt
+expect_code odd-names-unchanged 0
+check odd-name-edited FAKE_EDIT_ON=fmt "FAKE_EDIT=echo more >>'$odd'" -- "$repo" fmt
+expect_code odd-name-edited 1
+expect_out odd-name-edited "the checkout changed while checking"
+git -C "$repo" checkout -q -- . || exit 2
+check trailing-quote-edited FAKE_EDIT_ON=fmt "FAKE_EDIT=echo more >>'x\"'" -- "$repo" fmt
+expect_code trailing-quote-edited 1
+
+# --fresh and target paths holding a newline are refused, never shortened to another directory.
+repo=$(new_repo fresh-newline) || exit 2
+mkdir "$scratch/p"$'\n' && ln -s "$scratch/p"$'\n' "$scratch/plink" || exit 2
+for spec in "trailing|$scratch/requested"$'\n' "middle|$scratch/re"$'\n'"q" "parent|$scratch/plink/new"; do
+  name=fresh-newline-${spec%%|*}
+  check "$name" -- "$repo" --fresh "${spec#*|}" fmt
+  expect_code "$name" 2
+  expect_steps "$name" ""
+done
+if [[ ! -e $scratch/requested && ! -e $scratch/requested$'\n' && ! -e $scratch/re && ! -e $scratch/p/new &&
+  -z $(ls -A "$scratch/p"$'\n') ]]; then
+  pass "fresh-newline: no directory created under any spelling"
+else
+  fail "fresh-newline: created a directory"
+fi
+check target-newline "CARGO_TARGET_DIR=target/x"$'\n' -- "$repo" fmt
+expect_code target-newline 2
+expect_steps target-newline ""
+
 # A target dir inside the checkout must be ignored.
 repo=$(new_repo target-dirs) || exit 2
 check target-unignored CARGO_TARGET_DIR=build -- "$repo" fmt

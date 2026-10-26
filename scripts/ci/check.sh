@@ -17,17 +17,23 @@
 #
 # Exit 2: nothing was run (bad arguments, a target dir that would change the checkout, or a
 # checkout Git cannot describe: no commit, a merge conflict, a submodule, an untracked nested
-# repository, a file name with a newline, or any failing Git command). Exit 1: a gate failed, or
+# repository, a file name with a newline, a file name starting with " or ending with a carriage
+# return, a symlink target with a newline, or any failing Git command). Exit 1: a gate failed, or
 # the fingerprint changed or could not be read again. Exit 0: every gate passed on this checkout.
 set -uo pipefail
+unset CDPATH
 
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel) && root=$(cd "$root" && pwd -P) || exit 2
 cd "$root" || exit 2
 
-# The absolute path of $1, whose parent must exist; $1 itself need not.
+# The absolute path of $1, whose parent must exist; $1 itself need not. Fails if $1 or its
+# parent's physical path holds a newline, which command substitution could silently drop.
 resolve() {
   local parent
-  parent=$(cd "$(dirname -- "$1")" 2>/dev/null && pwd -P) || return 1
+  [[ $1 != *$'\n'* ]] || return 1
+  parent=$(cd -- "$(dirname -- "$1")" 2>/dev/null && pwd -P && echo .) || return 1
+  parent=${parent%$'\n.'}
+  [[ $parent != *$'\n'* ]] || return 1
   printf '%s/%s\n' "${parent%/}" "$(basename -- "$1")"
 }
 
@@ -40,12 +46,16 @@ while (($#)); do
         echo "--fresh needs a directory" >&2
         exit 2
       fi
+      if [[ $2 == *$'\n'* ]]; then
+        printf -- '--fresh %q: a path with a newline is not supported\n' "$2" >&2
+        exit 2
+      fi
       if [[ -e $2 || -L $2 ]]; then
         echo "--fresh $2: already exists; give a new path" >&2
         exit 2
       fi
       if ! fresh=$(resolve "$2"); then
-        echo "--fresh $2: its parent directory does not exist" >&2
+        echo "--fresh $2: its parent directory does not exist or has a newline in its path" >&2
         exit 2
       fi
       if [[ $fresh == "$root" || $fresh == "$root"/* ]]; then
@@ -92,11 +102,19 @@ describe_into() {
     printf 'HEAD %s\0' "$head"
     cat "$tmp/index"
     while IFS= read -r -d '' path; do
-      if [[ $path == *$'\n'* ]]; then
-        echo "file name with a newline: $path" >&2
+      # git hash-object --stdin-paths reads one name per line, unquotes a name starting with "
+      # and drops a trailing carriage return, so such names could hash a different file.
+      if [[ $path == *$'\n'* || $path == \"* || $path == *$'\r' ]]; then
+        printf 'unsupported file name: %q\n' "$path" >&2
         return 1
       elif [[ -L $path ]]; then
-        link=$(readlink -- "$path") || return 1
+        # The trailing "." keeps command substitution from dropping newlines the target ends with.
+        link=$(readlink -- "$path" && echo .) || return 1
+        link=${link%$'\n.'}
+        if [[ $link == *$'\n'* ]]; then
+          printf 'unsupported symlink target with a newline: %q\n' "$path" >&2
+          return 1
+        fi
         printf 'link %s\0%s\0' "$path" "$link"
       elif [[ -f $path ]]; then
         printf '%s\n' "$path" >>"$tmp/files"
@@ -121,6 +139,10 @@ fingerprint() {
 
 # A target directory inside the checkout must be ignored, or the build itself changes the checkout.
 target=${fresh:-${CARGO_TARGET_DIR:-$root/target}}
+if [[ $target == *$'\n'* ]]; then
+  printf 'target dir %q: a path with a newline is not supported\n' "$target" >&2
+  exit 2
+fi
 [[ $target == /* ]] || target=$root/$target
 if resolved=$(resolve "$target"); then target=$resolved; fi
 if [[ $target == "$root" || $target == "$root"/* ]] && ! git check-ignore -q -- "$target"; then
