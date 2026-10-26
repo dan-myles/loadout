@@ -52,7 +52,8 @@ jobs:
           rustup toolchain install --no-self-update
           rustc -vV
       # Caches only the registry and compiled dependencies, keyed by runner OS/arch, rustc -vV,
-      # CARGO*/RUST* env, Cargo.lock and manifests. Workspace crates are pruned before saving, so
+      # CARGO*/RUST* env, Cargo.lock and manifests; without an exact match it restores the newest
+      # entry for the same job and environment. Workspace crates are pruned before saving, so
       # every run compiles and tests the checked-out source.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -64,9 +65,12 @@ jobs:
           tool: cargo-nextest@0.9.148
           fallback: none
       # nextest runs the test binaries concurrently instead of one after another; it does not run
-      # doctests, so cargo test --doc covers those.
-      - run: cargo nextest run --locked --workspace --no-fail-fast
-      - run: cargo test --locked --workspace --doc --no-fail-fast
+      # doctests, so cargo test --doc covers those. Like cargo test --no-fail-fast, the doctests
+      # still run when a test fails, and the job still fails.
+      - id: nextest
+        run: cargo nextest run --locked --workspace --no-fail-fast
+      - if: ${{ !cancelled() && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
+        run: cargo test --locked --workspace --doc --no-fail-fast
 
   release-scripts:
     name: release packaging tests (Python ${{ matrix.python }})
