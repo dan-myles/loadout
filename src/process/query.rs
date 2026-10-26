@@ -1350,6 +1350,27 @@ fn validated(
     settled(buffer, stream, cap).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `install`'s refusal to start an installer in a cancelled run, carried inside its `io::Error`
+/// so a caller can tell an installer that never started from one that failed to spawn.
+#[derive(Debug)]
+pub(crate) struct InstallRefused;
+
+impl fmt::Display for InstallRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the background run was cancelled, so loadout started no installer")
+    }
+}
+
+impl std::error::Error for InstallRefused {}
+
+/// Whether `error` is `install`'s refusal in a cancelled run, by its type, never by its kind or
+/// message.
+pub(crate) fn install_refused(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<InstallRefused>)
+}
+
 /// Runs an install in loadout's own process group, so `sudo` can still prompt on the terminal
 /// and Ctrl-C reaches it. There is no deadline: installs legitimately take minutes. Only the
 /// tail of each output stream is kept. In a supervised background worker the installer is in
@@ -1357,10 +1378,7 @@ fn validated(
 /// no installer.
 pub(crate) fn install(invocation: &Invocation, containment: &Containment) -> io::Result<Captured> {
     if containment.is_cancelled() {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "the background run was cancelled, so loadout started no installer",
-        ));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, InstallRefused));
     }
     run_install(invocation, INSTALL_TAIL, INSTALL_DRAIN)
 }
@@ -3261,9 +3279,22 @@ mod inherited_tests {
         ));
         let installed = install(&touch, &containment).unwrap_err();
         assert_eq!(installed.kind(), io::ErrorKind::Interrupted);
+        assert!(install_refused(&installed));
         assert!(
             !ran.exists(),
             "a cancelled run must start no query or installer"
+        );
+    }
+
+    #[test]
+    fn only_the_typed_refusal_counts_as_an_installer_never_started() {
+        let missing = Invocation::new(Path::new("/nonexistent/loadout-manager"), ["x"]);
+        let spawn = install(&missing, &Containment::OwnGroup).unwrap_err();
+        assert!(!install_refused(&spawn), "{spawn}");
+        let lookalike = io::Error::new(io::ErrorKind::Interrupted, InstallRefused.to_string());
+        assert!(
+            !install_refused(&lookalike),
+            "the same kind and message without the type is not the refusal"
         );
     }
 

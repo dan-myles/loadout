@@ -13,7 +13,7 @@ use crate::resolve::Program;
 mod detect;
 mod manager;
 
-use detect::Eligibility;
+use detect::{Eligibility, Unanswered};
 use manager::Invocation;
 
 pub const ISOLATED: &str = "programs are not installed under LOADOUT_HOME isolation";
@@ -38,6 +38,19 @@ pub enum Error {
     },
     #[error("programs.{program}: only a missing program can be installed")]
     NotMissing { program: String },
+    #[error(
+        "programs.{program}: {manager} finished installing {package:?}, but the background run was cancelled, so loadout didn't confirm it"
+    )]
+    Unconfirmed {
+        program: String,
+        manager: &'static str,
+        package: String,
+    },
+    /// U8 refused to start this install's query or installer because the run was cancelled.
+    #[error(
+        "programs.{program}: the background run was cancelled, so loadout started no further work"
+    )]
+    NotStarted { program: String },
     #[error(
         "programs.{program}: the machine changed after the plan ({detail}), so loadout installed nothing; plan again"
     )]
@@ -217,7 +230,9 @@ fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Resu
         executable,
     };
     Ok(
-        match observe(&package, containment).map_err(|detail| detect_error(id, &package, detail))? {
+        match observe(&package, containment)
+            .map_err(|unanswered| detect_error(id, &package, unanswered.to_string()))?
+        {
             Observation::Installed => State::Installed(package),
             Observation::Missing(scope) => State::Missing(Missing {
                 package,
@@ -238,11 +253,11 @@ enum Observation {
 /// The one answer `steps` and `install` both act on: the manager's installed-query, then, for a
 /// missing package, whether and in which scope it can be installed. An answer loadout can't
 /// classify cancels a supervised run (see `unclassified`).
-fn observe(package: &Package, containment: &Containment) -> Result<Observation, String> {
+fn observe(package: &Package, containment: &Containment) -> Result<Observation, Unanswered> {
     unclassified(containment, classify(package, containment))
 }
 
-fn classify(package: &Package, containment: &Containment) -> Result<Observation, String> {
+fn classify(package: &Package, containment: &Containment) -> Result<Observation, Unanswered> {
     if detect::installed(
         containment,
         package.manager,
@@ -269,7 +284,10 @@ fn classify(package: &Package, containment: &Containment) -> Result<Observation,
 /// background run it also cancels the run, so no later query or installer starts. Installed,
 /// missing, and unsupported answers, including the nonzero exits some managers use for
 /// "missing", are classified and never cancel.
-fn unclassified<T>(containment: &Containment, answer: Result<T, String>) -> Result<T, String> {
+fn unclassified<T>(
+    containment: &Containment,
+    answer: Result<T, Unanswered>,
+) -> Result<T, Unanswered> {
     if answer.is_err()
         && let Some(cancel) = containment.cancel()
     {
@@ -392,9 +410,13 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
             )));
         }
     }
-    match observe(package, &missing.containment)
-        .map_err(|detail| detect_error(program, package, detail))?
-    {
+    let not_started = || Error::NotStarted {
+        program: program.to_owned(),
+    };
+    match observe(package, &missing.containment).map_err(|unanswered| match unanswered {
+        Unanswered::Refused(_) => not_started(),
+        Unanswered::Failed(detail) => detect_error(program, package, detail),
+    })? {
         Observation::Installed => return Ok(Installed::Already),
         Observation::Missing(scope) if scope == missing.scope => {}
         Observation::Missing(scope) => {
@@ -425,12 +447,17 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
         invocation
     };
     let command = invocation.display();
-    let output =
-        process::install(&invocation, &missing.containment).map_err(|source| Error::Spawn {
-            program: program.to_owned(),
-            command: command.clone(),
-            source,
-        })?;
+    let output = process::install(&invocation, &missing.containment).map_err(|source| {
+        if process::install_refused(&source) {
+            not_started()
+        } else {
+            Error::Spawn {
+                program: program.to_owned(),
+                command: command.clone(),
+                source,
+            }
+        }
+    })?;
     if !output
         .code
         .is_some_and(|code| manager::install_succeeded(manager, code))
@@ -462,7 +489,14 @@ fn verified(program: &str, missing: &Missing) -> Result<Installed, Error> {
             manager: package.manager.id(),
             package: package.id.clone(),
         }),
-        Err(detail) => Err(detect_error(program, package, detail)),
+        // A cancellation that landed while the installer ran let it finish; U8 then refused the
+        // confirming query. That is work the run didn't do, not a failed install.
+        Err(Unanswered::Refused(_)) => Err(Error::Unconfirmed {
+            program: program.to_owned(),
+            manager: package.manager.id(),
+            package: package.id.clone(),
+        }),
+        Err(Unanswered::Failed(detail)) => Err(detect_error(program, package, detail)),
     }
 }
 
@@ -828,6 +862,66 @@ mod tests {
         }
 
         #[test]
+        fn a_run_cancelled_during_its_install_starts_no_confirming_query() {
+            let dir = tempfile::tempdir().unwrap();
+            let containment = Containment::inherited_for_tests();
+            let missing = Missing {
+                package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 0)),
+                scope: Scope::User,
+                containment: containment.clone(),
+            };
+            containment.cancel().unwrap().cancel();
+            let error = verified("tool", &missing).unwrap_err();
+            assert!(matches!(error, Error::Unconfirmed { .. }), "{error}");
+            assert!(
+                !dir.path().join("cargo.calls").exists(),
+                "a cancelled run must start no query"
+            );
+        }
+
+        /// A confirming query that started before the cancel and then failed is a real failure:
+        /// the flag set meanwhile never turns it into a skip.
+        #[test]
+        fn a_query_failing_after_a_cancel_that_landed_mid_query_still_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("sleep"))
+                .find(|path| path.is_file())
+                .expect("a sleep command on the test's PATH");
+            let (started, go) = (dir.path().join("started"), dir.path().join("go"));
+            let cargo = script(
+                dir.path(),
+                "cargo",
+                &format!(
+                    ": > '{}'\nn=0; while [ ! -e '{}' ] && [ $n -lt 300 ]; do '{}' 0.1; n=$((n + 1)); done\nexit 2\n",
+                    started.display(),
+                    go.display(),
+                    sleep.display()
+                ),
+            );
+            let containment = Containment::inherited_for_tests();
+            let missing = Missing {
+                package: package(Manager::Cargo, cargo),
+                scope: Scope::User,
+                containment: containment.clone(),
+            };
+            let flag = containment.cancel().unwrap().clone();
+            let canceller = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !started.exists() {
+                    assert!(Instant::now() < deadline, "the query never started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                flag.cancel();
+                std::fs::write(go, "").unwrap();
+            });
+            let error = verified("tool", &missing).unwrap_err();
+            canceller.join().unwrap();
+            assert!(matches!(error, Error::Detect { .. }), "{error}");
+            assert!(containment.is_cancelled());
+        }
+
+        #[test]
         fn a_classified_missing_answer_does_not_cancel() {
             let dir = tempfile::tempdir().unwrap();
             let containment = Containment::inherited_for_tests();
@@ -958,7 +1052,7 @@ mod tests {
             std::fs::remove_file(dir.join("fail")).unwrap();
             let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
             let second = install(&found[1], false).unwrap_err();
-            assert!(matches!(second, Error::Detect { .. }), "{second}");
+            assert!(matches!(second, Error::NotStarted { .. }), "{second}");
             assert_eq!(
                 std::fs::read_to_string(dir.join("calls")).unwrap(),
                 calls,
