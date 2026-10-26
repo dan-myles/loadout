@@ -312,10 +312,17 @@ reinstalls them.
 
 ### Self-update (`src/release/`)
 
-`loadout update` (U8) calls `release::latest` after its apply when the resolved `[update] cli` is
-true, then `release::install` when a strictly newer stable release exists. Self-update applies
-exactly the rule above, with no token:
-- **Latest tag.** It reads the tag from the `releases/latest` redirect.
+`loadout update`, or its alias `loadout upgrade`, is the only thing that updates the CLI, and only
+when someone runs it: `loadout sync`, `init` and the scheduled job never do, whatever the
+loadout's legacy `[update] cli` says. It calls `release::latest`, then `release::install` when a
+strictly newer release exists, and applies exactly the rule above, with no token. Exits: 0 when
+updated, already up to date or nothing is published; 4 when this binary can't be updated
+(unmanaged, `LOADOUT_HOME` isolation, another install busy); 1 on any other error.
+- **Which release.** By default only stable releases: the tag from the `releases/latest`
+  redirect, which never names a prerelease. `--prerelease` reads the public releases list instead
+  (`api.github.com/repos/dan-myles/loadout/releases`, every linked page up to 10 of at most 8 MiB,
+  drafts and non-`v<semver>` tags skipped) and takes the highest version, prerelease or not. A
+  rate limit or any unreadable answer is an error, never "up to date".
 - **Download.** It downloads over HTTPS only (rustls, max 5 redirects, size limits), and requires
   the exact sidecar and a matching hash.
 - **Archive.** It reads the expected binaries from memory, checking each name, type and size. A
@@ -340,6 +347,13 @@ exactly the rule above, with no token:
 
 Anything else, such as `cargo install`, a package manager, a hand copy, or a `LOADOUT_HOME`
 isolated run, is never replaced. `doctor` reports which case applies (`cli install`).
+
+### Test prereleases
+
+Prereleases are tagged `vX.Y.Z-<label>` (for example `v0.1.1-test.1`), published with
+`gh release create --prerelease --latest=false`, and titled as test builds. A stable client
+(`loadout update`) never sees them; `install.sh --version v0.1.1-test.1` or `install.ps1
+-Version v0.1.1-test.1` installs one, and `loadout update --prerelease` moves to the newest one.
 
 ## Building a release archive locally
 

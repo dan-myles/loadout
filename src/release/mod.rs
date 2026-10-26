@@ -1,5 +1,6 @@
-//! Self-update (U9). `update` (U8) calls [`latest`] after its apply when the resolved
-//! `[update] cli` is true, and [`install`] when that finds a newer release.
+//! Self-update (U9). `loadout update` (also `loadout upgrade`) calls [`latest`] on the channel
+//! it was asked for, and [`install`] when that finds a newer release. Nothing else calls them:
+//! `loadout sync` and the scheduled job never update the CLI.
 //!
 //! Only a binary the install scripts put in place is ever replaced: the install record next to
 //! it must parse exactly and bind this platform's installer, this build's target, the running
@@ -67,7 +68,8 @@ pub enum Error {
 
 impl Error {
     /// Nothing was or will be replaced, by design or because another writer is busy with it.
-    /// `update` reports these and carries on; every other error is a failed self-update (exit 1).
+    /// `loadout update` reports these, exiting 0 when nothing is published and 4 otherwise; every
+    /// other error is a failed self-update (exit 1).
     pub fn skipped(&self) -> bool {
         matches!(
             self,
@@ -178,13 +180,13 @@ pub fn checks(context: &Context) -> Vec<Check> {
             let launcher = match (&install.background, cfg!(windows)) {
                 (Some(_), _) | (None, false) => String::new(),
                 (None, true) => {
-                    "; the next self-update also installs the background launcher".to_owned()
+                    "; the next `loadout update` also installs the background launcher".to_owned()
                 }
             };
             (
                 CheckStatus::Pass,
                 format!(
-                    "installed by {} at {}; self-update replaces it when [update] cli = true{launcher}",
+                    "installed by {} at {}; `loadout update` replaces it with a newer release{launcher}",
                     install.record.installer,
                     install.exe.display()
                 ),

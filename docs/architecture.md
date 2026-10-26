@@ -239,10 +239,11 @@ parse error and "no valid layer file". A tag file that no machine lists is a war
 email = "dan@example.com"          # string, integer, or boolean; `machine` is reserved
 work = false
 
-[update]                           # automatic updates; the narrower layer wins per field
-auto = true                        # Default true: run the background update service
+[update]                           # the background sync; the narrower layer wins per field
+auto = true                        # Default true: run the background sync service
 interval_minutes = 60              # Default 60, minimum 15
-cli = true                         # Default true: also update the loadout CLI
+# cli = true                       # Legacy: accepted with a warning, no effect. The CLI updates
+                                   # only when `loadout update` runs.
 
 [agents]
 enabled = ["claude", "codex", "devin"]   # list; tags and machines may edit it. Default: none
@@ -1726,12 +1727,12 @@ UAC. `LC_ALL` doesn't change winget's language either, which follows Windows' di
   descendant, or a UAC or `sudo` prompt blocks it until the process tree ends or something outside
   loadout kills it.
 - **What U8 must supply.** Before automatic updates can be claimed to finish safely in the
-  background, the supervisor that starts `update --background` must bound the whole run and kill
+  background, the supervisor that starts `sync --background` must bound the whole run and kill
   every descendant on all three OSes:
   - Linux: the systemd unit's time limit (`RuntimeMaxSec`), with its control-group kill.
   - Windows: Task Scheduler's `ExecutionTimeLimit` covers only the task's own process, so
-    `update --background` itself needs a job object for its descendants.
-  - macOS: launchd has no runtime limit, so `update --background` needs its own watchdog, which
+    `sync --background` itself needs a job object for its descendants.
+  - macOS: launchd has no runtime limit, so `sync --background` needs its own watchdog, which
     kills its process group.
 
   Until U8 proves that natively, no claim is made that a background run completes or cancels
@@ -1771,7 +1772,7 @@ Automatic updates are required, so they are on by default.
     an unhealthy refusal exits 4.
   - `init` does not self-update: the install scripts that run it have just fetched the latest
     release.
-- `loadout update` takes the state lock, then refuses (exit 4, nothing fetched) when the newest
+- `loadout sync` takes the state lock, then refuses (exit 4, nothing fetched) when the newest
   run didn't finish. It fetches and fast-forwards the clone, then plans and applies under the same
   lock (`apply::run_under_lock`, `Mode::Interactive`, never `--force` or `--elevated`). If the clone has
   local changes or an unfinished merge, has no branch or no upstream on `origin`, or the remote
@@ -1784,11 +1785,11 @@ Automatic updates are required, so they are on by default.
     transport. Local reads use the bounded query path (section 7). A URL carrying a credential (a
     password, or any user name in an HTTP(S) URL, usually a token) is refused before git runs; an
     SSH user name is kept. Shown URLs have their userinfo hidden.
-  - `update --loadout DIR` applies DIR as it is, after printing "not fetched": loadout never
+  - `sync --loadout DIR` applies DIR as it is, after printing "not fetched": loadout never
     fetches or changes a checkout it doesn't manage. `--background` refuses `--loadout`.
-- `loadout update --background` is the scheduled job's command. It is the supervisor
+- `loadout sync --background` is the scheduled job's command. It is the supervisor
   (`process::supervise`, `Limits::BACKGROUND`: soft 55 min, hard 60 min, 30 s settle), which starts
-  `loadout update --background --worker` and records how the run ended. The worker runs only after
+  `loadout sync --background --worker` and records how the run ended. The worker runs only after
   `process::handshake` and with `Context::supervised`; it does the same steps as the foreground in
   `Mode::Background` (no prompts, replace, force, or elevation), and stops with nothing applied
   when the loadout sets `[update] auto = false`. With `--service FILE`, both build their `Context`
@@ -1818,6 +1819,13 @@ Automatic updates are required, so they are on by default.
     and the agent dir variables. A variable or path that isn't valid UTF-8 can't be recorded
     exactly, so `install` refuses it before writing anything. A run refuses a record whose rebuilt
     destinations differ, or that isn't the `service.toml` of the state dir it names.
+  - Jobs older versions registered run `loadout update --background [--service FILE]`. After the
+    CLI is updated that legacy form still runs this same sync (a hidden route of `update`, never
+    a CLI update), and prints how to re-register. `service status` and `doctor` recognize the
+    legacy systemd units, launchd plist or loaded arguments and say to run `loadout service
+    install`, which writes the `sync` form; unit, plist and task names are unchanged. A Windows
+    task needs nothing: it runs the launcher, which is replaced with `loadout.exe` and starts the
+    worker with `sync`.
   - Arguments are quoted per scheduler: systemd `ExecStart` double quotes with `\`, `"`, `%%` and
     `$$` escaped; plist `<string>` elements, XML-escaped, never joined; Task `<Arguments>` quoted for
     `CommandLineToArgvW`, then XML-escaped. A path with a control character or invalid UTF-8 is
@@ -1833,25 +1841,30 @@ Automatic updates are required, so they are on by default.
   `loadout-background <version>`. Release archives for Windows ship both executables in one folder
   (`scripts/release/package.py`); `service install` refuses when the launcher is missing. U9's
   installer and self-update must place and replace both together.
-- **Self-update** (U9, source) runs when `[update] cli = true` and the install script installed the binary.
-  `update` reads the latest public GitHub release with no token, verifies the asset's `.sha256`, and
-  replaces itself. A binary from `cargo install` or a package manager is never replaced; doctor
-  reports how the CLI was installed. As built in `src/release/`:
-  - **Calling it.** In the foreground and in the background worker alike, `update` calls
-    `release::latest(context)` after an apply that ran to its report, then
-    `release::install(&release)` on `Some`. It doesn't run after an apply that failed (exit 1
-    stands) or was cancelled, or when the resolved `[update] cli` is false. The live cancellation
-    is checked again before the release request and before the install: a run cancelled after its
-    report starts neither, exits 4, and a background run records it as cancelled. A request
-    already under way is not interrupted. A skip is printed as
-    `cli: not updated: <reason>` and keeps the apply's exit; any other error fails `update` with
-    exit 1, and a background run records it as `failed` in `last-run.json`.
+- **Self-update** is `loadout update`, also `loadout upgrade`: on demand only, and only for a
+  binary the install script installed. It reads the public GitHub releases with no token, verifies
+  the asset's `.sha256`, and replaces itself. It never fetches or applies the loadout, and
+  `loadout sync`, `init` and the scheduled job never update the CLI. A binary from `cargo install`
+  or a package manager is never replaced; doctor reports how the CLI was installed. As built in
+  `src/release/` and `src/commands/update.rs`:
+  - **Calling it.** `update` calls `release::latest(context, channel)`, then
+    `release::install(&release)` on `Some`. The live cancellation is checked before the release
+    request and before the install; a request already under way is not interrupted. Exits: 0 when
+    updated, already up to date, or nothing is published; 4 for a skip (`cli: not updated:
+    <reason>`); 1 for any other error, which is never shown as up to date.
+  - **Channels.** `Channel::Stable` (the default) reads the `releases/latest` redirect, which
+    GitHub never points at a prerelease, so a stable client never moves onto one.
+    `--prerelease` (`Channel::Prerelease`) reads the public releases list
+    (`api.github.com/repos/<repo>/releases`): every linked page, at most 10 of at most 8 MiB, next
+    links only under the API base; drafts and tags that aren't `v<semver>` are skipped and the
+    highest version wins. A rate limit, a refusal, or an oversized or malformed answer is an error.
   - **Newer only.** `Some` means a release strictly newer than the running CLI; `None` means none
-    is offered. The release tag comes from the `releases/latest` redirect.
+    is offered.
   - **Skips.** `Error::skipped()` covers LOADOUT_HOME isolation, a binary without a matching
     install record, no published release, and another install or self-update holding the install
-    folder's lock (`Busy`). Those are reported, not failures. Every other error fails the
-    self-update.
+    folder's lock (`Busy`). Every other error fails the self-update.
+  - **`[update] cli`.** Accepted so existing loadouts stay valid; it resolves to nothing and
+    validation warns that it has no effect.
   - **Managed binaries.** A binary counts as managed only when its install record
     (`docs/releasing.md`, schema 1 or 2) parses exactly and binds this platform's installer, the
     build's target, the canonical running executable, its current SHA-256 and the running version.
@@ -1905,7 +1918,8 @@ Automatic updates are required, so they are on by default.
 | `loadout apply [--loadout DIR] [--force] [--elevated]`: read-only preflight, then the lock and a rebuilt plan; exit 1 on a failed action, 3 invalid, 4 when anything is left undone | source, unexecuted | U4 |
 | `loadout status [--json]`: ownership records with drift, runs with interrupted ones; exit 4 when not healthy; never writes | built | U3 |
 | `loadout rollback [RUN]`: undo the newest or the named run; exit 4 when later changes block it | built | U3 |
-| `loadout update [--loadout DIR] [--background [--service FILE]]`: lock, unfinished-run gate, fetch and fast-forward the clone (not with `--loadout`), then apply under the same lock; exit 4 when blocked; `--background` supervises a bounded worker and records it | source, unexecuted | U8 (+U9 self-update) |
+| `loadout sync [--loadout DIR] [--background [--service FILE]]`: lock, unfinished-run gate, fetch and fast-forward the clone (not with `--loadout`), then apply under the same lock; exit 4 when blocked; `--background` supervises a bounded worker and records it; never updates the CLI | source | U8 |
+| `loadout update [--prerelease]`, alias `loadout upgrade`: on-demand self-update of the installer-managed CLI, stable releases only unless `--prerelease`; never syncs; exit 0 updated/up to date/none published, 4 can't update this binary, 1 failure. The hidden legacy `update --background` form still runs `sync --background` | source | U9 |
 | `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
 | `loadout init <URL> [--name NAME] [--no-service]`: clone, name the machine, apply, install the service; exit 3 invalid, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
 

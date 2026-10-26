@@ -534,7 +534,8 @@ def g3_bootstrap(h):
     h.run("G3-version", [CLI, "--version"], {0}, asserts=lambda code, text: [
         ("version", text.strip() == "loadout %s" % h.expected["version"])])
     h.run("G3-help", [CLI, "--help"], {0}, asserts=lambda code, text: [
-        ("commands listed", all(word in text for word in ("init", "update", "service", "plan", "apply")))])
+        ("commands listed", all(word in text for word in ("init", "sync", "update", "service", "plan", "apply"))),
+        ("upgrade is update's alias", "[alias: upgrade]" in text)])
 
 
 def _is_json(path):
@@ -631,10 +632,10 @@ def g6_update(h):
         return
     target = HOME / ".config/loadout-e2e/hello.txt"
     gitconfig = HOME / ".config/loadout-e2e/gitconfig"
-    h.run("G6-up-to-date", [CLI, "update"], {0})
+    h.run("G6-up-to-date", [CLI, "sync"], {0})
     c2 = commit("C2", {"files/hello.txt": hello("c2"),
                        "loadout.toml": manifest().replace('greeting = "c1"', 'greeting = "c2"')})
-    h.run("G6-fast-forward", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G6-fast-forward", [CLI, "sync"], {0}, asserts=lambda code, text: [
         ("clone at C2", head() == c2), ("file updated", read(target) == hello("c2")),
         ("template updated", "greeting c2" in read(gitconfig))])
     c3 = commit("C3", {"files/hello.txt": hello("c3")})
@@ -644,7 +645,7 @@ def g6_update(h):
         tree_before = snapshot(CLONE / "files", target)
         branch_before = head()
         try:
-            h.run(case, [CLI, "update"], {4}, asserts=lambda code, text: [
+            h.run(case, [CLI, "sync"], {4}, asserts=lambda code, text: [
                 ("says blocked", "blocked" in text), ("branch unchanged", head() == branch_before),
                 ("tree and target unchanged", snapshot(CLONE / "files", target) == tree_before)])
         finally:
@@ -661,7 +662,7 @@ def g6_update(h):
             lambda: sh(["git", "-C", CLONE, "checkout", "-q", "main"]))
     blocked("G6-no-upstream", lambda: sh(["git", "-C", CLONE, "branch", "--unset-upstream"]),
             lambda: sh(["git", "-C", CLONE, "branch", "-q", "--set-upstream-to=origin/main", "main"]))
-    h.run("G6-after-blocks", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G6-after-blocks", [CLI, "sync"], {0}, asserts=lambda code, text: [
         ("clone at C3", head() == c3), ("file c3", read(target) == hello("c3"))])
 
     def local_commit():
@@ -681,26 +682,26 @@ def g6_update(h):
         c4 = commit("C4", {"files/hello.txt": hello("c4")})
 
     blocked("G6-diverged", diverge, reset_to_remote)
-    h.run("G6-after-diverged", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G6-after-diverged", [CLI, "sync"], {0}, asserts=lambda code, text: [
         ("clone at C4", head() == c4), ("file c4", read(target) == hello("c4"))])
 
     alt = ACC / "alt-checkout"
     sh(["git", "clone", "-q", REMOTE_URL, alt])
     sh(["git", "-C", alt, "checkout", "-q", "--detach", git("rev-list", "--max-parents=0", "HEAD")])
-    h.run("G6-loadout-dir", [CLI, "update", "--loadout", alt], {0}, asserts=lambda code, text: [
+    h.run("G6-loadout-dir", [CLI, "sync", "--loadout", alt], {0}, asserts=lambda code, text: [
         ("not fetched", "not fetched" in text), ("clone untouched", head() == c4),
         ("alt applied", read(target) == hello("c1"))])
-    h.run("G6-back-to-clone", [CLI, "update"], {0},
+    h.run("G6-back-to-clone", [CLI, "sync"], {0},
           asserts=lambda code, text: [("file c4", read(target) == hello("c4"))])
-    h.run("G6-background-loadout-refused", [CLI, "update", "--background", "--loadout", alt], {2})
+    h.run("G6-background-loadout-refused", [CLI, "sync", "--background", "--loadout", alt], {2})
 
     before = snapshot(HOME / ".config/loadout-e2e")
     c5 = commit("C5 missing variable", {"files/gitconfig.tmpl": "[user]\n\tname = {{ undefined_variable }}\n"})
-    h.run("G6-missing-variable", [CLI, "update"], {3}, asserts=lambda code, text: [
+    h.run("G6-missing-variable", [CLI, "sync"], {3}, asserts=lambda code, text: [
         ("targets unchanged", snapshot(HOME / ".config/loadout-e2e") == before)])
     h.record("G6-missing-variable-clone", "observe", detail="clone HEAD %s (C5 %s)" % (head(), c5))
     c6 = commit("C6 fixed", {"files/gitconfig.tmpl": (h.inputs / "fixtures/loadout/files/gitconfig.tmpl").read_text()})
-    h.run("G6-fixed", [CLI, "update"], {0}, asserts=lambda code, text: [("clone at C6", head() == c6)])
+    h.run("G6-fixed", [CLI, "sync"], {0}, asserts=lambda code, text: [("clone at C6", head() == c6)])
     c6 = git_index_file(h)
     interrupted(h, c6)
 
@@ -717,8 +718,8 @@ def git_index_file(h):
     before = sha256(external)
     target = HOME / ".config/loadout-e2e/hello.txt"
     last = None
-    for case, argv in (("G6-git-index-file-foreground", [CLI, "update"]),
-                       ("G6-git-index-file-background", [CLI, "update", "--background"])):
+    for case, argv in (("G6-git-index-file-foreground", [CLI, "sync"]),
+                       ("G6-git-index-file-background", [CLI, "sync", "--background"])):
         last = commit("C-index " + case, {"files/hello.txt": hello(case[-10:])})
         h.run(case, argv, {0}, env=h.env({"GIT_INDEX_FILE": str(external)}), timeout=900,
               asserts=lambda code, text, want=last, tag=case[-10:]: [
@@ -743,15 +744,15 @@ def start_hanging(h, argv, label):
 
 def interrupted(h, c6):
     """Locked and interrupted-run gates with a real killed apply (fake installer held)."""
-    process, reached = start_hanging(h, [CLI, "update"], "G6-hung-update")
+    process, reached = start_hanging(h, [CLI, "sync"], "G6-hung-update")
     if not h.check("G6-hang-reached", reached, "fake cargo install is running under update"):
         os.killpg(process.pid, signal.SIGKILL)
         (FAKE_STATE / "hang").unlink()
         return
-    h.run("G6-locked-update", [CLI, "update"], {1})
+    h.run("G6-locked-update", [CLI, "sync"], {1})
     h.run("G6-locked-apply", [CLI, "apply"], {1})
     # v2, U8 Locked correction: a background worker that finds the lock held is recorded as locked.
-    h.run("G6-locked-background", [CLI, "update", "--background"], {1}, timeout=300, asserts=lambda code, text: [
+    h.run("G6-locked-background", [CLI, "sync", "--background"], {1}, timeout=300, asserts=lambda code, text: [
         ("recorded locked", json_file(STATE / "background/last-run.json").get("result") == "locked")])
     os.killpg(process.pid, signal.SIGKILL)
     process.wait(timeout=30)
@@ -771,12 +772,12 @@ def interrupted(h, c6):
                     "(apply/mod.rs:165-173); no real-CLI kill inside a journaled write is induced")
     prior = read(target)
     c7 = commit("C7", {"files/hello.txt": hello("c7")})
-    h.run("G6-update-after-killed-install", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G6-update-after-killed-install", [CLI, "sync"], {0}, asserts=lambda code, text: [
         ("fetched C7", head() == c7), ("file c7", read(target) == hello("c7")),
         ("the program installed this time", (FAKE_STATE / "cargo").exists())])
     h.run("G6-rollback-latest-finished-run", [CLI, "rollback"], {0}, asserts=lambda code, text: [
         ("the C7 run's file is restored", read(target) == prior)])
-    h.run("G6-update-after-rollback", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G6-update-after-rollback", [CLI, "sync"], {0}, asserts=lambda code, text: [
         ("clone at C7", head() == c7), ("file c7 again", read(target) == hello("c7")),
         ("cargo still installed", (FAKE_STATE / "cargo").exists())])
 
@@ -786,10 +787,10 @@ def g7_background_by_hand(h):
         return
     records = STATE / "background"
     before = snapshot(records)
-    h.run("G7-worker-by-hand", [CLI, "update", "--background", "--worker"], {1},
+    h.run("G7-worker-by-hand", [CLI, "sync", "--background", "--worker"], {1},
           asserts=lambda code, text: [("nothing written", snapshot(records) == before)])
     c8 = commit("C8", {"files/hello.txt": hello("c8")})
-    h.run("G7-supervisor-by-hand", [CLI, "update", "--background"], {0}, timeout=900, asserts=lambda code, text: [
+    h.run("G7-supervisor-by-hand", [CLI, "sync", "--background"], {0}, timeout=900, asserts=lambda code, text: [
         ("clone at C8", head() == c8),
         ("supervisor exited 0", json_file(records / "supervisor.json").get("code") == 0),
         ("last run applied", json_file(records / "last-run.json").get("result") == "applied"),
@@ -802,18 +803,18 @@ def g7_background_by_hand(h):
     sh(["git", "-C", CLONE, "remote", "set-url", "origin", h.auth_url])
     try:
         started = time.monotonic()
-        h.run("G7-credentials-background-no-hang", [CLI, "update", "--background"], {1, 4}, timeout=600,
+        h.run("G7-credentials-background-no-hang", [CLI, "sync", "--background"], {1, 4}, timeout=600,
               asserts=lambda code, text: [("bounded", time.monotonic() - started < 300),
                                           ("server asked", Unauthorized.hits > 0),
                                           ("recorded failed or blocked",
                                            json_file(records / "last-run.json").get("result") in ("failed", "blocked"))])
-        h.run("G7-credentials-foreground-no-tty", [CLI, "update"], {1, 4}, timeout=300)
+        h.run("G7-credentials-foreground-no-tty", [CLI, "sync"], {1, 4}, timeout=300)
     finally:
         sh(["git", "-C", CLONE, "remote", "set-url", "origin", REMOTE_URL])
     h.run("G7-status-after-failed-background", [CLI, "status"], {4}, observe=True)
 
     c9 = commit("C9", {"files/hello.txt": hello("c9")})
-    process, reached = start_hanging(h, [CLI, "update", "--background"], "G7-supervisor-kill")
+    process, reached = start_hanging(h, [CLI, "sync", "--background"], "G7-supervisor-kill")
     if h.check("G7-hang-reached", reached, "fake install under the supervised worker"):
         workers = processes_matching("--worker")
         os.kill(process.pid, signal.SIGKILL)
@@ -826,7 +827,7 @@ def g7_background_by_hand(h):
     # v2, U8 R5: a killed supervisor leaves missing or stale evidence, which is never healthy.
     h.run("G7-status-after-kill", [CLI, "status"], {4})
     h.run("G7-rollback-after-kill", [CLI, "rollback"], {0, 4}, observe=True)
-    h.run("G7-update-after-kill", [CLI, "update"], {0}, asserts=lambda code, text: [("clone at C9", head() == c9)])
+    h.run("G7-update-after-kill", [CLI, "sync"], {0}, asserts=lambda code, text: [("clone at C9", head() == c9)])
     stale_records(h, records)
     linked_records(h, records)
 
@@ -836,7 +837,7 @@ def stale_records(h, records):
 
     Synthetic, guest-only: the supervisor record of a good run is moved aside by hand."""
     commit("C-stale", {"files/hello.txt": hello("stale")})
-    h.run("G7-good-run-before-stale", [CLI, "update", "--background"], {0}, timeout=900)
+    h.run("G7-good-run-before-stale", [CLI, "sync", "--background"], {0}, timeout=900)
     h.run("G7-status-good-run", [CLI, "status"], {0})
     aside = ACC / "supervisor.json.aside"
     (records / "supervisor.json").rename(aside)
@@ -862,7 +863,7 @@ def linked_records(h, records):
     try:
         h.run("G7-linked-records-status", [CLI, "status"], {1, 4},
               asserts=lambda code, text: [("outside unchanged", snapshot(outside) == before)])
-        h.run("G7-linked-records-background", [CLI, "update", "--background"], {1, 4}, timeout=900,
+        h.run("G7-linked-records-background", [CLI, "sync", "--background"], {1, 4}, timeout=900,
               asserts=lambda code, text: [("outside unchanged", snapshot(outside) == before)])
         h.run("G7-linked-records-service-uninstall", [CLI, "service", "uninstall"], {0, 1, 4}, observe=True,
               asserts=lambda code, text: [("outside unchanged", snapshot(outside) == before)])
@@ -894,6 +895,38 @@ def run_service(h, case, expect_status, extra_checks=None, timeout=900):
             failures.append(label)
     h.record(case, "fail" if failures else "pass", detail="; ".join(failures) or json.dumps(state, sort_keys=True))
     sh(["systemctl", "--user", "reset-failed", SERVICE], check=False)
+
+
+def legacy_registration(h, target, records):
+    """A job an older loadout registered runs `loadout update --background --service FILE`. Written as
+    those versions wrote it and loaded by the real systemd, it still syncs with this CLI, never
+    updates the CLI, and is reported for re-registration; `service install` moves it to `sync`."""
+    unit, timer = UNITS / SERVICE, UNITS / TIMER
+    new_unit, new_timer = read(unit), read(timer)
+    legacy_unit = new_unit.replace('"sync" "--background"', '"update" "--background"').replace(
+        "Description=loadout background sync", "Description=loadout background update")
+    legacy_timer = new_timer.replace("background sync every", "background update every")
+    if not h.check("G8-legacy-units-written", legacy_unit != new_unit and legacy_timer != new_timer,
+                   "the installed units name `sync`, so their legacy form differs"):
+        return
+    unit.write_text(legacy_unit)
+    timer.write_text(legacy_timer)
+    sh(["systemctl", "--user", "daemon-reload"])
+    h.run("G8-legacy-service-status", [CLI, "service", "status"], {4}, asserts=lambda code, text: [
+        ("names the legacy command", "legacy `loadout update --background`" in text),
+        ("says how to re-register", "loadout service install" in text)])
+    cli_before = sha256(CLI)
+    legacy = commit("C13b legacy job", {"files/hello.txt": hello("c13b")})
+    run_service(h, "G8-legacy-run-still-syncs", 0, lambda: [
+        ("clone at C13b", head() == legacy), ("file c13b", read(target) == hello("c13b")),
+        ("recorded applied", json_file(records / "last-run.json").get("result") == "applied"),
+        ("cli untouched", sha256(CLI) == cli_before)])
+    h.run("G8-legacy-journal", ["journalctl", "--user", "-u", SERVICE, "-n", "200", "--no-pager"], {0, 1},
+          observe=True)
+    h.run("G8-legacy-reinstall", [CLI, "service", "install"], {0})
+    h.check("G8-legacy-reinstalled-as-sync", read(unit) == new_unit and read(timer) == new_timer,
+            "service install wrote the `sync` units again")
+    h.run("G8-legacy-service-status-healthy", [CLI, "service", "status"], {0})
 
 
 def g8_service(h):
@@ -966,10 +999,11 @@ def g8_service(h):
         ("doctor says updates are disabled (U8 R10)", "disabled" in text.lower())])
     commit("C13 auto on", {"loadout.toml": manifest({"auto": "true"})})
     run_service(h, "G8-run-reenabled", 0, lambda: [("file c12", read(target) == hello("c12"))])
+    legacy_registration(h, target, records)
 
     moved = ACC / "moved-service.toml"
     shutil.copy2(service_toml, moved)
-    h.run("G8-moved-record-refused", [CLI, "update", "--background", "--service", moved], {1, 4}, timeout=300)
+    h.run("G8-moved-record-refused", [CLI, "sync", "--background", "--service", moved], {1, 4}, timeout=300)
 
     if h.args.long_timer:
         c14 = commit("C14 timer", {"files/hello.txt": hello("c14")})
@@ -1023,7 +1057,7 @@ def names_cadence_change(text, requested, registered):
 def changed_settings(h, service_toml):
     """v2, U8 R9/R10: the recorded route ignores a broken ambient Context; status and doctor
     name an interval the loadout changed after install."""
-    h.run("G8-recorded-route-ignores-ambient", [CLI, "update", "--background", "--service", service_toml], {0},
+    h.run("G8-recorded-route-ignores-ambient", [CLI, "sync", "--background", "--service", service_toml], {0},
           env=h.env({"LOADOUT_STATE_DIR": "relative/state", "LOADOUT_HOME": "relative/home"}), timeout=900)
     commit("C-interval 30", {"loadout.toml": manifest({"interval_minutes": "30"})})
     sh(["git", "-C", CLONE, "pull", "-q", "--ff-only"])
@@ -1049,7 +1083,7 @@ def other_state_job(h):
     h.run("G8-other-state-uninstall", [CLI, "service", "uninstall"], {0}, env=env_b)
     h.run("G8-reinstall-after-other-state", [CLI, "service", "install"], {0})
     h.run("G8-status-after-reinstall", [CLI, "service", "status"], {0})
-    h.run("G8-update-after-other-state", [CLI, "update"], {0, 4}, observe=True)
+    h.run("G8-update-after-other-state", [CLI, "sync"], {0, 4}, observe=True)
 
 
 def non_utf8_destination(h, service_toml):
@@ -1312,7 +1346,7 @@ def g8_launchd(h):
     except (RuntimeError, ValueError) as error:
         h.record("M8-plist-readable", "fail", detail=str(error))
     for label, ok in (
-            ("program arguments", plist.get("ProgramArguments") == [str(CLI), "update", "--background", "--service",
+            ("program arguments", plist.get("ProgramArguments") == [str(CLI), "sync", "--background", "--service",
                                                                     str(service_toml)]),
             ("start interval 900", plist.get("StartInterval") == 900),
             ("background process type", plist.get("ProcessType") == "Background"),
@@ -1514,7 +1548,7 @@ def launchd_deadline_case(h, records):
                  detail="harness cleanup refused: %s left unsignalled after the hold was released" % survivors)
     h.run("M8-lock-free-after-deadline", [CLI, "status"], {0, 4}, observe=True)
     h.run("M8-rollback-after-deadline", [CLI, "rollback"], {0, 4}, observe=True)
-    h.run("M8-update-after-deadline", [CLI, "update"], {0})
+    h.run("M8-update-after-deadline", [CLI, "sync"], {0})
 
 
 def launchd_soft_cancel_case(h, records, target):
@@ -1548,7 +1582,7 @@ def launchd_soft_cancel_case(h, records, target):
     h.record("M8-soft-cancel-receipt", "fail" if failures else "pass",
              detail="; ".join(failures) or json.dumps(evidence.get("state"), sort_keys=True))
     h.run("M8-status-after-soft-cancel", [CLI, "status"], {4})
-    h.run("M8-update-after-soft-cancel", [CLI, "update"], {0})
+    h.run("M8-update-after-soft-cancel", [CLI, "sync"], {0})
 
 
 def deadline_case(h, records):
@@ -1562,7 +1596,7 @@ def deadline_case(h, records):
     (FAKE_STATE / "hang").unlink()
     h.run("G8-lock-free-after-deadline", [CLI, "status"], {0, 4}, observe=True)
     h.run("G8-rollback-after-deadline", [CLI, "rollback"], {0, 4}, observe=True)
-    h.run("G8-update-after-deadline", [CLI, "update"], {0})
+    h.run("G8-update-after-deadline", [CLI, "sync"], {0})
 
 
 def soft_cancel_case(h, records):
@@ -1606,10 +1640,12 @@ def soft_cancel_case(h, records):
              detail="; ".join(failures) or json.dumps(state, sort_keys=True))
     sh(["systemctl", "--user", "reset-failed", SERVICE], check=False)
     h.run("G8-status-after-soft-cancel", [CLI, "status"], {4})
-    h.run("G8-update-after-soft-cancel", [CLI, "update"], {0})
+    h.run("G8-update-after-soft-cancel", [CLI, "sync"], {0})
 
 
 def g9_self_update(h):
+    """`loadout update` (alias `upgrade`) is the CLI self-update and nothing else: it never syncs, and
+    `sync` never updates the CLI, whatever the legacy `[update] cli` says."""
     if not h.requires("G9", "bootstrap"):
         return
     commit("C16 cli on", {"loadout.toml": manifest({"cli": "true"})})
@@ -1620,23 +1656,26 @@ def g9_self_update(h):
     unmanaged = ACC / "unmanaged" / "loadout"
     unmanaged.parent.mkdir(parents=True)
     shutil.copy2(CLI, unmanaged)
-    h.run("G9-unmanaged-skip", [unmanaged, "update"], {0}, asserts=lambda code, text: [
-        ("skip says install record", "install record" in text or "not one of the release targets" in text),
-        ("installed cli untouched", (sha256(CLI), read(record)) == pristine)])
+    for alias in ("update", "upgrade"):
+        h.run("G9-unmanaged-skip-" + alias, [unmanaged, alias], {4}, asserts=lambda code, text: [
+            ("skip says install record", "install record" in text or "not one of the release targets" in text),
+            ("installed cli untouched", (sha256(CLI), read(record)) == pristine)])
     if managed and h.expected.get("network") == "offline":
-        h.run("G9-managed-offline", [CLI, "update"], {1}, asserts=lambda code, text: [
-            ("binary and record unchanged", (sha256(CLI), read(record)) == pristine)])
+        for argv in ([CLI, "update"], [CLI, "upgrade", "--prerelease"]):
+            h.run("G9-managed-offline-" + "-".join(str(a) for a in argv[1:]), argv, {1}, asserts=lambda code, text: [
+                ("binary and record unchanged", (sha256(CLI), read(record)) == pristine),
+                ("never shown as up to date", "up to date" not in text)])
     else:
         h.run("G9-managed-offline", [CLI, "update"], {0, 1}, observe=True)
     record.write_text(read(record).replace('version = "%s"' % h.expected["version"], 'version = "0.0.1"'))
-    h.run("G9-tampered-record-skip", [CLI, "update"], {0}, asserts=lambda code, text: [
+    h.run("G9-tampered-record-skip", [CLI, "update"], {4}, asserts=lambda code, text: [
         ("binary unchanged", sha256(CLI) == pristine[0])])
     h.run("G9-tampered-record-doctor", [CLI, "doctor", "--json"], {0, 4}, observe=True)
     record.write_text(pristine[1])
     iso = ACC / "iso-self-update"
     h.run("G9-isolated-init", [CLI, "init", REMOTE_URL, "--name", "vm-linux", "--no-service"], {0, 4},
           env=h.env(isolated=iso), observe=True)
-    h.run("G9-isolated-skip", [CLI, "update"], {0, 4}, env=h.env(isolated=iso), asserts=lambda code, text: [
+    h.run("G9-isolated-skip", [CLI, "update"], {4}, env=h.env(isolated=iso), asserts=lambda code, text: [
         ("self-update skip names isolation", re.search(r"self-update[^\n]*isolation", text) is not None)])
     tests = h.inputs / "tests"
     if tests.is_dir():
@@ -1644,8 +1683,12 @@ def g9_self_update(h):
             if binary.name.startswith("loadout-") and os.access(binary, os.X_OK):
                 h.run("G9-release-unit-tests-%s" % binary.name, [binary, "release::", "--test-threads", "2"], {0},
                       timeout=900)
-    commit("C17 cli off", {"loadout.toml": manifest({"cli": "false"})})
-    h.run("G9-cli-off", [CLI, "update"], {0})
+    self_update_lines = ("cli: updated", "cli: up to date", "cli: not updated")
+    for value in ("true", "false"):
+        commit("C17 cli %s" % value, {"loadout.toml": manifest({"cli": value})})
+        h.run("G9-sync-never-self-updates-cli-" + value, [CLI, "sync"], {0}, asserts=lambda code, text: [
+            ("no self-update line", not any(line in text for line in self_update_lines)),
+            ("binary and record unchanged", (sha256(CLI), read(record)) == pristine)])
 
 
 def g10_std_elevation(h):
@@ -1658,7 +1701,7 @@ def g10_std_elevation(h):
     commit("C-std apt", {"os/linux.toml": extra})
     history = "/var/log/apt/history.log"
     before = snapshot(history)
-    h.run("G10-foreground-needs-elevated", [CLI, "update"], {4}, timeout=300, asserts=lambda code, text: [
+    h.run("G10-foreground-needs-elevated", [CLI, "sync"], {4}, timeout=300, asserts=lambda code, text: [
         ("names --elevated", "--elevated" in text), ("apt untouched", snapshot(history) == before)])
     run_service(h, "G10-background-blocked", 4, lambda: [("apt untouched", snapshot(history) == before)])
     commit("C-std apt removed", {"os/linux.toml": (h.inputs / "fixtures/loadout/os/linux.toml").read_text()})
