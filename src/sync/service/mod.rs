@@ -1541,9 +1541,10 @@ mod tests {
         plant(&exe);
         plant(&exe.with_file_name(format!("{LAUNCHER}.exe")));
         record_for(&fakes, &exe);
+        fakes.tool("schtasks", "exit 0");
         fakes.tool(
-            "schtasks",
-            "case \"$4\" in /XML) echo 'ERROR: Access is denied.' >&2; exit 1;; esac",
+            "powershell",
+            "echo 'ERROR: 0x80070005 Access is denied. (Exception from HRESULT: 0x80070005 (E_ACCESSDENIED))' >&2; exit 1",
         );
         let denied = status(&fakes.context).unwrap();
         assert!(
@@ -1559,11 +1560,11 @@ mod tests {
             describe(&denied)
         );
 
-        // The plain `/Query` finds the task, then `/Query /XML` can't: a definite absence after
+        // The plain `/Query` finds the task, then the read-back can't: a definite absence after
         // a successful query is a mismatch, never a match.
         fakes.tool(
-            "schtasks",
-            "case \"$4\" in /XML) echo 'ERROR: The system cannot find the file specified.' >&2; exit 1;; esac",
+            "powershell",
+            "echo 'ERROR: Task Scheduler cannot find the task.' >&2; exit 2",
         );
         let vanished = status(&fakes.context).unwrap();
         assert!(
@@ -1577,6 +1578,83 @@ mod tests {
             describe(&vanished).contains("no task Loadout Update"),
             "{}",
             describe(&vanished)
+        );
+
+        // A read-back that can't even start (no PowerShell to run) is an error, never a match.
+        fake::set("powershell", fakes.dir.path().join("no-such-powershell"));
+        let unavailable = status(&fakes.context).unwrap();
+        assert!(!unavailable.healthy(), "{}", describe(&unavailable));
+        assert!(
+            describe(&unavailable).contains("cannot check the installed job"),
+            "{}",
+            describe(&unavailable)
+        );
+        assert!(
+            !fakes.calls("schtasks").contains("/XML"),
+            "the definition is never read through schtasks /XML: {}",
+            fakes.calls("schtasks")
+        );
+    }
+
+    /// A launcher under a folder with non-ASCII letters, a space and an ampersand (a Windows
+    /// user name, say) is read back exactly and matches. The read-back is the bounded PowerShell
+    /// child with the Task Scheduler script, never `schtasks /Query /XML`, whose piped output is
+    /// the OEM code page; and the same definition in that code page is an error, not a match.
+    #[cfg(unix)]
+    #[test]
+    fn a_windows_task_under_a_non_ascii_path_reads_back_exactly() {
+        let fakes = Fakes::new(Os::Windows);
+        let bin = fakes.dir.path().join("bin \u{fc}n\u{ef}\u{96ea} & co");
+        let exe = bin.join("loadout.exe");
+        let launcher = bin.join(format!("{LAUNCHER}.exe"));
+        plant(&exe);
+        plant(&launcher);
+        record_for(&fakes, &exe);
+        let service = Private::Service.path(&fakes.context);
+        let service = service.to_str().unwrap();
+        assert!(
+            !service.contains(' '),
+            "the service path needs no quoting here: {service}"
+        );
+        let definition = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task><Triggers><TimeTrigger><Repetition><Interval>PT60M</Interval></Repetition></TimeTrigger></Triggers><Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>--service {}</Arguments></Exec></Actions></Task>\r\n",
+            xml(launcher.to_str().unwrap()),
+            xml(service)
+        );
+        let utf8 = fakes.dir.path().join("definition.utf8");
+        fs::write(&utf8, definition.as_bytes()).unwrap();
+        fakes.tool("schtasks", "exit 0");
+        fakes.tool("powershell", &format!("cat '{}'", utf8.display()));
+        let read = status(&fakes.context).unwrap();
+        assert_eq!(read.problem, None, "{}", describe(&read));
+        assert_eq!(read.mismatch, None, "{}", describe(&read));
+        let calls = fakes.calls("powershell");
+        assert!(
+            calls.starts_with(
+                "-NoProfile -NonInteractive -NoLogo -Command $ErrorActionPreference = 'Stop';"
+            ) && calls.contains(".GetTask('Loadout Update').Xml")
+                && calls.contains("[Console]::OpenStandardOutput()"),
+            "{calls}"
+        );
+        assert!(
+            !fakes.calls("schtasks").contains("/XML"),
+            "{}",
+            fakes.calls("schtasks")
+        );
+
+        // The bytes schtasks writes over a pipe (code page 437: \u{fc} is 0x81, \u{ef} 0x8b, and
+        // \u{96ea} has none, so it is '?'): not UTF-8, an error, never decoded some other way.
+        let letters = "\u{fc}n\u{ef}\u{96ea}";
+        let at = definition.find(letters).unwrap();
+        let mut oem = definition.into_bytes();
+        oem.splice(at..at + letters.len(), [0x81, b'n', 0x8b, b'?']);
+        fs::write(&utf8, &oem).unwrap();
+        let lossy = status(&fakes.context).unwrap();
+        assert!(!lossy.healthy(), "{}", describe(&lossy));
+        assert!(
+            describe(&lossy).contains("not valid UTF-8"),
+            "{}",
+            describe(&lossy)
         );
     }
 
