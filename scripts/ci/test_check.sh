@@ -84,7 +84,7 @@ check() {
   : >"$log"
   rm -f "$scratch/cases/$case.count"
   (cd "$repo" && env PATH="$scratch/gitwrap:$scratch/bin:$PATH" REAL_GIT="$real_git" FAKE_LOG="$log" \
-    FAKE_GIT_COUNT="$scratch/cases/$case.count" "${vars[@]}" bash scripts/ci/check.sh "$@") >"$out" 2>&1
+    FAKE_GIT_COUNT="$scratch/cases/$case.count" ${vars[@]+"${vars[@]}"} bash scripts/ci/check.sh "$@") >"$out" 2>&1
   code=$?
 }
 

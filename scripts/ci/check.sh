@@ -109,8 +109,10 @@ describe_into() {
         return 1
       elif [[ -L $path ]]; then
         # The trailing "." keeps command substitution from dropping newlines the target ends with.
-        link=$(readlink -- "$path" && echo .) || return 1
-        link=${link%$'\n.'}
+        # -n because macOS readlink appends a newline only to a target that lacks one, so without
+        # it "x" and "x<newline>" read the same there.
+        link=$(readlink -n -- "$path" && echo .) || return 1
+        link=${link%.}
         if [[ $link == *$'\n'* ]]; then
           printf 'unsupported symlink target with a newline: %q\n' "$path" >&2
           return 1
