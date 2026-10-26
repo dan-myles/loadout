@@ -83,7 +83,9 @@ impl Source {
 
     /// The tag `releases/latest` redirects to. GitHub answers with a redirect to
     /// `…/releases/tag/<tag>`, which is read without following it, so no API, token, or JSON is
-    /// involved. A 404 means nothing is published yet.
+    /// involved. With no stable release published (none at all, or only prereleases), github.com
+    /// redirects to the repository's release list, `<site>/<repository>/releases`, instead; that,
+    /// or a 404, means there is no release. Any other location is an error.
     pub(super) fn latest(&self) -> Result<Latest, String> {
         let url = format!("{}/{}/releases/latest", self.site, self.repository);
         let response = match self.agent(0, true).get(&url).call() {
@@ -102,7 +104,11 @@ impl Source {
             .get("location")
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| format!("{url} redirected without a readable location"))?;
-        let prefix = format!("/{}/releases/tag/", self.repository);
+        let list = format!("/{}/releases", self.repository);
+        if location == list || location == format!("{}{list}", self.site) {
+            return Ok(Latest::None);
+        }
+        let prefix = format!("{list}/tag/");
         let tag = location
             .split_once(&prefix)
             .map(|(_, tag)| tag)

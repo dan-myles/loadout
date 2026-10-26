@@ -1853,7 +1853,8 @@ Automatic updates are required, so they are on by default.
     updated, already up to date, or nothing is published; 4 for a skip (`cli: not updated:
     <reason>`); 1 for any other error, which is never shown as up to date.
   - **Channels.** `Channel::Stable` (the default) reads the `releases/latest` redirect, which
-    GitHub never points at a prerelease, so a stable client never moves onto one.
+    GitHub never points at a prerelease, so a stable client never moves onto one. With no stable
+    release it redirects to `<site>/<repo>/releases`; that or a 404 is `Error::NoRelease`.
     `--prerelease` (`Channel::Prerelease`) reads the public releases list
     (`api.github.com/repos/<repo>/releases`): every linked page, at most 10 of at most 8 MiB, next
     links only under the API base; drafts and tags that aren't `v<semver>` are skipped and the

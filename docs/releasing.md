@@ -319,7 +319,9 @@ strictly newer release exists, and applies exactly the rule above, with no token
 updated, already up to date or nothing is published; 4 when this binary can't be updated
 (unmanaged, `LOADOUT_HOME` isolation, another install busy); 1 on any other error.
 - **Which release.** By default only stable releases: the tag from the `releases/latest`
-  redirect, which never names a prerelease. `--prerelease` reads the public releases list instead
+  redirect, which never names a prerelease. With no stable release, github.com redirects
+  `releases/latest` to the release list (`/dan-myles/loadout/releases`) instead; that, or a 404,
+  is "no stable release" (exit 0), and any other answer is an error. `--prerelease` reads the public releases list instead
   (`api.github.com/repos/dan-myles/loadout/releases`, every linked page up to 10 of at most 8 MiB,
   drafts and non-`v<semver>` tags skipped) and takes the highest version, prerelease or not. A
   rate limit or any unreadable answer is an error, never "up to date".

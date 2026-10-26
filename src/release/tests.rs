@@ -439,7 +439,9 @@ mod unix {
         let server = Server::start();
         let fixture = Installed::new();
         server.route(LIST, 200, &[], &page(&[("v1.3.0-test.1", false, true)]));
-        // Only prereleases are published, so releases/latest has nothing.
+        // Only prereleases are published, so releases/latest has nothing: github.com redirects
+        // it to the release list.
+        no_stable_release(&server, &format!("{}/{REPOSITORY}/releases", server.base));
         assert!(matches!(
             release_for(&server, &fixture),
             Err(Error::NoRelease)
@@ -741,6 +743,52 @@ mod unix {
         let server = Server::start();
         let error = release_for(&server, &Installed::new()).unwrap_err();
         assert!(matches!(error, Error::NoRelease) && error.skipped());
+    }
+
+    /// What github.com answers on `releases/latest` when no stable release is published: a
+    /// redirect to the release list, absolute as GitHub sends it, or relative.
+    fn no_stable_release(server: &Server, location: &str) {
+        server.route(
+            &format!("/{REPOSITORY}/releases/latest"),
+            302,
+            &[("Location", location)],
+            b"",
+        );
+    }
+
+    #[test]
+    fn a_redirect_to_the_release_list_means_no_stable_release() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for location in [
+            format!("{}/{REPOSITORY}/releases", server.base),
+            format!("/{REPOSITORY}/releases"),
+        ] {
+            no_stable_release(&server, &location);
+            let error = release_for(&server, &fixture).unwrap_err();
+            assert!(
+                matches!(error, Error::NoRelease) && error.skipped(),
+                "{location}: {error}"
+            );
+        }
+        // Anything else is still not a release, and not "nothing published" either: another
+        // repository or origin, a query or trailing slash, or something only resembling a tag.
+        for location in [
+            format!("{}/{REPOSITORY}/releases/", server.base),
+            format!("{}/{REPOSITORY}/releases?q=1", server.base),
+            format!("{}/someone/else/releases", server.base),
+            format!("https://elsewhere.invalid/{REPOSITORY}/releases"),
+            format!("{}/{REPOSITORY}", server.base),
+            format!("{}/{REPOSITORY}/releases/tag/", server.base),
+            format!("{}/{REPOSITORY}/releases/tags/v1.2.0", server.base),
+            format!("{}/{REPOSITORY}/releases/tag/v1.2.0/x", server.base),
+        ] {
+            no_stable_release(&server, &location);
+            assert!(
+                matches!(release_for(&server, &fixture), Err(Error::Download { .. })),
+                "{location}"
+            );
+        }
     }
 
     #[test]
