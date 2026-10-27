@@ -42,14 +42,24 @@ fn quote(arg: &str) -> String {
 }
 
 pub(super) fn service_unit(exe: &str, service: &str) -> String {
-    let command = [exe, "update", "--background", "--service", service]
+    unit(exe, service, "sync", "loadout background sync")
+}
+
+/// The service unit older versions wrote: it runs the legacy `loadout update --background`,
+/// which still syncs, until `service install` writes [`service_unit`] in its place.
+pub(super) fn legacy_service_unit(exe: &str, service: &str) -> String {
+    unit(exe, service, "update", "loadout background update")
+}
+
+fn unit(exe: &str, service: &str, verb: &str, description: &str) -> String {
+    let command = [exe, verb, "--background", "--service", service]
         .iter()
         .map(|arg| quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
     format!(
         "[Unit]\n\
-         Description=loadout background update\n\
+         Description={description}\n\
          Documentation=https://github.com/dan-myles/loadout\n\
          \n\
          [Service]\n\
@@ -63,9 +73,18 @@ pub(super) fn service_unit(exe: &str, service: &str) -> String {
 }
 
 pub(super) fn timer_unit(interval_minutes: u32) -> String {
+    timer(interval_minutes, "sync")
+}
+
+/// The timer older versions wrote, which differs only in its description.
+pub(super) fn legacy_timer_unit(interval_minutes: u32) -> String {
+    timer(interval_minutes, "update")
+}
+
+fn timer(interval_minutes: u32, what: &str) -> String {
     format!(
         "[Unit]\n\
-         Description=Run the loadout background update every {interval_minutes} minutes\n\
+         Description=Run the loadout background {what} every {interval_minutes} minutes\n\
          \n\
          [Timer]\n\
          OnBootSec=5min\n\
@@ -184,16 +203,29 @@ pub(super) fn differs(
     interval_minutes: u32,
 ) -> Result<Option<String>, String> {
     let expected = [
-        (SERVICE, service_unit(exe, service)),
-        (TIMER, timer_unit(interval_minutes)),
+        (
+            SERVICE,
+            service_unit(exe, service),
+            legacy_service_unit(exe, service),
+        ),
+        (
+            TIMER,
+            timer_unit(interval_minutes),
+            legacy_timer_unit(interval_minutes),
+        ),
     ];
     let mut present = true;
-    for (name, text) in expected {
+    let mut legacy = false;
+    for (name, text, older) in expected {
         match super::definition(&dir(context).join(name))? {
-            Some(actual) if actual != text => return Ok(Some(super::differs_from_record(name))),
-            Some(_) => {}
+            Some(actual) if actual == text => {}
+            Some(actual) if actual == older => legacy = true,
+            Some(_) => return Ok(Some(super::differs_from_record(name))),
             None => present = false,
         }
+    }
+    if legacy {
+        return Ok(Some(super::LEGACY.to_owned()));
     }
     if !present || context.isolated {
         return Ok(None);
@@ -292,6 +324,29 @@ mod tests {
         assert_eq!(
             unit,
             "[Unit]\n\
+             Description=loadout background sync\n\
+             Documentation=https://github.com/dan-myles/loadout\n\
+             \n\
+             [Service]\n\
+             Type=exec\n\
+             ExecStart=\"/opt/my tools/loadout\" \"sync\" \"--background\" \"--service\" \"/home/u/.local/state/loadout/service.toml\"\n\
+             RuntimeMaxSec=3720\n\
+             KillMode=control-group\n\
+             TimeoutStopSec=30\n\
+             NoNewPrivileges=yes\n"
+        );
+    }
+
+    /// The unit older versions wrote, byte for byte, which `differs` recognizes as the legacy
+    /// job rather than a foreign one.
+    #[test]
+    fn the_legacy_unit_is_the_one_older_versions_wrote() {
+        assert_eq!(
+            legacy_service_unit(
+                "/opt/my tools/loadout",
+                "/home/u/.local/state/loadout/service.toml"
+            ),
+            "[Unit]\n\
              Description=loadout background update\n\
              Documentation=https://github.com/dan-myles/loadout\n\
              \n\
@@ -302,6 +357,20 @@ mod tests {
              KillMode=control-group\n\
              TimeoutStopSec=30\n\
              NoNewPrivileges=yes\n"
+        );
+        assert_eq!(
+            legacy_timer_unit(45),
+            "[Unit]\n\
+             Description=Run the loadout background update every 45 minutes\n\
+             \n\
+             [Timer]\n\
+             OnBootSec=5min\n\
+             OnUnitInactiveSec=45min\n\
+             RandomizedDelaySec=60\n\
+             Unit=loadout-update.service\n\
+             \n\
+             [Install]\n\
+             WantedBy=timers.target\n"
         );
     }
 

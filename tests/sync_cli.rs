@@ -1,5 +1,6 @@
-//! `loadout update` and `loadout service` through the real binary, with the real `git` against
-//! bare remotes in scratch dirs, and a fake `git` where the exact argv and environment matter.
+//! `loadout sync`, `loadout update`/`upgrade` and `loadout service` through the real binary,
+//! with the real `git` against bare remotes in scratch dirs, and a fake `git` where the exact
+//! argv and environment matter.
 //! Every run uses `LOADOUT_HOME` and `LOADOUT_STATE_DIR` in a temp dir, so nothing on the host
 //! is read or written, and no scheduler is ever asked to change anything.
 
@@ -161,6 +162,13 @@ impl Machine {
     }
 }
 
+/// Whether a run's output shows a CLI self-update step: the lines `loadout update` prints.
+fn touched_the_cli(text: &str) -> bool {
+    ["cli: updated", "cli: up to date", "cli: not updated"]
+        .iter()
+        .any(|line| text.contains(line))
+}
+
 fn text(output: &Output) -> String {
     format!(
         "{}{}",
@@ -170,10 +178,10 @@ fn text(output: &Output) -> String {
 }
 
 #[test]
-fn update_fetches_fast_forwards_and_applies_the_new_commit() {
+fn sync_fetches_fast_forwards_and_applies_the_new_commit() {
     let machine = Machine::new(LOADOUT);
     machine.clone();
-    let first = machine.run(&["update"]);
+    let first = machine.run(&["sync"]);
     assert_eq!(first.status.code(), Some(0), "{}", text(&first));
     assert!(
         text(&first).contains("fetched: up to date"),
@@ -183,7 +191,7 @@ fn update_fetches_fast_forwards_and_applies_the_new_commit() {
     assert_eq!(machine.notes().as_deref(), Some("first\n"));
 
     machine.push("second\n");
-    let second = machine.run(&["update"]);
+    let second = machine.run(&["sync"]);
     assert_eq!(second.status.code(), Some(0), "{}", text(&second));
     assert!(
         text(&second).contains("fetched: fast-forwarded"),
@@ -220,7 +228,7 @@ fn inherited_line_ending_config_never_changes_what_the_clone_checks_out() {
     fs::write(&config, "[core]\n\tautocrlf = true\n\teol = crlf\n").unwrap();
 
     let output = machine
-        .command(&["update"])
+        .command(&["sync"])
         .env("GIT_CONFIG_GLOBAL", &config)
         .output()
         .unwrap();
@@ -255,7 +263,7 @@ fn inherited_git_redirections_never_touch_another_index_or_repository() {
     assert_ne!(planted_head, pushed);
 
     let output = machine
-        .command(&["update"])
+        .command(&["sync"])
         .env("GIT_INDEX_FILE", &planted_index)
         .env("GIT_DIR", machine.work.join(".git"))
         .env("GIT_WORK_TREE", &machine.work)
@@ -279,11 +287,11 @@ fn inherited_git_redirections_never_touch_another_index_or_repository() {
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
 }
 
-/// An unfinished run blocks `update` before it fetches, in the foreground and under the
+/// An unfinished run blocks `sync` before it fetches, in the foreground and under the
 /// supervisor: exit 4, the clone's branch and its view of origin don't move, and nothing is
 /// applied. The run is seeded through the public `Run::begin` and left unfinished.
 #[test]
-fn an_interrupted_run_blocks_update_before_the_fetch() {
+fn an_interrupted_run_blocks_sync_before_the_fetch() {
     let machine = Machine::new(LOADOUT);
     let clone = machine.clone();
     let context = machine.context();
@@ -301,7 +309,7 @@ fn an_interrupted_run_blocks_update_before_the_fetch() {
     let tracking = git(&clone, &["rev-parse", "refs/remotes/origin/main"]);
     machine.push("second\n");
 
-    let foreground = machine.run(&["update"]);
+    let foreground = machine.run(&["sync"]);
     assert_eq!(foreground.status.code(), Some(4), "{}", text(&foreground));
     assert!(
         text(&foreground).contains("didn't finish"),
@@ -309,7 +317,7 @@ fn an_interrupted_run_blocks_update_before_the_fetch() {
         text(&foreground)
     );
 
-    let background = machine.run(&["update", "--background"]);
+    let background = machine.run(&["sync", "--background"]);
     assert_eq!(background.status.code(), Some(4), "{}", text(&background));
     let record = machine.record("last-run.json");
     assert_eq!(record["result"], "blocked", "{record}");
@@ -329,12 +337,12 @@ fn an_interrupted_run_blocks_update_before_the_fetch() {
 }
 
 #[test]
-fn a_dirty_clone_blocks_update_and_nothing_is_applied() {
+fn a_dirty_clone_blocks_sync_and_nothing_is_applied() {
     let machine = Machine::new(LOADOUT);
     let clone = machine.clone();
     fs::write(clone.join("files").join("notes"), "edited in the clone\n").unwrap();
     machine.push("second\n");
-    let output = machine.run(&["update"]);
+    let output = machine.run(&["sync"]);
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
     assert!(
         text(&output).contains("blocked: the clone has local changes"),
@@ -349,19 +357,19 @@ fn a_dirty_clone_blocks_update_and_nothing_is_applied() {
 }
 
 #[test]
-fn update_without_a_clone_says_how_to_make_one() {
+fn sync_without_a_clone_says_how_to_make_one() {
     let machine = Machine::new(LOADOUT);
-    let output = machine.run(&["update"]);
+    let output = machine.run(&["sync"]);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
     assert!(text(&output).contains("loadout init"), "{}", text(&output));
 }
 
 #[test]
-fn update_with_another_checkout_applies_it_without_fetching_it() {
+fn sync_with_another_checkout_applies_it_without_fetching_it() {
     let machine = Machine::new(LOADOUT);
     let before = git(&machine.work, &["rev-parse", "HEAD"]);
     fs::write(machine.work.join("files").join("notes"), "uncommitted\n").unwrap();
-    let output = machine.run(&["update", "--loadout", machine.work.to_str().unwrap()]);
+    let output = machine.run(&["sync", "--loadout", machine.work.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     assert!(text(&output).contains("not fetched:"), "{}", text(&output));
     assert_eq!(machine.notes().as_deref(), Some("uncommitted\n"));
@@ -375,7 +383,7 @@ fn update_with_another_checkout_applies_it_without_fetching_it() {
 #[test]
 fn background_refuses_another_checkout_at_parse_time() {
     let machine = Machine::new(LOADOUT);
-    let output = machine.run(&["update", "--background", "--loadout", "x"]);
+    let output = machine.run(&["sync", "--background", "--loadout", "x"]);
     assert_eq!(output.status.code(), Some(2), "{}", text(&output));
     assert!(!machine.state.exists());
 }
@@ -384,7 +392,7 @@ fn background_refuses_another_checkout_at_parse_time() {
 fn a_worker_started_by_hand_refuses_before_it_locks_or_writes() {
     let machine = Machine::new(LOADOUT);
     let output = machine
-        .command(&["update", "--background", "--worker"])
+        .command(&["sync", "--background", "--worker"])
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
@@ -402,7 +410,7 @@ fn a_background_run_is_supervised_applies_and_leaves_its_records() {
     let machine = Machine::new(LOADOUT);
     machine.clone();
     machine.push("second\n");
-    let output = machine.run(&["update", "--background"]);
+    let output = machine.run(&["sync", "--background"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
 
@@ -444,7 +452,7 @@ fn a_worker_log_that_cannot_be_saved_fails_the_run_and_its_record() {
     machine.clone();
     machine.push("second\n");
     fs::create_dir_all(machine.state.join("background").join("worker.log")).unwrap();
-    let output = machine.run(&["update", "--background"]);
+    let output = machine.run(&["sync", "--background"]);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
 
     let supervisor = machine.record("supervisor.json");
@@ -464,9 +472,17 @@ fn a_worker_log_that_cannot_be_saved_fails_the_run_and_its_record() {
 
 /// The scheduled job's route takes its `Context` from the service record alone: ambient
 /// overrides that `Context` would reject (relative paths) don't stop it, and it applies to the
-/// recorded home and state.
+/// recorded home and state. The job older loadout versions registered, `loadout update
+/// --background --service FILE`, takes the same route after the CLI is updated: it syncs, says
+/// how to re-register the job, and never updates the CLI.
 #[test]
 fn a_recorded_service_run_ignores_an_unusable_ambient_environment() {
+    for verb in ["sync", "update"] {
+        recorded_service_run(verb);
+    }
+}
+
+fn recorded_service_run(verb: &str) {
     let machine = Machine::new(LOADOUT);
     machine.clone();
     machine.push("second\n");
@@ -490,22 +506,28 @@ fn a_recorded_service_run_ignores_an_unusable_ambient_environment() {
     .unwrap();
 
     let output = machine
-        .command(&[
-            "update",
-            "--background",
-            "--service",
-            service.to_str().unwrap(),
-        ])
+        .command(&[verb, "--background", "--service", service.to_str().unwrap()])
         .env("LOADOUT_HOME", "relative-home")
         .env("LOADOUT_STATE_DIR", "relative-state")
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-    assert_eq!(machine.notes().as_deref(), Some("second\n"));
+    assert_eq!(output.status.code(), Some(0), "{verb}: {}", text(&output));
+    assert_eq!(machine.notes().as_deref(), Some("second\n"), "{verb}");
     let supervisor = machine.record("supervisor.json");
     let run = machine.record("last-run.json");
-    assert_eq!(run["result"], "applied", "{run}");
-    assert_eq!(run["supervisor"], supervisor["run"], "{run}");
+    assert_eq!(run["result"], "applied", "{verb}: {run}");
+    assert_eq!(run["supervisor"], supervisor["run"], "{verb}: {run}");
+    assert!(
+        !touched_the_cli(&text(&output)),
+        "{verb}: {}",
+        text(&output)
+    );
+    assert_eq!(
+        text(&output).contains("loadout service install"),
+        verb == "update",
+        "only the legacy form says how to re-register the job: {}",
+        text(&output)
+    );
 }
 
 /// A background run that finds another run holding the lock does nothing, exits 1, and is
@@ -516,7 +538,7 @@ fn a_background_run_that_finds_the_lock_held_is_recorded_as_locked() {
     machine.clone();
     machine.push("second\n");
     let held = relock(&machine.context());
-    let output = machine.run(&["update", "--background"]);
+    let output = machine.run(&["sync", "--background"]);
     drop(held);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
     let run = machine.record("last-run.json");
@@ -530,7 +552,7 @@ fn a_blocked_background_run_is_recorded_and_makes_status_unhealthy() {
     let machine = Machine::new(LOADOUT);
     let clone = machine.clone();
     git(&clone, &["checkout", "--quiet", "--detach"]);
-    let output = machine.run(&["update", "--background"]);
+    let output = machine.run(&["sync", "--background"]);
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
     let run = machine.record("last-run.json");
     assert_eq!(run["result"], "blocked", "{run}");
@@ -547,7 +569,7 @@ fn a_blocked_background_run_is_recorded_and_makes_status_unhealthy() {
 fn a_loadout_that_turns_updates_off_stops_the_background_run_before_planning() {
     let machine = Machine::new(&format!("{LOADOUT}[update]\nauto = false\n"));
     machine.clone();
-    let output = machine.run(&["update", "--background"]);
+    let output = machine.run(&["sync", "--background"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     assert_eq!(machine.record("last-run.json")["result"], "disabled");
     assert!(machine.notes().is_none(), "nothing may be applied");
@@ -605,7 +627,7 @@ fn doctor_reports_the_clone_the_service_and_the_background_run() {
 }
 
 /// A fake `git` that records its argv, the prompt variables, the redirection variables and the
-/// transient configuration variables, then says the clone has no branch, so `update` stops at the
+/// transient configuration variables, then says the clone has no branch, so `sync` stops at the
 /// first query.
 #[cfg(unix)]
 fn fake_git(dir: &Path) -> PathBuf {
@@ -633,7 +655,7 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
     let root = machine.home.parent().unwrap().to_path_buf();
     let bin = fake_git(&root);
     let output = machine
-        .command(&["update"])
+        .command(&["sync"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("GIT_INDEX_FILE", root.join("planted-index"))
         .env("GIT_DIR", root.join("planted-repo"))
@@ -673,4 +695,120 @@ fn every_git_call_names_its_repository_and_turns_hooks_and_prompts_off() {
         "the caller's transient git configuration reaches git unchanged: {log}"
     );
     assert!(log.contains("config=1"), "{log}");
+}
+
+/// `loadout update` and its alias `loadout upgrade` update only the CLI. With loadout's clone
+/// behind its remote and a file waiting to be applied, neither fetches, applies, takes the lock
+/// or records a run, and both print the same thing, with and without `--prerelease`. Under
+/// `LOADOUT_HOME` the CLI is never replaced, so they say so and exit 4.
+#[test]
+fn update_and_upgrade_are_the_same_cli_only_command_and_never_sync() {
+    let machine = Machine::new(&format!("{LOADOUT}[update]\ncli = true\n"));
+    let clone = machine.clone();
+    let head = git(&clone, &["rev-parse", "HEAD"]);
+    let tracking = git(&clone, &["rev-parse", "refs/remotes/origin/main"]);
+    machine.push("second\n");
+    let entries = || {
+        let mut names: Vec<_> = fs::read_dir(&machine.state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = entries();
+    let mut shown = Vec::new();
+    for alias in ["update", "upgrade"] {
+        for extra in [None, Some("--prerelease")] {
+            let args: Vec<&str> = std::iter::once(alias).chain(extra).collect();
+            let output = machine.run(&args);
+            assert_eq!(output.status.code(), Some(4), "{args:?}: {}", text(&output));
+            assert!(
+                text(&output).contains("LOADOUT_HOME isolation"),
+                "{args:?}: {}",
+                text(&output)
+            );
+            assert!(
+                text(&output).contains("loadout sync"),
+                "{args:?}: {}",
+                text(&output)
+            );
+            shown.push(text(&output));
+        }
+    }
+    assert_eq!(shown[0], shown[2], "update and upgrade print the same");
+    assert_eq!(shown[1], shown[3], "with --prerelease too");
+    assert!(machine.notes().is_none(), "nothing may be applied");
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(&clone, &["rev-parse", "refs/remotes/origin/main"]),
+        tracking,
+        "nothing was fetched"
+    );
+    assert_eq!(entries(), before, "no state is written");
+}
+
+/// The job older loadout versions registered, run by hand or by its scheduler after the CLI is
+/// updated: `loadout update --background` still syncs, as `loadout sync --background` does, and
+/// says how to re-register the job. It never updates the CLI.
+#[test]
+fn the_legacy_scheduled_update_command_still_syncs_and_says_how_to_migrate() {
+    let machine = Machine::new(LOADOUT);
+    machine.clone();
+    machine.push("second\n");
+    let output = machine.run(&["update", "--background"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        text(&output).contains("loadout service install"),
+        "{}",
+        text(&output)
+    );
+    assert!(!touched_the_cli(&text(&output)), "{}", text(&output));
+    assert_eq!(machine.notes().as_deref(), Some("second\n"));
+    let run = machine.record("last-run.json");
+    assert_eq!(run["result"], "applied", "{run}");
+    assert_eq!(run["fetched"]["result"], "advanced", "{run}");
+    assert_eq!(machine.record("supervisor.json")["code"], 0);
+}
+
+/// The legacy scheduled flags never combine with the CLI update, and a checkout to apply is now
+/// `loadout sync`'s: each refusal leaves the machine untouched.
+#[test]
+fn legacy_update_flags_are_refused_outside_the_scheduled_form() {
+    let machine = Machine::new(LOADOUT);
+    for args in [
+        &["update", "--background", "--prerelease"][..],
+        &["upgrade", "--background", "--loadout", "x"],
+        &["update", "--worker"],
+        &["update", "--service", "service.toml"],
+    ] {
+        let output = machine.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {}", text(&output));
+    }
+    let output = machine.run(&["update", "--loadout", machine.work.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("loadout sync --loadout"),
+        "{}",
+        text(&output)
+    );
+    assert!(machine.notes().is_none(), "nothing may be applied");
+    assert!(!machine.state.exists(), "nothing may be written");
+}
+
+/// Sync never updates the CLI, whatever the loadout's legacy `[update] cli` says.
+#[test]
+fn sync_never_updates_the_cli_even_when_the_loadout_asks() {
+    let machine = Machine::new(&format!("{LOADOUT}[update]\ncli = true\n"));
+    machine.clone();
+    for args in [&["sync"][..], &["sync", "--background"]] {
+        let output = machine.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {}", text(&output));
+        assert!(
+            !touched_the_cli(&text(&output)),
+            "{args:?}: {}",
+            text(&output)
+        );
+    }
+    assert_eq!(machine.notes().as_deref(), Some("first\n"));
 }

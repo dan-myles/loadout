@@ -1,4 +1,4 @@
-//! A background update is two processes of the same binary (architecture section 8): a
+//! A background sync is two processes of the same binary (architecture section 8): a
 //! supervisor, which starts the worker inside a process tree it owns and bounds the whole run
 //! (`process::supervise`), and the worker, which acts only after `process::handshake`. This
 //! module starts the worker and keeps the records both leave in `<state>/background`:
@@ -63,7 +63,7 @@ impl SupervisorRecord {
     }
 }
 
-/// Runs one background update under supervision with the production limits, records how it
+/// Runs one background sync under supervision with the production limits, records how it
 /// ended, and returns the exit code for the supervisor process: the worker's own code when it
 /// exited by itself and its tree was confirmed stopped, otherwise 1.
 pub fn supervise(context: &Context, worker: &Worker<'_>) -> Result<u8, Error> {
@@ -90,7 +90,7 @@ pub fn supervise_with(context: &Context, worker: &Worker<'_>, limits: Limits) ->
         },
     )?;
     let mut command = Command::new(worker.exe);
-    command.args(["update", "--background", "--worker", "--run", &run]);
+    command.args(["sync", "--background", "--worker", "--run", &run]);
     if let Some((path, recorded)) = worker.service {
         command
             .arg("--service")
@@ -181,7 +181,7 @@ fn save(context: &Context, record: &SupervisorRecord) -> Result<(), Error> {
 }
 
 /// The Windows launcher, `loadout-background.exe`, given its arguments: `--version`, or
-/// `--service <FILE>`, which supervises one background update with `loadout.exe` from the
+/// `--service <FILE>`, which supervises one background sync with `loadout.exe` from the
 /// launcher's own folder as the worker (never one found on PATH). Elsewhere it refuses with
 /// exit 2. It has no console, so a failure is visible only through its exit code and the
 /// background records.

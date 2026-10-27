@@ -2,7 +2,7 @@
 //! `schtasks /Create /XML`. It runs only while the user is logged on (an interactive token, so
 //! no password is stored), with least privilege, and never two at once. It starts the GUI
 //! launcher beside `loadout.exe`, so no console window opens at each run; the launcher runs the
-//! same supervisor as `loadout update --background`.
+//! same supervisor as `loadout sync --background`.
 
 use super::{Error, LAUNCHER, Scheduler, failed, query, query_output, required, xml};
 use crate::context::Context;
@@ -15,6 +15,21 @@ const BACKSTOP: &str = "PT1H2M";
 /// A fixed start in the past: the repetition runs from it, so the definition is the same on
 /// every install, and `StartWhenAvailable` makes up a run missed while the machine was off.
 const START: &str = "2000-01-01T00:00:00";
+/// Reads the registered definition back through Task Scheduler's own API and writes its text to
+/// standard output as raw UTF-8 bytes. `schtasks /Query /XML` can't be used for this: over a pipe
+/// it writes the console's OEM code page, which turns every character outside it (a launcher
+/// under a non-ASCII user name, say) into another byte or a `?`, so no decoding gets the path
+/// back. The bytes go straight to the stream, so the console's code page, which a query shares
+/// with the caller, is never changed. A missing task (0x80070002) says `cannot find` whatever
+/// the display language; any other failure exits 1 with its HRESULT.
+const READ_BACK: &str = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; \
+try { $s = New-Object -ComObject Schedule.Service; $s.Connect(); \
+$x = $s.GetFolder('\\').GetTask('__TASK__').Xml } \
+catch { $e = $_.Exception; while ($null -ne $e.InnerException) { $e = $e.InnerException }; \
+if ($e.HResult -eq -2147024894) { [Console]::Error.WriteLine('ERROR: Task Scheduler cannot find the task.'); exit 2 }; \
+[Console]::Error.WriteLine(('ERROR: 0x{0:x8} {1}' -f $e.HResult, $e.Message)); exit 1 }; \
+$b = [Text.Encoding]::UTF8.GetBytes($x); $o = [Console]::OpenStandardOutput(); \
+$o.Write($b, 0, $b.Length); $o.Flush(); exit 0";
 
 /// One argument as `CommandLineToArgvW` reads it back: quoted when it holds a space, a tab, or a
 /// quote, or is empty; backslashes doubled where they precede a quote or the closing quote.
@@ -50,7 +65,7 @@ fn task_xml(launcher: &str, service: &str, interval_minutes: u32) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
          \x20 <RegistrationInfo>\r\n\
-         \x20   <Description>loadout background update</Description>\r\n\
+         \x20   <Description>loadout background sync</Description>\r\n\
          \x20 </RegistrationInfo>\r\n\
          \x20 <Triggers>\r\n\
          \x20   <TimeTrigger>\r\n\
@@ -165,8 +180,9 @@ pub(super) fn differs(
     service: &str,
     interval_minutes: u32,
 ) -> Result<Option<String>, String> {
-    let args = ["/Query", "/TN", NAME, "/XML"];
-    let answer = query_output(context, "schtasks", &args).map_err(|error| error.to_string())?;
+    let script = read_back_script();
+    let args = read_back_args(&script);
+    let answer = query_output(context, "powershell", &args).map_err(|error| error.to_string())?;
     if answer.code != Some(0) {
         let answer = Captured::from(answer);
         if not_found(&answer) {
@@ -174,13 +190,29 @@ pub(super) fn differs(
                 "Task Scheduler has no task {NAME} to read back"
             )));
         }
-        return Err(failed("schtasks", &args, &answer).to_string());
+        return Err(failed("powershell", &READ_BACK_LABEL, &answer).to_string());
     }
     compare(&answer.stdout, launcher, service, interval_minutes)
 }
 
-/// The task definition `schtasks /Query /XML` printed, against the one this record would
-/// register.
+/// How a failed read-back names its command: the script itself is too long to repeat.
+const READ_BACK_LABEL: [&str; 2] = ["-Command", "<Task Scheduler GetTask(Loadout Update).Xml>"];
+
+fn read_back_script() -> String {
+    READ_BACK.replace("__TASK__", NAME)
+}
+
+fn read_back_args(script: &str) -> [&str; 5] {
+    [
+        "-NoProfile",
+        "-NonInteractive",
+        "-NoLogo",
+        "-Command",
+        script,
+    ]
+}
+
+/// The task definition Task Scheduler read back, against the one this record would register.
 fn compare(
     bytes: &[u8],
     launcher: &str,
@@ -318,6 +350,73 @@ pub(super) fn registered(context: &Context) -> Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-back is one `-Command` argument with no double quote, so Windows' argument
+    /// quoting passes it through unchanged; it names this task, writes raw bytes to the stream,
+    /// and never touches the console's code page.
+    #[test]
+    fn the_read_back_reads_this_task_as_raw_bytes_without_changing_the_console() {
+        let script = read_back_script();
+        let args = read_back_args(&script);
+        assert_eq!(
+            args[..4],
+            ["-NoProfile", "-NonInteractive", "-NoLogo", "-Command"]
+        );
+        assert_eq!(args[4], script);
+        assert!(!script.contains('"'), "{script}");
+        assert!(!script.contains("__TASK__"), "{script}");
+        assert!(
+            script.contains("GetFolder('\\').GetTask('Loadout Update').Xml"),
+            "{script}"
+        );
+        assert!(
+            script.contains("[Text.Encoding]::UTF8.GetBytes($x)"),
+            "{script}"
+        );
+        assert!(
+            script.contains("[Console]::OpenStandardOutput()"),
+            "{script}"
+        );
+        assert!(
+            script.contains("-2147024894"),
+            "0x80070002, whatever the language: {script}"
+        );
+        assert!(
+            script.contains("cannot find"),
+            "what `not_found` looks for: {script}"
+        );
+        for changes_the_console in ["OutputEncoding", "chcp", "SetConsoleOutputCP"] {
+            assert!(!script.contains(changes_the_console), "{script}");
+        }
+    }
+
+    /// A non-ASCII launcher path matches when read back exactly, as UTF-8 or UTF-16; the same
+    /// definition in the OEM code page `schtasks` pipes is an error, and one with the lost letters
+    /// as `?` is a mismatch. Neither is ever a match.
+    #[test]
+    fn a_non_ascii_definition_matches_only_when_read_back_exactly() {
+        let launcher = "C:\\Users\\J\u{fc}rgen \u{96ea} & co\\AppData\\Local\\Programs\\loadout\\loadout-background.exe";
+        let service = "C:\\Users\\J\u{fc}rgen \u{96ea} & co\\AppData\\Local\\loadout\\service.toml";
+        let text = task_xml(launcher, service, 15);
+        assert_eq!(compare(text.as_bytes(), launcher, service, 15), Ok(None));
+        assert_eq!(compare(&utf16(&text), launcher, service, 15), Ok(None));
+
+        let letters = "\u{fc}rgen \u{96ea}";
+        let oem: Vec<u8> = text
+            .replace(letters, "\u{1}rgen ?")
+            .bytes()
+            .map(|byte| if byte == 1 { 0x81 } else { byte })
+            .collect();
+        assert_eq!(
+            compare(&oem, launcher, service, 15),
+            Err("the task's XML is not valid UTF-8".to_owned())
+        );
+        let lost = text.replace(letters, "?rgen ?");
+        assert!(matches!(
+            compare(lost.as_bytes(), launcher, service, 15),
+            Ok(Some(_))
+        ));
+    }
 
     #[test]
     fn arguments_read_back_exactly_as_commandlinetoargvw_splits_them() {

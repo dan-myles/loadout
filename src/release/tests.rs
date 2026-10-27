@@ -48,7 +48,9 @@ fn isolation_is_never_managed() {
         None,
     )
     .unwrap();
-    assert!(matches!(latest(&context), Err(Error::Isolated)));
+    for channel in [Channel::Stable, Channel::Prerelease] {
+        assert!(matches!(latest(&context, channel), Err(Error::Isolated)));
+    }
     assert_eq!(checks(&context)[0].status, CheckStatus::Info);
 }
 
@@ -147,6 +149,7 @@ mod unix {
         fn source(&self) -> Source {
             Source {
                 site: self.base.clone(),
+                api: self.base.clone(),
                 repository: REPOSITORY.to_owned(),
                 https_only: false,
             }
@@ -160,6 +163,11 @@ mod unix {
                 &[("Location", &location)],
                 b"",
             );
+            self.assets(tag, archive, sidecar);
+        }
+
+        /// A release's archive and sidecar, without making it `releases/latest`.
+        fn assets(&self, tag: &str, archive: &[u8], sidecar: Option<String>) {
             let asset = Server::asset_path(tag);
             self.route(&asset, 200, &[], archive);
             let sidecar = sidecar.unwrap_or_else(|| format!("{}  {ASSET}\n", sha256(archive)));
@@ -327,13 +335,382 @@ mod unix {
     }
 
     fn release_for(server: &Server, fixture: &Installed) -> Result<Option<Release>, Error> {
+        release_on(server, fixture, Channel::Stable)
+    }
+
+    fn release_on(
+        server: &Server,
+        fixture: &Installed,
+        channel: Channel,
+    ) -> Result<Option<Release>, Error> {
+        release_from(server, fixture, channel, "1.0.0")
+    }
+
+    /// The release offered to a CLI running `current`.
+    fn release_from(
+        server: &Server,
+        fixture: &Installed,
+        channel: Channel,
+        current: &str,
+    ) -> Result<Option<Release>, Error> {
         find(
             &server.source(),
             fixture.install().unwrap(),
             TARGET,
-            Version::new(1, 0, 0),
+            Version::parse(current).unwrap(),
             Containment::OwnGroup,
+            channel,
         )
+    }
+
+    /// The tag the prerelease channel offers a CLI running 1.0.0 when the list is `tags`.
+    fn newest_of(server: &Server, fixture: &Installed, tags: &[&str]) -> String {
+        let listed: Vec<(&str, bool, bool)> = tags.iter().map(|tag| (*tag, false, true)).collect();
+        server.route(LIST, 200, &[], &page(&listed));
+        release_on(server, fixture, Channel::Prerelease)
+            .unwrap()
+            .unwrap()
+            .tag()
+            .to_owned()
+    }
+
+    const LIST: &str = "/repos/dan-myles/loadout/releases?per_page=100";
+
+    /// A releases-list page naming `releases` as `(tag, draft, prerelease)`.
+    fn page(releases: &[(&str, bool, bool)]) -> Vec<u8> {
+        let listed: Vec<serde_json::Value> = releases
+            .iter()
+            .map(|(tag, draft, prerelease)| {
+                serde_json::json!({
+                    "tag_name": tag,
+                    "draft": draft,
+                    "prerelease": prerelease,
+                    "assets": [],
+                })
+            })
+            .collect();
+        serde_json::to_vec(&listed).unwrap()
+    }
+
+    fn next(server: &Server, page: usize) -> (String, String) {
+        let path = format!("/repositories/1/releases?per_page=100&page={page}");
+        (
+            "Link".to_owned(),
+            format!(
+                "<{}{path}>; rel=\"next\", <{}{path}>; rel=\"last\"",
+                server.base, server.base
+            ),
+        )
+    }
+
+    #[test]
+    fn the_prerelease_channel_offers_the_highest_version_across_pages_and_skips_drafts() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        let (name, value) = next(&server, 2);
+        server.route(
+            LIST,
+            200,
+            &[(&name, &value)],
+            &page(&[
+                ("v1.3.0-test.1", false, true),
+                ("v1.2.0", false, false),
+                ("v9.0.0", true, false),
+                ("nightly", false, true),
+                ("v1.3.0-test.2+build.1", false, true),
+            ]),
+        );
+        server.route(
+            "/repositories/1/releases?per_page=100&page=2",
+            200,
+            &[],
+            &page(&[("v1.3.0-test.3", false, true), ("v1.1.0", false, false)]),
+        );
+        let release = release_on(&server, &fixture, Channel::Prerelease)
+            .unwrap()
+            .unwrap();
+        assert_eq!(release.tag(), "v1.3.0-test.3");
+        assert_eq!(release.version(), "1.3.0-test.3");
+        assert_eq!(release.current(), "1.0.0");
+    }
+
+    #[test]
+    fn the_stable_channel_never_offers_a_prerelease() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        server.route(LIST, 200, &[], &page(&[("v1.3.0-test.1", false, true)]));
+        // Only prereleases are published, so releases/latest has nothing: github.com redirects
+        // it to the release list.
+        no_stable_release(&server, &format!("{}/{REPOSITORY}/releases", server.base));
+        assert!(matches!(
+            release_for(&server, &fixture),
+            Err(Error::NoRelease)
+        ));
+        server.publish("v1.2.0", b"unused", None);
+        assert_eq!(
+            release_for(&server, &fixture).unwrap().unwrap().tag(),
+            "v1.2.0"
+        );
+        assert_eq!(
+            release_on(&server, &fixture, Channel::Prerelease)
+                .unwrap()
+                .unwrap()
+                .tag(),
+            "v1.3.0-test.1"
+        );
+    }
+
+    #[test]
+    fn a_prerelease_of_the_running_version_or_anything_older_is_not_offered() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        server.route(
+            LIST,
+            200,
+            &[],
+            &page(&[
+                ("v1.0.0", false, false),
+                ("v1.0.0-test.9", false, true),
+                ("v0.9.0", false, false),
+            ]),
+        );
+        assert!(
+            release_on(&server, &fixture, Channel::Prerelease)
+                .unwrap()
+                .is_none()
+        );
+        server.route(LIST, 200, &[], b"[]");
+        assert!(matches!(
+            release_on(&server, &fixture, Channel::Prerelease),
+            Err(Error::NoRelease)
+        ));
+    }
+
+    #[test]
+    fn releases_are_ranked_by_semver_precedence_which_ignores_build_metadata() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (tags, newest) in [
+            // Equal precedence: the first listed, which GitHub lists as the newest, is kept.
+            (
+                &["v1.3.0-test.1+build.1", "v1.3.0-test.1+build.2"][..],
+                "v1.3.0-test.1+build.1",
+            ),
+            (
+                &["v1.3.0-test.1+build.2", "v1.3.0-test.1+build.1"],
+                "v1.3.0-test.1+build.2",
+            ),
+            // Numeric identifiers compare as numbers.
+            (&["v1.3.0-test.2", "v1.3.0-test.10"], "v1.3.0-test.10"),
+            (&["v1.3.0-test.10", "v1.3.0-test.2"], "v1.3.0-test.10"),
+            // A stable release outranks its own prereleases.
+            (&["v1.3.0-test.9", "v1.3.0"], "v1.3.0"),
+            (&["v1.3.0", "v1.3.0-test.9"], "v1.3.0"),
+            (
+                &["v1.3.0+build.1", "v1.3.0-test.9+build.2"],
+                "v1.3.0+build.1",
+            ),
+        ] {
+            assert_eq!(newest_of(&server, &fixture, tags), newest, "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_differing_only_in_build_metadata_is_never_offered() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (current, tag) in [
+            ("1.2.3-test.1+build.1", "v1.2.3-test.1+build.2"),
+            ("1.2.3-test.1+build.2", "v1.2.3-test.1+build.1"),
+            ("1.2.3-test.1", "v1.2.3-test.1+build.1"),
+            ("1.2.3", "v1.2.3+build.1"),
+            ("1.2.3+build.1", "v1.2.3"),
+        ] {
+            server.route(LIST, 200, &[], &page(&[(tag, false, true)]));
+            assert!(
+                release_from(&server, &fixture, Channel::Prerelease, current)
+                    .unwrap()
+                    .is_none(),
+                "{current} offered {tag}"
+            );
+            if !tag.contains('-') {
+                server.publish(tag, b"unused", None);
+                assert!(
+                    release_from(&server, &fixture, Channel::Stable, current)
+                        .unwrap()
+                        .is_none(),
+                    "{current} offered stable {tag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_release_of_higher_precedence_is_offered_whatever_either_build_metadata() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for (current, tag) in [
+            ("1.2.3-test.1+build.9", "v1.2.3-test.2"),
+            ("1.2.3-test.2+build.1", "v1.2.3-test.10+build.0"),
+            ("1.2.3-test.9", "v1.2.3"),
+            ("1.2.3+build.9", "v1.2.4+build.1"),
+        ] {
+            server.route(LIST, 200, &[], &page(&[(tag, false, true)]));
+            let release = release_from(&server, &fixture, Channel::Prerelease, current)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{current} was not offered {tag}"));
+            assert_eq!(release.tag(), tag);
+            assert_eq!(release.current(), current);
+            if !tag.contains('-') {
+                server.publish(tag, b"unused", None);
+                let stable = release_from(&server, &fixture, Channel::Stable, current)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{current} was not offered stable {tag}"));
+                assert_eq!(stable.tag(), tag);
+            }
+        }
+    }
+
+    /// A releases-list answer, and what its error must say: name, status, headers, body, text.
+    struct Case(
+        &'static str,
+        u16,
+        Vec<(String, String)>,
+        Vec<u8>,
+        &'static str,
+    );
+
+    #[test]
+    fn a_releases_list_that_cannot_be_read_fully_is_an_error_never_up_to_date() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        let oversized = [vec![b' '; 8 * 1024 * 1024 + 1], b"[]".to_vec()].concat();
+        let outside = (
+            "Link".to_owned(),
+            "<https://elsewhere.invalid/releases?page=2>; rel=\"next\"".to_owned(),
+        );
+        let cases = vec![
+            Case(
+                "rate limit used up",
+                403,
+                vec![
+                    ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
+                    ("x-ratelimit-reset".to_owned(), "1700000000".to_owned()),
+                ],
+                b"{}".to_vec(),
+                "used up until 1700000000",
+            ),
+            Case(
+                "refused",
+                403,
+                vec![],
+                b"{}".to_vec(),
+                "refused the request",
+            ),
+            Case(
+                "too many requests",
+                429,
+                vec![],
+                b"{}".to_vec(),
+                "refused the request",
+            ),
+            Case("server error", 500, vec![], b"{}".to_vec(), "answered 500"),
+            Case(
+                "not a list",
+                200,
+                vec![],
+                b"{\"message\": \"x\"}".to_vec(),
+                "release list",
+            ),
+            Case("not JSON", 200, vec![], b"<html>".to_vec(), "release list"),
+            Case("larger than the limit", 200, vec![], oversized, "/releases"),
+            Case(
+                "next page elsewhere",
+                200,
+                vec![outside],
+                page(&[]),
+                "outside",
+            ),
+        ];
+        for Case(name, status, headers, body, expected) in cases {
+            let headers: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            server.route(LIST, status, &headers, &body);
+            match release_on(&server, &fixture, Channel::Prerelease) {
+                Err(Error::Download { detail }) => {
+                    assert!(detail.contains(expected), "{name}: {detail}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_releases_list_longer_than_its_page_bound_is_refused() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        let (name, value) = next(&server, 2);
+        server.route(LIST, 200, &[(&name, &value)], &page(&[]));
+        for number in 2..=11 {
+            let (name, value) = next(&server, number + 1);
+            server.route(
+                &format!("/repositories/1/releases?per_page=100&page={number}"),
+                200,
+                &[(&name, &value)],
+                &page(&[("v1.5.0-test.1", false, true)]),
+            );
+        }
+        match release_on(&server, &fixture, Channel::Prerelease) {
+            Err(Error::Download { detail }) => assert!(detail.contains("longer than"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_prerelease_is_installed_with_every_check_a_stable_release_gets() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        let new_binary = script("1.3.0-test.1");
+        let archive = release_archive(&new_binary);
+        server.route(LIST, 200, &[], &page(&[("v1.3.0-test.1", false, true)]));
+        server.assets("v1.3.0-test.1", &archive, None);
+        let release = release_on(&server, &fixture, Channel::Prerelease)
+            .unwrap()
+            .unwrap();
+        install(&release).unwrap();
+        assert_eq!(fs::read(&fixture.exe).unwrap(), new_binary);
+        let record = record::parse(&fs::read(fixture.record_path()).unwrap()).unwrap();
+        assert_eq!(record.version, "1.3.0-test.1");
+        assert_eq!(record.binary_sha256, sha256(&new_binary));
+        assert!(
+            installed(
+                &fixture.exe,
+                false,
+                TARGET,
+                &Version::parse("1.3.0-test.1").unwrap()
+            )
+            .is_ok()
+        );
+
+        // A prerelease whose binary reports another version, or whose sidecar doesn't match, is
+        // refused like any release, and nothing changes.
+        let fixture = Installed::new();
+        let before = fixture.snapshot();
+        server.route(LIST, 200, &[], &page(&[("v1.3.0-test.2", false, true)]));
+        server.assets(
+            "v1.3.0-test.2",
+            &release_archive(&script("1.3.0-test.1")),
+            None,
+        );
+        let release = release_on(&server, &fixture, Channel::Prerelease)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(install(&release), Err(Error::Verify { .. })));
+        let mut after = fixture.snapshot();
+        after.remove(publish::LOCK_FILE);
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -366,6 +743,52 @@ mod unix {
         let server = Server::start();
         let error = release_for(&server, &Installed::new()).unwrap_err();
         assert!(matches!(error, Error::NoRelease) && error.skipped());
+    }
+
+    /// What github.com answers on `releases/latest` when no stable release is published: a
+    /// redirect to the release list, absolute as GitHub sends it, or relative.
+    fn no_stable_release(server: &Server, location: &str) {
+        server.route(
+            &format!("/{REPOSITORY}/releases/latest"),
+            302,
+            &[("Location", location)],
+            b"",
+        );
+    }
+
+    #[test]
+    fn a_redirect_to_the_release_list_means_no_stable_release() {
+        let server = Server::start();
+        let fixture = Installed::new();
+        for location in [
+            format!("{}/{REPOSITORY}/releases", server.base),
+            format!("/{REPOSITORY}/releases"),
+        ] {
+            no_stable_release(&server, &location);
+            let error = release_for(&server, &fixture).unwrap_err();
+            assert!(
+                matches!(error, Error::NoRelease) && error.skipped(),
+                "{location}: {error}"
+            );
+        }
+        // Anything else is still not a release, and not "nothing published" either: another
+        // repository or origin, a query or trailing slash, or something only resembling a tag.
+        for location in [
+            format!("{}/{REPOSITORY}/releases/", server.base),
+            format!("{}/{REPOSITORY}/releases?q=1", server.base),
+            format!("{}/someone/else/releases", server.base),
+            format!("https://elsewhere.invalid/{REPOSITORY}/releases"),
+            format!("{}/{REPOSITORY}", server.base),
+            format!("{}/{REPOSITORY}/releases/tag/", server.base),
+            format!("{}/{REPOSITORY}/releases/tags/v1.2.0", server.base),
+            format!("{}/{REPOSITORY}/releases/tag/v1.2.0/x", server.base),
+        ] {
+            no_stable_release(&server, &location);
+            assert!(
+                matches!(release_for(&server, &fixture), Err(Error::Download { .. })),
+                "{location}"
+            );
+        }
     }
 
     #[test]

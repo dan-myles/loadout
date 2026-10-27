@@ -1,5 +1,6 @@
-//! Self-update (U9). `update` (U8) calls [`latest`] after its apply when the resolved
-//! `[update] cli` is true, and [`install`] when that finds a newer release.
+//! Self-update (U9). `loadout update` (also `loadout upgrade`) calls [`latest`] on the channel
+//! it was asked for, and [`install`] when that finds a newer release. Nothing else calls them:
+//! `loadout sync` and the scheduled job never update the CLI.
 //!
 //! Only a binary the install scripts put in place is ever replaced: the install record next to
 //! it must parse exactly and bind this platform's installer, this build's target, the running
@@ -67,7 +68,8 @@ pub enum Error {
 
 impl Error {
     /// Nothing was or will be replaced, by design or because another writer is busy with it.
-    /// `update` reports these and carries on; every other error is a failed self-update (exit 1).
+    /// `loadout update` reports these, exiting 0 when nothing is published and 4 otherwise; every
+    /// other error is a failed self-update (exit 1).
     pub fn skipped(&self) -> bool {
         matches!(
             self,
@@ -114,10 +116,22 @@ struct Install {
     background: Option<PathBuf>,
 }
 
-/// Whether a strictly newer release than the running CLI is published. `Ok(None)` means the
-/// running CLI is the newest release (or newer), so none is offered. Reads nothing but the
-/// running binary, its record, and one HTTPS redirect.
-pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
+/// Which published releases [`latest`] considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Stable releases only: the one GitHub's `releases/latest` names, which is never a
+    /// prerelease. A stable client never moves onto a prerelease.
+    Stable,
+    /// Every published release, prereleases (test builds) included: the highest version in the
+    /// releases list. Only `loadout update --prerelease` asks for it.
+    Prerelease,
+}
+
+/// Whether a strictly newer release than the running CLI is published on `channel`. `Ok(None)`
+/// means the running CLI is the newest such release (or newer), so none is offered. Reads
+/// nothing but the running binary, its record, and GitHub: one HTTPS redirect for
+/// [`Channel::Stable`], the public releases list for [`Channel::Prerelease`].
+pub fn latest(context: &Context, channel: Channel) -> Result<Option<Release>, Error> {
     let install = managed(context)?;
     let target = target().ok_or_else(not_a_release_build)?;
     find(
@@ -126,6 +140,7 @@ pub fn latest(context: &Context) -> Result<Option<Release>, Error> {
         target,
         running_version(),
         context.containment.clone(),
+        channel,
     )
 }
 
@@ -165,13 +180,13 @@ pub fn checks(context: &Context) -> Vec<Check> {
             let launcher = match (&install.background, cfg!(windows)) {
                 (Some(_), _) | (None, false) => String::new(),
                 (None, true) => {
-                    "; the next self-update also installs the background launcher".to_owned()
+                    "; the next `loadout update` also installs the background launcher".to_owned()
                 }
             };
             (
                 CheckStatus::Pass,
                 format!(
-                    "installed by {} at {}; self-update replaces it when [update] cli = true{launcher}",
+                    "installed by {} at {}; `loadout update` replaces it with a newer release{launcher}",
                     install.record.installer,
                     install.exe.display()
                 ),
@@ -407,22 +422,29 @@ fn find(
     target: &'static str,
     current: Version,
     containment: Containment,
+    channel: Channel,
 ) -> Result<Option<Release>, Error> {
-    let tag = match source
-        .latest()
-        .map_err(|detail| Error::Download { detail })?
-    {
+    let found = match channel {
+        Channel::Stable => source.latest(),
+        Channel::Prerelease => source.newest(),
+    };
+    let tag = match found.map_err(|detail| Error::Download { detail })? {
         Latest::None => return Err(Error::NoRelease),
         Latest::Tag(tag) => tag,
     };
-    let version = tag
-        .strip_prefix('v')
-        .and_then(|version| Version::parse(version).ok())
-        .filter(|version| version.pre.is_empty())
+    let version = download::tag_version(&tag)
+        .filter(|version| channel == Channel::Prerelease || version.pre.is_empty())
         .ok_or_else(|| Error::Verify {
-            detail: format!("the latest release tag {tag:?} is not vX.Y.Z"),
+            detail: match channel {
+                Channel::Stable => format!("the latest release tag {tag:?} is not vX.Y.Z"),
+                Channel::Prerelease => {
+                    format!("the newest release tag {tag:?} is not vX.Y.Z or vX.Y.Z-<prerelease>")
+                }
+            },
         })?;
-    if version <= current {
+    // Precedence, not `Ord`: a release differing only in build metadata is the same version and
+    // is never offered. The record and smoke checks still require the exact version text.
+    if !version.cmp_precedence(&current).is_gt() {
         return Ok(None);
     }
     Ok(Some(Release {

@@ -69,7 +69,6 @@ pub struct Resolved {
 pub struct Update {
     pub auto: bool,
     pub interval_minutes: u32,
-    pub cli: bool,
 }
 
 impl Default for Update {
@@ -77,7 +76,6 @@ impl Default for Update {
         Self {
             auto: true,
             interval_minutes: 60,
-            cli: true,
         }
     }
 }

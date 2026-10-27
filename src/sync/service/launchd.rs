@@ -21,7 +21,17 @@ pub(super) fn file(context: &Context) -> PathBuf {
 }
 
 pub(super) fn plist(exe: &str, service: &str, interval_minutes: u32) -> String {
-    let arguments = [exe, "update", "--background", "--service", service]
+    agent(exe, service, interval_minutes, "sync")
+}
+
+/// The plist older versions wrote: it runs the legacy `loadout update --background`, which
+/// still syncs, until `service install` writes [`plist`] in its place.
+pub(super) fn legacy_plist(exe: &str, service: &str, interval_minutes: u32) -> String {
+    agent(exe, service, interval_minutes, "update")
+}
+
+fn agent(exe: &str, service: &str, interval_minutes: u32, verb: &str) -> String {
+    let arguments = [exe, verb, "--background", "--service", service]
         .iter()
         .fold(String::new(), |mut out, arg| {
             let _ = writeln!(out, "\t\t<string>{}</string>", xml(arg));
@@ -154,6 +164,9 @@ pub(super) fn differs(
     let Some(actual) = super::definition(&file(context))? else {
         return Ok(None);
     };
+    if actual == legacy_plist(exe, service, interval_minutes) {
+        return Ok(Some(super::LEGACY.to_owned()));
+    }
     if actual != plist(exe, service, interval_minutes) {
         return Ok(Some(super::differs_from_record(&format!("{LABEL}.plist"))));
     }
@@ -173,9 +186,11 @@ pub(super) fn differs(
         }
         return Err(failed("launchctl", &args, &answer).to_string());
     }
-    let expected = [exe, "update", "--background", "--service", service];
+    let expected = [exe, "sync", "--background", "--service", service];
+    let legacy = [exe, "update", "--background", "--service", service];
     match arguments(&answer.stdout) {
         Some(loaded) if loaded == expected => Ok(None),
+        Some(loaded) if loaded == legacy => Ok(Some(super::LEGACY.to_owned())),
         Some(loaded) => Ok(Some(format!(
             "launchd has {LABEL} loaded with other arguments ({}); the job it runs is not this record's",
             loaded.join(" ")
@@ -252,7 +267,7 @@ mod tests {
             plist.contains(
                 "\t<array>\n\
                  \t\t<string>/Users/a &amp; b/&lt;bin&gt;/loadout</string>\n\
-                 \t\t<string>update</string>\n\
+                 \t\t<string>sync</string>\n\
                  \t\t<string>--background</string>\n\
                  \t\t<string>--service</string>\n\
                  \t\t<string>/Users/a &amp; b/state/service.toml</string>\n\
@@ -273,5 +288,15 @@ mod tests {
             "{plist}"
         );
         assert!(plist.ends_with("</dict>\n</plist>\n"), "{plist}");
+        let legacy = legacy_plist(
+            "/Users/a & b/<bin>/loadout",
+            "/Users/a & b/state/service.toml",
+            30,
+        );
+        assert_eq!(
+            legacy,
+            plist.replace("<string>sync</string>", "<string>update</string>"),
+            "the legacy plist differs only in the command it runs"
+        );
     }
 }

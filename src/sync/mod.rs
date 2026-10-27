@@ -1,5 +1,5 @@
 //! Loadout's own clone of the loadout, kept with the system `git` (architecture section 8), and
-//! the background update that keeps it current: the scheduled job (`service`) and the records a
+//! the background sync that keeps it current: the scheduled job (`service`) and the records a
 //! background run leaves for `status` and `doctor` (`background`).
 //!
 //! The clone lives at `<state>/loadout`. `clone` and `fetch` take the state lock by reference,
@@ -120,7 +120,7 @@ impl std::fmt::Display for Blocked {
     }
 }
 
-/// Loadout's own clone: `<state>/loadout`, the checkout `plan`, `apply`, and `update` read by
+/// Loadout's own clone: `<state>/loadout`, the checkout `plan`, `apply`, and `sync` read by
 /// default.
 pub fn checkout(context: &Context) -> PathBuf {
     context.state.join("loadout")
@@ -251,7 +251,7 @@ pub fn settings(context: &Context, checkout: &Path) -> Result<Update, Error> {
 }
 
 /// Why no new run may start on this machine yet, if one may not: the newest run didn't finish
-/// (or another run is going), or its journal can't be read. `update` checks this before it
+/// (or another run is going), or its journal can't be read. `sync` checks this before it
 /// fetches, so a blocked machine's clone doesn't move either.
 pub fn unfinished(context: &Context) -> Result<Option<String>, Error> {
     let runs = state::runs(context)?;
@@ -325,7 +325,7 @@ fn checkout_check(context: &Context) -> Check {
             name,
             CheckStatus::Warn,
             format!(
-                "{} from {origin}: {reason}; `loadout update` won't move it",
+                "{} from {origin}: {reason}; `loadout sync` won't move it",
                 path.display()
             ),
         ),

@@ -345,7 +345,7 @@ pub fn busy(context: &Context) -> Result<bool, Error> {
     }
 }
 
-/// One of the files the background update keeps in the state dir, next to the state and the
+/// One of the files the background sync keeps in the state dir, next to the state and the
 /// journals. Only these names can be written or read through [`write_private`] and
 /// [`read_private`], so no caller can reach any other path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,7 +382,7 @@ impl Private {
     }
 }
 
-/// Writes one of the background update's files atomically, readable only by the user, creating
+/// Writes one of the background sync's files atomically, readable only by the user, creating
 /// the state dir and its `background` folder (`0o700`) if needed. The same rules as the state
 /// file apply: every folder must be a real folder inside the canonical state dir.
 pub fn write_private(context: &Context, file: Private, bytes: &[u8]) -> Result<PathBuf, Error> {
@@ -409,7 +409,7 @@ fn private_dir(context: &Context, file: Private) -> Result<Option<PathBuf>, Erro
     }
 }
 
-/// Reads one of the background update's files: `None` when it, or the state dir, doesn't exist
+/// Reads one of the background sync's files: `None` when it, or the state dir, doesn't exist
 /// (only a missing path counts as absent; any other error is returned). It must be a regular
 /// file itself, never a link, even one to another file in the state dir, in folders that are
 /// real folders there.
@@ -433,7 +433,7 @@ pub fn read_private(context: &Context, file: Private) -> Result<Option<Vec<u8>>,
     disk::read_internal(&path, &context.state)
 }
 
-/// Removes one of the background update's files, if it is there. Its folders must pass the same
+/// Removes one of the background sync's files, if it is there. Its folders must pass the same
 /// checks as for a read, so a linked folder can't point the removal outside the state dir, and
 /// only a regular file is removed; a link or anything else in its place is refused and left
 /// alone.

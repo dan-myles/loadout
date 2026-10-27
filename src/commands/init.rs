@@ -22,7 +22,7 @@ pub struct Args {
     /// This machine's name in the loadout [default: the saved name, else one made from the hostname]
     #[arg(long, value_name = "NAME", value_parser = machine_name)]
     pub name: Option<String>,
-    /// Don't install the background update service, even when the loadout's [update] auto is true
+    /// Don't install the background sync service, even when the loadout's [update] auto is true
     #[arg(long)]
     pub no_service: bool,
 }
@@ -36,7 +36,7 @@ fn machine_name(value: &str) -> Result<String, String> {
 }
 
 /// Sets this machine up from a loadout: clones it into loadout's own checkout, saves the
-/// machine's name and the loadout's URL, applies it, and installs the background update service
+/// machine's name and the loadout's URL, applies it, and installs the background sync service
 /// unless the loadout's `[update] auto` is false or `--no-service` is given.
 ///
 /// The existing setup, a conflicting `--name`, and a URL carrying a password are refused before
@@ -53,7 +53,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = sync::checkout(context);
     if checkout.exists() {
         anyhow::bail!(
-            "loadout is already set up on this machine ({} exists); run `loadout update` to apply the latest loadout",
+            "loadout is already set up on this machine ({} exists); run `loadout sync` to apply the latest loadout",
             checkout.display()
         );
     }
@@ -97,7 +97,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let applied = show(apply::run_under_lock(context, &checkout, lock, options))?;
     if applied == Exit::Invalid {
         println!(
-            "background service not installed: fix the loadout, then run `loadout update` and `loadout service install`"
+            "background service not installed: fix the loadout, then run `loadout sync` and `loadout service install`"
         );
         return Ok(applied);
     }
@@ -183,7 +183,7 @@ fn service(args: &Args, context: &Context, checkout: &Path) -> anyhow::Result<Ex
                 println!("warning: {warning}");
             }
             println!(
-                "background service installed: {} runs `loadout update --background` every {} minutes",
+                "background service installed: {} runs `loadout sync --background` every {} minutes",
                 installed.exe.display(),
                 installed.interval_minutes
             );

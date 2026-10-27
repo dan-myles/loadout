@@ -1,8 +1,7 @@
 //! The whole command surface in one machine's life, through the real binary: `init` from a
-//! `file://` remote, then `plan`, `apply`, `status`, `update` after a new commit, and
+//! `file://` remote, then `plan`, `apply`, `status`, `sync` after a new commit, and
 //! `rollback`. Every run uses `LOADOUT_HOME` and `LOADOUT_STATE_DIR` in a temp dir, so nothing
-//! on the host is read or written, no scheduler is asked anything (`--no-service`), and
-//! self-update is refused by isolation before any network request.
+//! on the host is read or written and no scheduler is asked anything (`--no-service`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,7 +116,7 @@ const FILES: &str = "[loadout]\nversion = 1\n\
                      [files.notes]\nsource = \"files/notes\"\ntarget = \"~/notes.md\"\n";
 
 #[test]
-fn init_plan_apply_status_update_and_rollback_run_one_machine_end_to_end() {
+fn init_plan_apply_status_sync_and_rollback_run_one_machine_end_to_end() {
     let machine = Machine::new(&format!("{FILES}[update]\ncli = true\n"));
 
     let init = machine.run(&["init", &machine.url(), "--name", "box", "--no-service"]);
@@ -142,45 +141,50 @@ fn init_plan_apply_status_update_and_rollback_run_one_machine_end_to_end() {
     assert_eq!(code(&status), Some(0), "{}", text(&status));
 
     machine.push("second\n");
-    let update = machine.run(&["update"]);
-    assert_eq!(code(&update), Some(0), "{}", text(&update));
-    let shown = text(&update);
+    let sync = machine.run(&["sync"]);
+    assert_eq!(code(&sync), Some(0), "{}", text(&sync));
+    let shown = text(&sync);
     assert!(shown.contains("fetched: fast-forwarded"), "{shown}");
     assert_eq!(machine.notes().as_deref(), Some("second\n"));
-    // `[update] cli = true`: the self-update is attempted after the apply, and isolation skips
-    // it visibly without changing the exit.
-    assert!(
-        shown.contains("cli: not updated:") && shown.contains("LOADOUT_HOME"),
-        "{shown}"
-    );
+    // Sync never updates the CLI, whatever the loadout's legacy `[update] cli` says.
+    assert!(!self_update_line(&shown), "{shown}");
 
     let rollback = machine.run(&["rollback"]);
     assert_eq!(code(&rollback), Some(0), "{}", text(&rollback));
     assert_eq!(
         machine.notes().as_deref(),
         Some("first\n"),
-        "rolling back the update's run restores what init applied: {}",
+        "rolling back the sync's run restores what init applied: {}",
         text(&rollback)
     );
 }
 
-#[test]
-fn update_never_tries_to_update_the_cli_when_the_loadout_turns_it_off() {
-    let machine = Machine::new(&format!("{FILES}[update]\ncli = false\n"));
-    let init = machine.run(&["init", &machine.url(), "--name", "box", "--no-service"]);
-    assert_eq!(code(&init), Some(0), "{}", text(&init));
-
-    let update = machine.run(&["update"]);
-    assert_eq!(code(&update), Some(0), "{}", text(&update));
-    assert!(
-        !text(&update).contains("cli:"),
-        "no self-update line at all: {}",
-        text(&update)
-    );
+/// Whether output shows a CLI self-update step: the lines `loadout update` prints.
+fn self_update_line(text: &str) -> bool {
+    ["cli: updated", "cli: up to date", "cli: not updated"]
+        .iter()
+        .any(|line| text.contains(line))
 }
 
 #[test]
-fn a_blocked_update_applies_nothing_and_never_reaches_the_self_update() {
+fn sync_never_tries_to_update_the_cli_whatever_the_loadout_says() {
+    for cli in ["false", "true"] {
+        let machine = Machine::new(&format!("{FILES}[update]\ncli = {cli}\n"));
+        let init = machine.run(&["init", &machine.url(), "--name", "box", "--no-service"]);
+        assert_eq!(code(&init), Some(0), "{}", text(&init));
+
+        let sync = machine.run(&["sync"]);
+        assert_eq!(code(&sync), Some(0), "{}", text(&sync));
+        assert!(
+            !self_update_line(&text(&sync)),
+            "no self-update line at all with cli = {cli}: {}",
+            text(&sync)
+        );
+    }
+}
+
+#[test]
+fn a_blocked_sync_applies_nothing_and_never_updates_the_cli() {
     let machine = Machine::new(&format!("{FILES}[update]\ncli = true\n"));
     let init = machine.run(&["init", &machine.url(), "--name", "box", "--no-service"]);
     assert_eq!(code(&init), Some(0), "{}", text(&init));
@@ -188,10 +192,10 @@ fn a_blocked_update_applies_nothing_and_never_reaches_the_self_update() {
     fs::write(clone.join("files").join("notes"), "local edit\n").unwrap();
     machine.push("second\n");
 
-    let update = machine.run(&["update"]);
-    assert_eq!(code(&update), Some(4), "{}", text(&update));
-    assert!(text(&update).contains("blocked:"), "{}", text(&update));
-    assert!(!text(&update).contains("cli:"), "{}", text(&update));
+    let sync = machine.run(&["sync"]);
+    assert_eq!(code(&sync), Some(4), "{}", text(&sync));
+    assert!(text(&sync).contains("blocked:"), "{}", text(&sync));
+    assert!(!self_update_line(&text(&sync)), "{}", text(&sync));
     assert_eq!(
         machine.notes().as_deref(),
         Some("first\n"),

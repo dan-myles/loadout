@@ -189,6 +189,18 @@ impl Checker {
             );
         }
 
+        // Kept so existing loadouts stay valid; nothing reads it any more.
+        if layer
+            .update
+            .as_ref()
+            .is_some_and(|update| update.cli.is_some())
+        {
+            self.warn(
+                "update.cli",
+                "has no effect: the CLI is updated only when you run `loadout update`, never by sync or the scheduled job; remove it",
+            );
+        }
+
         if let Some(agents) = &layer.agents {
             self.agents(agents, global);
         }

@@ -12,7 +12,30 @@ use crate::process::{self, Captured, Containment};
 use super::Scope;
 use super::manager::{self, Invocation};
 
-fn query<I, S>(containment: &Containment, program: &Path, args: I) -> Result<Captured, String>
+/// Why a manager gave no answer. `Refused` is U8's refusal to start a query in a cancelled run,
+/// kept typed so callers can tell work the run didn't do from a query that failed; everything
+/// else, including the manager's own unexpected answers, is `Failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Unanswered {
+    Refused(String),
+    Failed(String),
+}
+
+impl From<String> for Unanswered {
+    fn from(detail: String) -> Self {
+        Unanswered::Failed(detail)
+    }
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::Refused(detail) | Unanswered::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+fn query<I, S>(containment: &Containment, program: &Path, args: I) -> Result<Captured, Unanswered>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -21,8 +44,13 @@ where
         program,
         args.into_iter().map(|arg| arg.as_ref().to_os_string()),
     );
-    process::query(&invocation, containment)
-        .map_err(|error| format!("{}: {error}", invocation.display()))
+    process::query(&invocation, containment).map_err(|error| {
+        let detail = format!("{}: {error}", invocation.display());
+        match error {
+            process::QueryError::Cancelled => Unanswered::Refused(detail),
+            _ => Unanswered::Failed(detail),
+        }
+    })
 }
 
 fn helper(tool: &str) -> Result<PathBuf, String> {
@@ -37,8 +65,8 @@ pub(super) fn installed(
     manager: Manager,
     program: &Path,
     package: &str,
-) -> Result<bool, String> {
-    match manager {
+) -> Result<bool, Unanswered> {
+    let answer = match manager {
         Manager::Brew => brew(
             &query(
                 containment,
@@ -139,8 +167,9 @@ pub(super) fn installed(
         ),
         Manager::Uv => uv(&query(containment, program, ["tool", "list"])?, package),
         Manager::Pipx => pipx(&query(containment, program, ["list", "--json"])?, package),
-        Manager::Go => go(containment, program, package),
-    }
+        Manager::Go => return go(containment, program, package),
+    };
+    answer.map_err(Unanswered::Failed)
 }
 
 const WINGET_NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
@@ -162,7 +191,7 @@ pub(super) fn eligibility(
     manager: Manager,
     program: &Path,
     package: &str,
-) -> Result<Eligibility, String> {
+) -> Result<Eligibility, Unanswered> {
     if let Some(scope) = manager::scope(manager) {
         return Ok(Eligibility::Scope(scope));
     }
@@ -183,7 +212,7 @@ pub(super) fn eligibility(
                 "--disable-interactivity",
             ],
         )
-        .and_then(|shown| winget_installer(&shown))
+        .and_then(|shown| winget_installer(&shown).map_err(Unanswered::Failed))
     };
     let user = show("user")?;
     if user.as_deref().is_some_and(per_user_installer) {
@@ -640,10 +669,10 @@ fn go_binary(package: &str) -> &str {
 
 /// Go keeps no list of installed tools, so this finds the binary `go install` would write and
 /// asks `go version -m` which package built it.
-fn go(containment: &Containment, program: &Path, package: &str) -> Result<bool, String> {
+fn go(containment: &Containment, program: &Path, package: &str) -> Result<bool, Unanswered> {
     let env = query(containment, program, ["env", "GOBIN", "GOPATH"])?;
     if !env.success() {
-        return Err(env.unexpected());
+        return Err(env.unexpected().into());
     }
     let mut lines = env.stdout.lines();
     let gobin = lines.next().unwrap_or_default().trim();
@@ -666,7 +695,7 @@ fn go(containment: &Containment, program: &Path, package: &str) -> Result<bool, 
     ));
     match std::fs::symlink_metadata(&binary) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("cannot inspect {}: {error}", binary.display())),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", binary.display()).into()),
         Ok(_) => {}
     }
     let built = query(
@@ -675,18 +704,16 @@ fn go(containment: &Containment, program: &Path, package: &str) -> Result<bool, 
         [OsStr::new("version"), OsStr::new("-m"), binary.as_os_str()],
     )?;
     if !built.success() {
-        return Err(built.unexpected());
+        return Err(built.unexpected().into());
     }
     match go_path(&built.stdout) {
         Some(path) if path == package => Ok(true),
         Some(path) => Err(format!(
             "{} was built from {path}, not {package}; loadout will not overwrite it",
             binary.display()
-        )),
-        None => Err(format!(
-            "go version -m {} names no package path",
-            binary.display()
-        )),
+        )
+        .into()),
+        None => Err(format!("go version -m {} names no package path", binary.display()).into()),
     }
 }
 
