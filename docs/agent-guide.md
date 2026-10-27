@@ -17,8 +17,11 @@ If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.m
 ## Ground rules
 
 1. **Read before you write.** `doctor`, `validate`, `plan`, and `status` never change the machine.
-   `apply`, `sync`, `init`, `rollback`, and `service install|uninstall` do. Show the user the plan
-   and get their go-ahead before running a command from the second group on their real home.
+   `apply`, `sync`, `init`, `rollback`, and `service install|uninstall` do. Before running one of
+   those on the user's real home, show them the plan, unless they have already authorized that
+   kind of run (for example "keep this machine synced", or a standing instruction). Within that
+   authorization, don't ask again each run. Do ask before anything the plan shows they may not
+   expect: a `replace` or `remove`, `--force` over their edits, or `--elevated`.
 2. **Rehearse in a sandbox.** Set `LOADOUT_HOME` and `LOADOUT_STATE_DIR` to a temporary directory
    and every path Loadout itself touches stays inside it ([section 4](#4-rehearse-in-a-sandbox)).
 3. **Branch on the exit code, then read the output.** 0, 1, 2, 3, and 4 mean different things
@@ -349,16 +352,34 @@ loadout sync --loadout path/to/checkout     # apply that checkout as it is; noth
 clone, then applies it under the same lock. It never passes `--force` or `--elevated`, so drift and
 system-wide programs are reported, not handled. Sync never updates the CLI.
 
-It applies nothing and exits 4 when the clone can't be fast-forwarded:
+It applies nothing and exits 4 when the clone can't be fast-forwarded. It leaves the clone's branch
+and working tree as they were, so nothing is lost yet.
 
-| Reason printed | Fix |
+| Reason printed | What it means |
 | --- | --- |
-| the clone has local changes | discard them: the clone isn't for editing |
-| a merge, rebase, cherry-pick, revert, or bisect is unfinished in the clone | abort it in the clone |
-| the clone has no branch checked out | check out the tracking branch |
-| the clone's branch doesn't track a branch of origin | set its upstream |
-| the clone has commits the remote doesn't have, and loadout never pushes | move any commit worth keeping to the loadout repo, then reset the clone's branch to its upstream |
-| the clone and the remote have both moved on, and loadout only fast-forwards | the same: the clone should only ever follow the remote |
+| the clone has local changes | someone edited or added files in the clone |
+| a merge, rebase, cherry-pick, revert, or bisect is unfinished in the clone | a Git operation was started there and not finished |
+| the clone has no branch checked out | the clone is on a detached `HEAD` |
+| the clone's branch doesn't track a branch of origin | the branch has no upstream |
+| the clone has commits the remote doesn't have, and loadout never pushes | someone committed in the clone |
+| the clone and the remote have both moved on, and loadout only fast-forwards | someone committed in the clone, and the remote has new commits too |
+
+The clone should only ever follow the remote, but whatever is in it may be the user's work. Before
+you discard, abort, or reset anything:
+
+1. **Inspect it.** In `<state>/loadout`, run `git status`, `git stash list`, and
+   `git log --oneline @{u}..HEAD` (or `git log --oneline -10` with no upstream). Find out what is
+   there and who made it.
+2. **Preserve it.** Save the user's edits and commits outside the clone first: push them to a
+   branch of their loadout repo, or export them with `git format-patch` or `git diff > file`, and
+   copy out any untracked files `git status` lists, since `git diff` leaves those out.
+   Changes they want kept belong in their own loadout repo, where `sync` will bring them back.
+3. **Confirm the removal.** Unless the user has already authorized discarding the clone's local
+   state, show them what will be lost and get their yes.
+4. **Only then restore the clone**: finish or abort the Git operation, check out the tracking
+   branch, set its upstream, or reset the branch to its upstream. Then run `loadout sync` again.
+
+Never abort someone's merge or rebase, discard their edits, or reset their commits blindly.
 
 With `--loadout DIR`, sync prints `not fetched: DIR is not loadout's own clone, so it is applied as
 it is` and never fetches, merges, or changes that checkout.
