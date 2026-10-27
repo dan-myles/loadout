@@ -1,0 +1,5 @@
+[variables]
+email = "ada@work.example"
+
+[mcp.github]
+agents = ["claude"]

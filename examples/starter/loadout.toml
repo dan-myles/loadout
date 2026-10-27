@@ -1,0 +1,32 @@
+# A small, complete loadout. Copy this folder into its own Git repository to start yours.
+[loadout]
+version = 1
+
+[machines.work-laptop]
+tags = ["work"]
+
+[variables]
+name = "Ada Lovelace"
+email = "ada@example.com"
+
+[agents]
+enabled = ["claude", "codex"]
+
+[files.gitconfig]
+source = "files/gitconfig.tmpl"
+target = "~/.gitconfig"
+
+[skills.code-review]
+source = "skills/code-review"
+
+[instructions.global]
+source = "instructions/AGENTS.md"
+
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = { env = "GITHUB_TOKEN", prefix = "Bearer " } }
+
+[programs.ripgrep]
+brew = "ripgrep"
+apt = "ripgrep"
+winget = "BurntSushi.ripgrep.MSVC"
