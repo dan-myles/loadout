@@ -12,10 +12,9 @@ on macOS, Linux, and Windows.
 
 </div>
 
-> [!IMPORTANT]
-> **Loadout is pre-release.** There is no stable release yet. The public releases are
-> test prereleases (`v0.1.1-test.N`), labelled not for use, so the default one-line install has
-> nothing to install. To use Loadout today, [build it from source](#install).
+> [!NOTE]
+> **`v0.1.1` is the first stable release.** Loadout is early, and its scope is deliberately narrow:
+> see [Status](#status).
 
 ## Why Loadout
 
@@ -52,29 +51,78 @@ own changes from yours.
 
 ## Install
 
-**From source** (works today). You need [rustup](https://rustup.rs), `git`, and the platform's C
-linker: Xcode Command Line Tools on macOS, Visual Studio Build Tools with the MSVC C++ tools on
-Windows, or the system `cc` and linker on Linux. The pinned toolchain in `rust-toolchain.toml`
-installs itself on first build.
+Each release has a prebuilt binary for six platforms. The install script picks the one for your OS
+and CPU, checks its SHA-256, and installs it for your user. It needs no admin rights.
+
+| OS | CPU | Script |
+| --- | --- | --- |
+| macOS | Apple Silicon (arm64) and Intel (x86_64) | `install.sh` |
+| Linux, any distribution (static musl build) | x86_64 and aarch64 | `install.sh` |
+| Windows | x64 and ARM64 | `install.ps1` |
+
+**macOS and Linux**, from any POSIX shell. Needs `curl` and `git`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
+```
+
+This installs `loadout` to `~/.local/bin`. If that folder isn't on your `PATH`, the script prints the
+line to add to your shell profile.
+
+**Windows**, in PowerShell 5.1 or 7. Needs `git`.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
+```
+
+This installs `loadout.exe` and its background launcher, `loadout-background.exe`, to
+`%LOCALAPPDATA%\Programs\loadout`. If that folder isn't on your `PATH`, the script prints the command
+that adds it.
+
+Then check the install:
+
+```sh
+loadout --version   # loadout 0.1.1
+loadout doctor
+```
+
+To install and set up a machine in one step, pass your loadout's URL. The rest of the arguments go
+to [`loadout init`](#quickstart).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh \
+  | sh -s -- https://github.com/you/your-loadout.git --name laptop
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1))) `
+  -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+```
+
+- **Pin a release** with `--version v0.1.1` (`sh -s -- --version v0.1.1`) or `-Version v0.1.1`.
+  The default is the latest stable release.
+- **Updates.** A binary installed this way is **managed**: `loadout update` (alias `upgrade`)
+  replaces it with a newer stable release, after checking that release's SHA-256.
+- **Existing installs.** The script replaces an existing binary only if this installer put it
+  there, and it never edits your shell profile or `PATH`.
+- Every check the scripts make is in [docs/releasing.md](docs/releasing.md#installing-from-a-release).
+
+**From source.** You need [rustup](https://rustup.rs), `git`, and the platform's C linker: Xcode
+Command Line Tools on macOS, Visual Studio Build Tools with the MSVC C++ tools on Windows, or the
+system `cc` and linker on Linux. The pinned toolchain in `rust-toolchain.toml` installs itself on
+first build.
 
 ```sh
 git clone https://github.com/dan-myles/loadout.git
 cd loadout
 cargo install --locked --path .
-loadout --version   # loadout 0.1.0
+loadout --version   # loadout 0.1.1
 loadout doctor
 ```
 
 This puts `loadout` and its Windows background launcher, `loadout-background`, in
 `~/.cargo/bin`. A source build is **unmanaged**: `loadout update` leaves it alone, so update it
 with `git pull` and the same `cargo install` command.
-
-**From a release** (once a stable release exists). `scripts/release/install.sh` and `install.ps1`
-download a release, verify its SHA-256, install it to `~/.local/bin` (or
-`%LOCALAPPDATA%\Programs\loadout`), and can run `loadout init` straight after. A binary installed
-this way is **managed**, and `loadout update` keeps it current. Until a stable release is
-published, the default install fails with an HTTP error and installs nothing. See
-[docs/releasing.md](docs/releasing.md#installing-from-a-release).
 
 ## Quickstart
 
@@ -245,7 +293,7 @@ system-wide managers need `--elevated`.
 
 ## Status
 
-Loadout `0.1.0` is under active development, and its scope is deliberately narrow.
+Loadout `0.1.1` is under active development, and its scope is deliberately narrow.
 
 - **Tested natively** at specific commits, under the real schedulers:
   - macOS 27 on Apple Silicon: the full acceptance harness and a legacy launchd migration;

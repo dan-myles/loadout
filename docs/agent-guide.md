@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.0` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.1` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -36,8 +36,26 @@ If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.m
 
 ## 1. Discover the CLI
 
+If `loadout` isn't on `PATH`, install the latest release for this OS and CPU (see the README's
+[Install](../README.md#install) section for platforms and options). macOS and Linux:
+
 ```sh
-loadout --version          # loadout 0.1.0
+curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
+```
+
+The binary goes to `~/.local/bin` (or `%LOCALAPPDATA%\Programs\loadout`). If that folder isn't on
+`PATH`, call it by its full path or add the folder as the script says. Without a loadout URL, the
+script writes only that folder (the binary, its install record, and a lock file). It applies
+nothing and installs no service, so it is safe to run before asking about the user's loadout.
+
+```sh
+loadout --version          # loadout 0.1.1
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go
@@ -544,11 +562,11 @@ scheduled job never update the CLI.
   matching install record. A binary built from source, installed with `cargo install`, or copied by
   hand is left alone: `update` prints `cli: not updated: <reason>` and exits 4.
   `loadout doctor`'s `cli install` check says which case applies.
-- Without `--prerelease`, only stable releases count. **There is no stable release yet**, so on a
-  managed binary `update` finds nothing to install and exits 0. A source build stops earlier, at
-  the unmanaged check above.
-- The public releases so far are test prereleases (`v0.1.1-test.N`), labelled not for use. Don't
-  move a user onto one unless they ask for a test build.
+- Without `--prerelease`, only stable releases count. The first is `v0.1.1`. A source build stops
+  earlier, at the unmanaged check above.
+- The `v0.1.1-test.N` prereleases are test builds, labelled not for use. Don't move a user onto
+  one unless they ask for a test build. `v0.1.1` ranks above all of them, so a managed test build
+  that runs `update` moves onto `v0.1.1`.
 - Exits: 0 when updated, already up to date, or nothing is published. 4 when this binary can't be
   updated (unmanaged, under `LOADOUT_HOME`, or another install holds the lock). 1 on any other
   error, which is never reported as up to date.
