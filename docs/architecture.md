@@ -1926,7 +1926,7 @@ Automatic updates are required, so they are on by default.
 | `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
 | `loadout init <URL> [--name NAME] [--no-service]`: clone, name the machine, apply, install the service; exit 3 invalid, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
 
-`plan`, `apply`, and `update` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
+`plan`, `apply`, and `sync` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
 at another checkout.
 
 ## 11. Module contracts
