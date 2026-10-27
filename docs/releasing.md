@@ -6,8 +6,9 @@ standard-library Python 3.8+.
 > [!NOTE]
 > Every GitHub workflow in this repository is disabled for now, so the triggers below describe
 > what each one does when it is enabled. Run the same gates locally with `scripts/ci/check.sh`
-> (see [CONTRIBUTING.md](../CONTRIBUTING.md#checks)). No stable release is published yet. The
-> public releases are test prereleases (`v0.1.1-test.N`), labelled not for use.
+> (see [CONTRIBUTING.md](../CONTRIBUTING.md#checks)). A release enables the Release workflow only
+> for its own tag, then disables it again ([Cutting a release](#cutting-a-release)). `v0.1.1` is the
+> first stable release. The `v0.1.1-test.N` prereleases are test builds, labelled not for use.
 
 ## CI (`.github/workflows/ci.yml`)
 
@@ -123,16 +124,21 @@ Triggers:
 ## Cutting a release
 
 1. Set `version` in `Cargo.toml`, commit it with the matching `Cargo.lock`, and merge to `main`.
-2. `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`
-3. Wait for the Release workflow to finish. Review the draft release on GitHub, then publish it.
-   Self-update and `releases/latest` only see published, non-prerelease releases. Don't untick
-   "pre-release" on a beta draft.
+2. While the workflows are disabled, enable only the Release workflow, and only after that merge,
+   so that no pull request starts it: `gh workflow enable release.yml`.
+3. `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`
+4. Wait for the Release workflow to finish. Download the draft's assets and check them against
+   `SHA256SUMS`, then publish the draft. Self-update and `releases/latest` only see published,
+   non-prerelease releases. Don't untick "pre-release" on a beta draft.
+5. Disable the Release workflow again, whether or not the run succeeded:
+   `gh workflow disable release.yml`.
 
 ## Installing from a release
 
 `scripts/release/install.sh` (macOS, Linux) and `scripts/release/install.ps1` (Windows) install a
-published release. Until one is published, the default download fails with an HTTP error and
-nothing is installed.
+published release: the latest stable one by default, or the tag given with `--version`/`-Version`.
+They support the six release targets above. Any other OS or CPU is refused before anything is
+downloaded.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
@@ -525,9 +531,8 @@ Checked on 2026-10-24 against the real crate at d8da3c0 (CI run 40060874531, Rel
 
 ### Not covered
 
-- The Release workflow on a real tag. Every workflow is disabled, and the test prereleases were
-  built and attached by hand.
-- A stable release. Until one exists, the default installs find nothing to install.
+- The Release workflow on a real tag, before `v0.1.1`. The test prereleases were built and
+  attached by hand; `v0.1.1` is the first release the Release workflow builds and drafts.
 - Execution on Intel macOS, aarch64 Linux, and aarch64 Windows beyond the 2026-10-24 runner smoke.
 - A full native suite at the final head `78e8fb6`, or a full Linux suite on test.3.
 - macOS as a standard (non-admin) user or without a GUI session.
