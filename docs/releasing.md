@@ -3,6 +3,12 @@
 Two workflows, one packaging script. Nothing here needs tools beyond rustup/cargo, git, and a
 standard-library Python 3.8+.
 
+> [!NOTE]
+> Every GitHub workflow in this repository is disabled for now, so the triggers below describe
+> what each one does when it is enabled. Run the same gates locally with `scripts/ci/check.sh`
+> (see [CONTRIBUTING.md](../CONTRIBUTING.md#checks)). No stable release is published yet. The
+> public releases are test prereleases (`v0.1.1-test.N`), labelled not for use.
+
 ## CI (`.github/workflows/ci.yml`)
 
 Runs on pushes to `main`, every pull request, and manual dispatch.
