@@ -199,6 +199,33 @@ def commit(message, edits):
     return git("rev-parse", "HEAD")
 
 
+class EmptyCommit(RuntimeError):
+    """(standing 246) a commit the harness meant as a change changed nothing."""
+
+
+def commit_checked(message, edits, cwd=None):
+    """commit() that refuses, with EmptyCommit naming the message, to make a commit that changes nothing
+    (the g9 failure: `C17 cli true` right after C16 had set it). Returns the new HEAD."""
+    cwd = WORK if cwd is None else cwd
+    for rel, text in edits.items():
+        path = cwd / rel
+        if text is None:
+            path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+    git("add", "-A", cwd=cwd)
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=cwd, stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=120)
+    if staged.returncode == 0:
+        raise EmptyCommit("%r changes nothing: its edits equal the committed files" % message)
+    if staged.returncode != 1:
+        raise RuntimeError("git diff --cached --quiet -> %d: %s" % (staged.returncode, staged.stderr))
+    git("commit", "-q", "-m", message, cwd=cwd)
+    git("push", "-q", "origin", "HEAD:main", cwd=cwd)
+    return git("rev-parse", "HEAD", cwd=cwd)
+
+
 def manifest(update=None, extra=""):
     """loadout.toml from the fixture with [update] fields replaced."""
     text = (WORK / "loadout.toml").read_text()
@@ -1683,12 +1710,33 @@ def g9_self_update(h):
             if binary.name.startswith("loadout-") and os.access(binary, os.X_OK):
                 h.run("G9-release-unit-tests-%s" % binary.name, [binary, "release::", "--test-threads", "2"], {0},
                       timeout=900)
+    g9_sync_cli_values(h, record, pristine)
+
+
+def g9_sync_cli_values(h, record, pristine):
+    """`sync` with the legacy `[update] cli` set each way applies the loadout and never updates the CLI.
+    (standing 246) every commit really changes the manifest (and hello.txt, so the apply is visible);
+    the 8c1d461 loop recommitted `cli = true` right after C16 and git refused the empty commit."""
     self_update_lines = ("cli: updated", "cli: up to date", "cli: not updated")
-    for value in ("true", "false"):
-        commit("C17 cli %s" % value, {"loadout.toml": manifest({"cli": value})})
-        h.run("G9-sync-never-self-updates-cli-" + value, [CLI, "sync"], {0}, asserts=lambda code, text: [
-            ("no self-update line", not any(line in text for line in self_update_lines)),
-            ("binary and record unchanged", (sha256(CLI), read(record)) == pristine)])
+    target = HOME / ".config/loadout-e2e/hello.txt"
+    # Start with the value the committed manifest does not have, so each commit changes it.
+    committed = read(WORK / "loadout.toml")
+    order = ("false", "true") if re.search(r"(?m)^cli = true$", committed) else ("true", "false")
+    for value in order:
+        text = manifest({"cli": value})
+        try:
+            rev = commit_checked("C17 cli %s" % value, {"loadout.toml": text, "files/hello.txt": hello("c17-" + value)})
+        except EmptyCommit as error:
+            h.record("G9-sync-never-self-updates-cli-" + value, "fail", detail="harness: %s" % error)
+            continue
+        h.run("G9-sync-never-self-updates-cli-" + value, [CLI, "sync"], {0}, asserts=lambda code, text_, rev=rev,
+              value=value, manifest_text=text: [
+            ("no self-update line", not any(line in text_ for line in self_update_lines)),
+            ("binary and record unchanged", (sha256(CLI), read(record)) == pristine),
+            ("clone at C17 cli %s" % value, head() == rev),
+            ("manifest names cli = %s" % value, read(CLONE / "loadout.toml") == manifest_text
+             and ("cli = %s" % value) in manifest_text),
+            ("loadout applied", read(target) == hello("c17-" + value))])
 
 
 def g10_std_elevation(h):
