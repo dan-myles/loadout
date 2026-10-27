@@ -429,8 +429,74 @@ Also not pinned:
 
 ## Validation status
 
+Each result below is bound to the commit it ran on. Together they are evidence for those commits
+and platforms, not a certification of every OS version, agent, or package manager. The final head
+of PR #16, `78e8fb6` (merged into `main` as `bf2e2f4`), changes only the acceptance harness on top of
+`2401701`. Its local gates pass (rustfmt, clippy, `cargo nextest` 816/816), but no native suite ran
+at `78e8fb6` itself.
+
+### Test prereleases and real-GitHub self-update (2026-10-26)
+
+Three test prereleases are published, each as a prerelease with `--latest=false` and titled not for
+use: `v0.1.1-test.1` (`35a93dd`), `v0.1.1-test.2` (`24af400`), and `v0.1.1-test.3` (`effdfb6`,
+`2401701` with only its version changed). Their annotated tags were pushed by hand, and
+`publish.sh` created each release as a draft and then published it. The Release workflow didn't
+run: the archives were built natively, for x86_64 Linux (musl), aarch64 macOS, and x86_64 Windows
+(MSVC), checked against their sidecars, and attached. Some were added to an already published
+release as new assets, and none replaced another. Every public download is byte-equal to the
+checked file.
+
+Against real github.com, with no stable release published (`releases/latest` redirects to the
+release list):
+
+| Platform | Result on test.3 |
+| --- | --- |
+| macOS 27.0, Apple Silicon | 54 pass, 0 fail |
+| Windows 11 x64, standard user | 28 pass, 0 fail, 6 observe |
+| Linux x86_64 VM | 122 pass, 0 fail, 4 observe |
+
+Each run covered:
+- a direct install of test.3 through `install.sh --version` or `install.ps1 -Version`. On Linux,
+  a plain `install.sh` exits 1 on the missing stable asset and installs nothing;
+- stable `update` and `upgrade` exiting 0 with "no stable loadout release is published yet",
+  binary and record unchanged;
+- test.1 → test.3, separately through `update --prerelease` and `upgrade --prerelease`, then
+  no-ops on both aliases.
+
+The observe rows are doctor runs and the stable call on test.1, which still exits 1 on the
+redirect. `2401701` (PR #16) fixed that redirect handling.
+
+### Native acceptance (2026-10-26 and 27)
+
+| Platform | Commit | What ran | Result |
+| --- | --- | --- | --- |
+| macOS 27.0, Apple Silicon, admin user with a GUI session | `37bd62d` | full acceptance harness, long timers and production deadlines, under real launchd | 149 pass, 1 fail, 18 observe, 1 not run |
+| | old CLI `61071c7` → `37bd62d` | genuine legacy launchd migration: an `update --background` job keeps syncing, then `service install` rewrites it to `sync` | 26 pass, 0 fail |
+| Windows 11 x64, test and standard users | `37bd62d` (GNU build, unmanaged) | core, Unicode and long cases under the real Scheduled Task | test user 140 pass, 1 fail, 19 observe, 1 not run; standard user 57 pass, 0 fail |
+| Linux x86_64 VM | `24af400` (test.2) | full long acceptance, three users, credited only for the groups the later fixes don't touch | did not pass as a whole (harness defects, below) |
+| | `effdfb6` (test.3) | targeted deadline, soft-cancel and sync-never-self-updates cases under real systemd, two users | 83 pass, 0 fail, 8 observe |
+
+- **The fails are harness defects, not product failures.** On macOS, the self-update group's new
+  loop committed an unchanged `cli = true`, and its two sync cases didn't run. `78e8fb6` fixes the
+  loop. An earlier real-GitHub run from test.1 to test.2 covered the same behavior outside the
+  harness, with real applied syncs for both values and the CLI left unchanged. On
+  Windows, a help-text regex didn't match clap's `[alias: upgrade]`, which the collected output
+  shows correctly. On Linux, the test.2 run's deadline, soft-cancel and self-update failures were
+  harness defects too, kept as recorded and uncredited. The targeted test.3 run covers those cases.
+- **Linux is composite evidence**: the unaffected groups of the test.2 run, the targeted test.3 run,
+  and the real-GitHub test.3 run. The full suite didn't run on test.3.
+- **Windows has no exact `2401701` replay.** Its only product change from `37bd62d` is the release
+  download, which the real-GitHub run covers on test.3.
+- **Proven on real schedulers:** the 55-minute soft cancel (exit 4, recorded as cancelled), the
+  60-minute deadline, scheduled runs with no manual kick, and least privilege for the Windows task.
+- **macOS limits:** only an admin user with a GUI session, on Apple Silicon. Intel, Gatekeeper and
+  quarantine, and NFD file names were not exercised. Under launchd, the legacy job's deprecation
+  note goes to `/dev/null`, so it can't be observed there.
+
+### Release pipeline smoke (2026-10-24, `d8da3c0`)
+
 Checked on 2026-10-24 against the real crate at d8da3c0 (CI run 40060874531, Release run
-40060874548):
+40060874548), while the workflows were still enabled:
 
 - CI on all six native runners: rustfmt, clippy `-D warnings`, and `cargo test`. Release-script
   unit tests on Python 3.8 and 3.12.
@@ -457,9 +523,11 @@ Checked on 2026-10-24 against the real crate at d8da3c0 (CI run 40060874531, Rel
 - `publish.sh` with a fake `gh`, run on the real 13 release files: stable and prerelease create, a
   draft is reclassified before upload, and a published release is refused with exit 1.
 
-Not covered:
+### Not covered
 
-- Real tag-push and draft-release behavior on GitHub, which needs a maintainer's tag.
-- macOS, aarch64 Linux and aarch64 Windows execution beyond the native runner smoke. No VMs for
-  those exist here.
-- Install, update, and apply behavior, which the later units own.
+- The Release workflow on a real tag. Every workflow is disabled, and the test prereleases were
+  built and attached by hand.
+- A stable release. Until one exists, the default installs find nothing to install.
+- Execution on Intel macOS, aarch64 Linux, and aarch64 Windows beyond the 2026-10-24 runner smoke.
+- A full native suite at the final head `78e8fb6`, or a full Linux suite on test.3.
+- macOS as a standard (non-admin) user or without a GUI session.

@@ -52,8 +52,10 @@ own changes from yours.
 
 ## Install
 
-**From source** (works today). You need [rustup](https://rustup.rs) and `git`. The pinned
-toolchain in `rust-toolchain.toml` installs itself on first build.
+**From source** (works today). You need [rustup](https://rustup.rs), `git`, and the platform's C
+linker: Xcode Command Line Tools on macOS, Visual Studio Build Tools with the MSVC C++ tools on
+Windows, or the system `cc` and linker on Linux. The pinned toolchain in `rust-toolchain.toml`
+installs itself on first build.
 
 ```sh
 git clone https://github.com/dan-myles/loadout.git
@@ -90,6 +92,9 @@ loadout validate .
 ```sh
 loadout plan --loadout .
 ```
+
+Example output (the paths, the machine name, and which programs are missing or need elevation
+depend on the machine):
 
 ```text
 plan for ada-desktop from /home/ada/my-loadout
@@ -242,11 +247,15 @@ system-wide managers need `--elevated`.
 
 Loadout `0.1.0` is under active development, and its scope is deliberately narrow.
 
-- **Tested:** unit and CLI integration tests on native Linux, macOS, and Windows runners, and
-  release-archive acceptance on Linux and Windows VMs, each at specific commits.
-  [docs/releasing.md](docs/releasing.md#validation-status) records those runs and what they don't
-  cover. macOS has no full native acceptance yet. This is evidence for those commits and
-  platforms, not a certification of every OS version, agent, or package manager.
+- **Tested natively** at specific commits, under the real schedulers:
+  - macOS 27 on Apple Silicon: the full acceptance harness and a legacy launchd migration;
+  - Windows 11 x64: a core, Unicode and long replay, plus MSVC builds;
+  - Linux x86_64: composite VM acceptance.
+
+  Self-update ran end to end against real GitHub releases on all three. Each platform's scope,
+  results, and limits are in [docs/releasing.md](docs/releasing.md#validation-status). This is
+  evidence for those commits and platforms, not a certification of every OS version, agent, or
+  package manager.
 - **Inferred:** Windows paths for Codex, Cursor, Pi, and Antigravity come from those agents'
   source, not from runs on Windows.
 - **Not in v1:** upgrading or uninstalling programs, version pinning, secrets from keychains or
