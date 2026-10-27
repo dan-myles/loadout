@@ -17,7 +17,16 @@ This page is for people and agents changing Loadout's own code. To *use* Loadout
 
 You need [rustup](https://rustup.rs), `git`, and Python 3.8+ for the release-script tests.
 `rust-toolchain.toml` pins Rust `1.98.1` with `rustfmt` and `clippy`, and rustup installs it on
-first use.
+first use. Rust links through the platform's own toolchain, so rustup alone isn't enough:
+
+| OS | Also needs |
+| --- | --- |
+| macOS | Xcode Command Line Tools (`xcode-select --install`) |
+| Windows | Visual Studio Build Tools with the MSVC C++ tools and a Windows SDK |
+| Linux | a C compiler and linker, such as `gcc` or `clang` (Ubuntu: `build-essential`) |
+
+Release builds have more requirements per target; see
+[docs/releasing.md](docs/releasing.md#building-a-release-archive-locally).
 
 ```sh
 cargo build
@@ -65,7 +74,7 @@ must stay inside a throwaway directory:
 - Tests check behavior through the public API or the real binary in such a directory, never
   through a developer's real `HOME`.
 - Real package installs, real schedulers, and native acceptance runs belong in a disposable VM
-  guest, through `tests/vm-acceptance/`.
+  guest or a dedicated test account, driven by `tests/vm-acceptance/`.
 
 ## Code rules
 
