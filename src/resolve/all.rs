@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::resolve;
-use crate::diagnostic::{Diagnostic, Diagnostics};
+use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::machine::Facts;
 use crate::manifest::{Condition, Layer, Loadout, OneOrMany, Scope};
 use crate::platform::{Arch, Os};
@@ -14,6 +14,9 @@ struct Machine {
     name: String,
     label: String,
     profiles: Vec<String>,
+    /// A profile alone whose tag a declared machine lists: it may be written only to go with
+    /// that machine's other tags, so a problem seen nowhere else stays a warning.
+    composed: bool,
 }
 
 struct Variant {
@@ -76,6 +79,17 @@ pub(super) fn check_all(loadout: &Loadout) -> Diagnostics {
 
     let mut out = Diagnostics::default();
     for (mut diagnostic, hits) in groups {
+        if diagnostic.severity == Severity::Error
+            && hits
+                .iter()
+                .all(|index| machines[variants[*index].machine].composed)
+        {
+            diagnostic.severity = Severity::Warning;
+            diagnostic.message = format!(
+                "{}; [machines] lists this tag with others, so only a machine that chooses it alone as a profile would fail",
+                diagnostic.message
+            );
+        }
         diagnostic.message = format!(
             "{} (on {})",
             diagnostic.message,
@@ -94,6 +108,7 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
             name: name.clone(),
             label: name.clone(),
             profiles: Vec::new(),
+            composed: false,
         })
         .collect();
     let named: BTreeSet<&String> = conditions(loadout)
@@ -105,6 +120,7 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
                 name: (*name).clone(),
                 label: format!("unlisted machine {name}"),
                 profiles: Vec::new(),
+                composed: false,
             });
         }
     }
@@ -123,6 +139,10 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
                 name: name.clone(),
                 label: format!("a machine with only profile {tag}"),
                 profiles: vec![tag.clone()],
+                composed: loadout
+                    .machines
+                    .values()
+                    .any(|entry| entry.tags.contains(tag)),
             });
         }
     }
@@ -130,6 +150,7 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
         name,
         label: "any other unlisted machine".to_owned(),
         profiles: Vec::new(),
+        composed: false,
     });
     machines
 }

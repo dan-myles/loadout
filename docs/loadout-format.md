@@ -410,7 +410,9 @@ on macOS, Linux, and Windows, on both architectures, and checks:
 - every template parses
 
 Each problem is reported once, with the machines and OSes it affects, such as `(on a machine with
-only profile work: windows)`. Validate doesn't try every combination of profiles, so two profiles
+only profile work: windows)`. A problem that appears only on a profile alone, for a tag `[machines]` lists together with others,
+is a warning rather than an error, since that tag may only patch its siblings. Validate doesn't try
+every combination of profiles, so two profiles
 that clash only together show up in that machine's `plan`. Warnings (such as a plaintext
 credential) don't fail validation.
 [`tests/foundation/invalid/`](../tests/foundation/invalid) collects the mistakes validate catches.

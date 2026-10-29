@@ -938,6 +938,38 @@ fn file_targets_collide_with_the_paths_an_enabled_custom_agent_receives() {
 }
 
 #[test]
+fn a_declared_tag_written_only_to_patch_its_sibling_stays_valid() {
+    let tree = tree(&[
+        (
+            "loadout.toml",
+            &root("[machines.laptop]\ntags = [\"work\", \"work-mac\"]\n"),
+        ),
+        (
+            "tags/work.toml",
+            "[files.notes]\nsource = \"f\"\ntarget = \"~/notes\"\n",
+        ),
+        (
+            "tags/work-mac.toml",
+            "[files.notes]\ntarget = \"~/mac-notes\"\n",
+        ),
+        ("tags/solo.toml", "[files.half]\ntarget = \"~/half\"\n"),
+    ]);
+    let all = tree.all();
+    assert!(
+        all.lines().any(
+            |line| line.starts_with("tags/work-mac.toml: warning: files.notes:")
+                && line.contains("only a machine that chooses it alone")
+        ),
+        "{all}"
+    );
+    assert!(
+        all.lines()
+            .any(|line| line.starts_with("tags/solo.toml: error: files.half:")),
+        "a profile no machine declares must work alone: {all}"
+    );
+}
+
+#[test]
 fn check_all_names_each_machine_and_os_a_problem_appears_on() {
     let tree = tree(&[
         (

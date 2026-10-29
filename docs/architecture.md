@@ -434,7 +434,8 @@ per-write checks in section 6.
 `check_all` resolves every listed machine, every unlisted machine name that a `when.machine`
 uses, one unlisted machine per tag layer with only that profile chosen (labelled `a machine with
 only profile <tag>`), and one other unlisted machine with none. Combinations of profiles aren't
-enumerated. Each runs on macOS, Linux, and Windows, on both
+enumerated. An error seen only on single-profile machines whose tag some `[machines]` entry lists is
+reported as a warning, so a loadout with tags written to compose stays valid. Each runs on macOS, Linux, and Windows, on both
 architectures, and on Linux both with no distro and with each distro a `when.distro` names.
 Facts are synthetic. Each diagnostic is reported once, with its machines and OSes appended, for
 example `(on studio: linux; tower: macos, windows)`.
