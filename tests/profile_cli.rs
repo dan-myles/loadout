@@ -138,11 +138,17 @@ fn an_undeclared_machine_gets_its_chosen_profile_on_init_and_every_later_run() {
     let machine = Machine::new("");
     let init = machine.init(&["--profile", "development"]);
     assert_code(&init, 0);
-    assert!(text(&init).contains("profiles: development"), "{}", text(&init));
+    assert!(
+        text(&init).contains("profiles: development"),
+        "{}",
+        text(&init)
+    );
     assert!(machine.has("base.md") && machine.has("development.md"));
     assert!(!machine.has("work.md"), "only the chosen profile applies");
     assert!(
-        machine.machine_file().contains("profiles = [\"development\"]"),
+        machine
+            .machine_file()
+            .contains("profiles = [\"development\"]"),
         "{}",
         machine.machine_file()
     );
@@ -243,7 +249,10 @@ fn a_chosen_profile_the_loadout_drops_blocks_the_sync_instead_of_removing_its_it
     let machine = Machine::new("");
     assert_code(&machine.init(&["--profile", "development"]), 0);
     git(&machine.work, &["rm", "--quiet", "tags/development.toml"]);
-    git(&machine.work, &["commit", "--quiet", "-m", "drop development"]);
+    git(
+        &machine.work,
+        &["commit", "--quiet", "-m", "drop development"],
+    );
     git(&machine.work, &["push", "--quiet", "origin", "main"]);
 
     let sync = machine.run(&["sync"]);

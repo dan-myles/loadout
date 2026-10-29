@@ -60,7 +60,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = sync::checkout(context);
     if checkout.exists() {
         anyhow::bail!(
-            "loadout is already set up on this machine ({} exists); run `loadout sync` to apply the latest loadout",
+            "loadout is already set up on this machine ({} exists); run `loadout sync` to apply the latest loadout, or `loadout profile set` to change this machine's profiles",
             checkout.display()
         );
     }
@@ -97,40 +97,34 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         (None, Some(saved)) => saved,
         (None, None) => choose(context, loadout.as_ref(), interactive)?,
     };
-    let available = loadout.as_ref().map(Loadout::profiles);
-    let profiles = match &available {
-        Some(available) if args.profiles.is_empty() && interactive && !available.is_empty() => {
-            let declared = loadout
-                .as_ref()
-                .and_then(|loadout| loadout.machines.get(&name))
-                .map(|entry| entry.tags.clone())
-                .unwrap_or_default();
-            profile::ask(
-                available,
-                &[],
-                &declared,
-                &mut io::stdin().lock(),
-                &mut io::stdout(),
-            )?
-        }
-        _ => args.profiles.clone(),
+    let available = loadout.as_ref().map(Loadout::profiles).unwrap_or_default();
+    let declared = loadout
+        .as_ref()
+        .and_then(|loadout| loadout.machines.get(&name))
+        .map(|entry| entry.tags.clone())
+        .unwrap_or_default();
+    let profiles = if args.profiles.is_empty() && interactive && !available.is_empty() {
+        profile::ask(
+            &available,
+            &[],
+            &declared,
+            &mut io::stdin().lock(),
+            &mut io::stdout(),
+        )?
+    } else {
+        args.profiles.clone()
     };
-    let unknown: Vec<&String> = match &available {
-        Some(available) => profiles
-            .iter()
-            .filter(|profile| !available.contains(profile))
-            .collect(),
-        None => Vec::new(),
-    };
+    // An invalid loadout lists no profiles; its apply below reports why, so nothing is refused here.
+    let unknown: Vec<&String> = profiles
+        .iter()
+        .filter(|profile| loadout.is_some() && !available.contains(profile))
+        .collect();
     if !unknown.is_empty() {
         machine::save(context, &name, &args.url, &[])?;
         for profile in unknown {
             println!("no profile {profile} in this loadout (no tags/{profile}.toml)");
         }
-        println!(
-            "{}",
-            profile::offered(available.as_deref().unwrap_or_default())
-        );
+        println!("{}", profile::offered(&available));
         println!(
             "nothing applied: run `loadout profile set PROFILE...`, then `loadout sync` and `loadout service install`"
         );
@@ -138,16 +132,18 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     }
     machine::save(context, &name, &args.url, &profiles)?;
     println!("this machine is {name}");
-    if profiles.is_empty() {
-        match &available {
-            Some(available) if !available.is_empty() => println!(
-                "no profiles chosen, so this machine gets the global and OS layers only; `loadout profile choose` picks some later ({})",
-                profile::offered(available)
-            ),
-            _ => {}
-        }
-    } else {
+    if !profiles.is_empty() {
         println!("profiles: {}", profiles.join(", "));
+    } else if !available.is_empty() {
+        let gets = if declared.is_empty() {
+            "the global and OS layers only".to_owned()
+        } else {
+            format!("its [machines] tags ({})", declared.join(", "))
+        };
+        println!(
+            "no profiles chosen, so this machine gets {gets}; `loadout profile set PROFILE...` or `loadout profile choose` adds some later ({})",
+            profile::offered(&available)
+        );
     }
 
     let options = Options {

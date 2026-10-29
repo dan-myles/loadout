@@ -445,7 +445,11 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(context.machine_file()).unwrap(), text);
 
-        fs::write(context.machine_file(), "name = \"box\"\nprofiles = [\"../x\"]\n").unwrap();
+        fs::write(
+            context.machine_file(),
+            "name = \"box\"\nprofiles = [\"../x\"]\n",
+        )
+        .unwrap();
         assert!(matches!(profiles(&context), Err(Error::Invalid { .. })));
         assert!(matches!(name(&context), Err(Error::Invalid { .. })));
     }
