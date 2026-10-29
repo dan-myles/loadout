@@ -34,6 +34,8 @@ pub struct Facts {
     pub distro: Option<String>,
     pub arch: Arch,
     pub home: PathBuf,
+    /// The profiles (tag layers) chosen on this machine and saved in `machine.toml`.
+    pub profiles: Vec<String>,
 }
 
 pub fn detect(context: &Context) -> Result<Facts, Error> {
@@ -42,12 +44,18 @@ pub fn detect(context: &Context) -> Result<Facts, Error> {
         Os::Linux => distro(Path::new("/etc/os-release")),
         Os::Macos | Os::Windows => None,
     };
+    let saved = read(context)?;
+    let (name, profiles) = match saved {
+        Some(file) => (file.name, file.profiles),
+        None => (hostname(), Vec::new()),
+    };
     Ok(Facts {
-        name: name(context)?.name,
+        name,
         os,
         distro,
         arch: Arch::current()?,
         home: context.home.clone(),
+        profiles,
     })
 }
 
@@ -63,42 +71,79 @@ pub struct Name {
     pub source: NameSource,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MachineFile {
     name: String,
-    #[expect(dead_code, reason = "written by init; read by sync")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
+    // Left out when empty, so a machine with no profiles keeps a file older versions can read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct SavedFile<'a> {
-    name: &'a str,
-    remote: &'a str,
+/// Saves this machine's name, its loadout's URL, and its chosen profiles in
+/// `<state>/machine.toml` (init, U9). Once saved, the name no longer follows the hostname. The
+/// state dir must already exist (init takes the state lock first, which creates it). The file is
+/// written to a new name in the state dir, synced, and renamed over the old one, so a crash leaves
+/// the old file or the new one. Like [`name`], it refuses an existing `machine.toml` that is a
+/// link or not a regular file, and it refuses a remote that carries a password, because loadout
+/// stores no credentials.
+pub fn save(context: &Context, name: &str, remote: &str, profiles: &[String]) -> Result<(), Error> {
+    write(
+        context,
+        MachineFile {
+            name: name.to_owned(),
+            remote: Some(remote.to_owned()),
+            profiles: profiles.to_vec(),
+        },
+    )
 }
 
-/// Saves this machine's name and its loadout's URL in `<state>/machine.toml` (init, U9). Once
-/// saved, the name no longer follows the hostname. The state dir must already exist (init takes
-/// the state lock first, which creates it). The file is written to a new name in the state dir,
-/// synced, and renamed over the old one, so a crash leaves the old file or the new one. Like
-/// [`name`], it refuses an existing `machine.toml` that is a link or not a regular file, and it
-/// refuses a remote that carries a password, because loadout stores no credentials.
-pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), Error> {
+/// Replaces this machine's chosen profiles and keeps its saved name and URL. A machine with no
+/// saved name gets the hostname's saved with them, as `init` would.
+pub fn save_profiles(context: &Context, profiles: &[String]) -> Result<(), Error> {
+    let file = match read(context)? {
+        Some(file) => MachineFile {
+            profiles: profiles.to_vec(),
+            ..file
+        },
+        None => MachineFile {
+            name: hostname(),
+            remote: None,
+            profiles: profiles.to_vec(),
+        },
+    };
+    write(context, file)
+}
+
+/// The profiles saved on this machine, in the order they were chosen; none before any are saved.
+pub fn profiles(context: &Context) -> Result<Vec<String>, Error> {
+    Ok(read(context)?.map(|file| file.profiles).unwrap_or_default())
+}
+
+fn write(context: &Context, mut file: MachineFile) -> Result<(), Error> {
     let path = context.machine_file();
     let invalid = |message: &str| Error::Invalid {
         path: path.clone(),
         message: message.to_owned(),
     };
-    if !crate::id::is_id(name) {
+    if !crate::id::is_id(&file.name) {
         return Err(invalid(&format!(
-            "machine name {name:?} must be lowercase letters, digits, - or _"
+            "machine name {:?} must be lowercase letters, digits, - or _",
+            file.name
         )));
     }
-    if has_password(remote) {
+    if file.remote.as_deref().is_some_and(has_password) {
         return Err(invalid(
             "the loadout URL carries a password; loadout stores no credentials, so use your Git credential helper or SSH keys",
         ));
     }
+    if let Some(problem) = profile_problem(&file.profiles) {
+        return Err(invalid(&problem));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    file.profiles.retain(|profile| seen.insert(profile.clone()));
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Err(invalid("must be a regular file, not a link or folder")),
@@ -112,12 +157,19 @@ pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), Error> {
     if !state.is_dir() {
         return Err(invalid("the state dir is not a folder"));
     }
-    let text = toml::to_string(&SavedFile { name, remote })
-        .map_err(|error| invalid(&format!("cannot encode it: {error}")))?;
+    let text =
+        toml::to_string(&file).map_err(|error| invalid(&format!("cannot encode it: {error}")))?;
     write_new(&state, &state.join("machine.toml"), text.as_bytes()).map_err(|source| Error::Write {
         path: path.clone(),
         source,
     })
+}
+
+fn profile_problem(profiles: &[String]) -> Option<String> {
+    profiles
+        .iter()
+        .find(|profile| !crate::id::is_id(profile))
+        .map(|profile| format!("profile {profile:?} must be lowercase letters, digits, - or _"))
 }
 
 /// Whether a URL's authority names a password, as in `https://user:token@host/repo`.
@@ -154,14 +206,26 @@ fn write_new(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn name(context: &Context) -> Result<Name, Error> {
+    Ok(match read(context)? {
+        Some(file) => Name {
+            name: file.name,
+            source: NameSource::Saved,
+        },
+        None => Name {
+            name: hostname(),
+            source: NameSource::Hostname,
+        },
+    })
+}
+
+fn hostname() -> String {
+    from_hostname(&gethostname::gethostname().to_string_lossy())
+}
+
+fn read(context: &Context) -> Result<Option<MachineFile>, Error> {
     let path = context.machine_file();
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Name {
-                name: from_hostname(&gethostname::gethostname().to_string_lossy()),
-                source: NameSource::Hostname,
-            });
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(Error::Read { path, source }),
         Ok(_) => {}
     }
@@ -205,10 +269,10 @@ pub fn name(context: &Context) -> Result<Name, Error> {
             ),
         });
     }
-    Ok(Name {
-        name: file.name,
-        source: NameSource::Saved,
-    })
+    if let Some(message) = profile_problem(&file.profiles) {
+        return Err(Error::Invalid { path, message });
+    }
+    Ok(Some(file))
 }
 
 pub fn from_hostname(hostname: &str) -> String {
@@ -301,7 +365,13 @@ mod tests {
             Some("/home/a".into()),
         )
         .unwrap();
-        save(&context, "work-laptop", "git@github.com:me/loadout.git").unwrap();
+        save(
+            &context,
+            "work-laptop",
+            "git@github.com:me/loadout.git",
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             name(&context).unwrap(),
             Name {
@@ -314,7 +384,13 @@ mod tests {
             text.contains("remote = \"git@github.com:me/loadout.git\""),
             "{text}"
         );
-        save(&context, "work-laptop", "https://github.com/me/loadout.git").unwrap();
+        save(
+            &context,
+            "work-laptop",
+            "https://github.com/me/loadout.git",
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             fs::read_dir(dir.path()).unwrap().count(),
             1,
@@ -327,13 +403,51 @@ mod tests {
             ("work", "https://me:token@github.com/me/loadout.git"),
         ] {
             assert!(matches!(
-                save(&context, name_value, remote),
+                save(&context, name_value, remote, &[]),
                 Err(Error::Invalid { .. })
             ));
         }
         assert_eq!(fs::read(context.machine_file()).unwrap(), before);
         assert!(!has_password("https://me@github.com/me/loadout.git"));
         assert!(!has_password("git@github.com:me/loadout.git"));
+    }
+
+    #[test]
+    fn profiles_are_saved_with_the_name_and_remote_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::resolve(
+            Os::Linux,
+            |name| (name == "LOADOUT_STATE_DIR").then(|| dir.path().as_os_str().to_owned()),
+            Some("/home/a".into()),
+        )
+        .unwrap();
+        assert!(profiles(&context).unwrap().is_empty());
+        save_profiles(&context, &["work".to_owned()]).unwrap();
+        assert_eq!(name(&context).unwrap().source, NameSource::Saved);
+
+        save(&context, "box", "https://x/y.git", &[]).unwrap();
+        assert!(
+            !fs::read_to_string(context.machine_file())
+                .unwrap()
+                .contains("profiles"),
+            "a machine with no profiles keeps the file older versions read"
+        );
+        let chosen = ["development", "work", "development"].map(str::to_owned);
+        save_profiles(&context, &chosen).unwrap();
+        assert_eq!(profiles(&context).unwrap(), ["development", "work"]);
+        let text = fs::read_to_string(context.machine_file()).unwrap();
+        assert!(text.contains("name = \"box\""), "{text}");
+        assert!(text.contains("remote = \"https://x/y.git\""), "{text}");
+
+        assert!(matches!(
+            save_profiles(&context, &["Bad Profile".to_owned()]),
+            Err(Error::Invalid { .. })
+        ));
+        assert_eq!(fs::read_to_string(context.machine_file()).unwrap(), text);
+
+        fs::write(context.machine_file(), "name = \"box\"\nprofiles = [\"../x\"]\n").unwrap();
+        assert!(matches!(profiles(&context), Err(Error::Invalid { .. })));
+        assert!(matches!(name(&context), Err(Error::Invalid { .. })));
     }
 
     #[cfg(unix)]
@@ -351,7 +465,7 @@ mod tests {
         fs::write(&target, "secret").unwrap();
         std::os::unix::fs::symlink(&target, context.machine_file()).unwrap();
         assert!(matches!(
-            save(&context, "box", "https://x/y.git"),
+            save(&context, "box", "https://x/y.git", &[]),
             Err(Error::Invalid { .. })
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "secret");

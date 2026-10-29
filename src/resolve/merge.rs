@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{Update, report};
+
+/// Where a profile problem points: the machine's own saved selection, not the loadout.
+const MACHINE_FILE: &str = "machine.toml";
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::machine::Facts;
 use crate::manifest::{
@@ -356,12 +359,28 @@ fn layers<'a>(
         .into_iter()
         .flatten()
         .collect();
-    let Some(entry) = loadout.machines.get(&facts.name) else {
-        return layers;
-    };
-    for tag in &entry.tags {
+    let listed = loadout
+        .machines
+        .get(&facts.name)
+        .into_iter()
+        .flat_map(|entry| &entry.tags)
+        .map(|tag| (tag, false));
+    let chosen = facts.profiles.iter().map(|profile| (profile, true));
+    for (tag, chosen) in listed.chain(chosen) {
+        if tags.contains(tag) {
+            continue;
+        }
         match find(Scope::Tag(tag.clone())) {
-            Some(file) => layers.push(file),
+            Some(layer) => layers.push(layer),
+            None if chosen => report(
+                diagnostics,
+                Severity::Error,
+                Some(Path::new(MACHINE_FILE)),
+                "profiles",
+                format!(
+                    "this machine uses profile {tag:?}, but the loadout has no tags/{tag}.toml; `loadout profile list` shows the profiles it has and `loadout profile set` changes this machine's"
+                ),
+            ),
             None => report(
                 diagnostics,
                 Severity::Error,

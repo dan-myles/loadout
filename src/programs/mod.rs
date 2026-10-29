@@ -1013,6 +1013,7 @@ mod tests {
             distro: None,
             arch: crate::platform::Arch::X86_64,
             home: sandbox.into(),
+            profiles: Vec::new(),
         };
         let programs = BTreeMap::from([
             ("ripgrep".to_owned(), program(&[(Manager::Apt, "ripgrep")])),
@@ -1287,6 +1288,7 @@ mod tests {
                 distro: None,
                 arch: crate::platform::Arch::X86_64,
                 home,
+                profiles: Vec::new(),
             };
             let programs = BTreeMap::from([
                 ("a".to_owned(), super::program(&[(Manager::Cargo, "a")])),

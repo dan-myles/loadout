@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::resolve;
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::machine::Facts;
-use crate::manifest::{Condition, Layer, Loadout, OneOrMany};
+use crate::manifest::{Condition, Layer, Loadout, OneOrMany, Scope};
 use crate::platform::{Arch, Os};
 
 const ARCHES: [Arch; 2] = [Arch::X86_64, Arch::Aarch64];
@@ -13,6 +13,7 @@ const UNLISTED: &str = "unlisted";
 struct Machine {
     name: String,
     label: String,
+    profiles: Vec<String>,
 }
 
 struct Variant {
@@ -59,6 +60,7 @@ pub(super) fn check_all(loadout: &Loadout) -> Diagnostics {
             distro: variant.distro.clone(),
             arch: variant.arch,
             home: PathBuf::from("~"),
+            profiles: machines[variant.machine].profiles.clone(),
         };
         let diagnostics = match resolve(loadout, &facts) {
             Ok((_, warnings)) => warnings,
@@ -91,6 +93,7 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
         .map(|name| Machine {
             name: name.clone(),
             label: name.clone(),
+            profiles: Vec::new(),
         })
         .collect();
     let named: BTreeSet<&String> = conditions(loadout)
@@ -101,6 +104,7 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
             machines.push(Machine {
                 name: (*name).clone(),
                 label: format!("unlisted machine {name}"),
+                profiles: Vec::new(),
             });
         }
     }
@@ -113,9 +117,19 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
         })
         .find(|name| !taken(name))
         .expect("more candidates than taken names");
+    for file in &loadout.layers {
+        if let Scope::Tag(tag) = &file.scope {
+            machines.push(Machine {
+                name: name.clone(),
+                label: format!("a machine with only profile {tag}"),
+                profiles: vec![tag.clone()],
+            });
+        }
+    }
     machines.push(Machine {
         name,
         label: "any other unlisted machine".to_owned(),
+        profiles: Vec::new(),
     });
     machines
 }

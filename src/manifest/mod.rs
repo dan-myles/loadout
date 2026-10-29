@@ -95,6 +95,17 @@ impl Loadout {
             .map(|file| &file.layer)
     }
 
+    /// The profiles a machine can choose: the loadout's tag layers, by name.
+    pub fn profiles(&self) -> Vec<String> {
+        self.layers
+            .iter()
+            .filter_map(|file| match &file.scope {
+                Scope::Tag(tag) => Some(tag.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn global(&self) -> &Layer {
         &self.layers[0].layer
     }

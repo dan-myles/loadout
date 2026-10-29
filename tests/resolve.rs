@@ -56,6 +56,7 @@ fn facts(name: &str, os: Os) -> Facts {
         distro: None,
         arch: Arch::X86_64,
         home: PathBuf::from("/home/synthetic"),
+        profiles: Vec::new(),
     }
 }
 
@@ -177,6 +178,58 @@ fn an_unlisted_machine_gets_only_the_global_and_os_layers() {
     assert_eq!(stranger.variables["who"], text("windows"));
     assert!(stranger.programs.is_empty());
     assert_eq!(tree.clean("box", Os::Windows).variables["who"], text("box"));
+}
+
+#[test]
+fn chosen_profiles_follow_the_declared_tags_and_the_machine_layer_still_wins() {
+    let tree = tree(&[
+        (
+            "loadout.toml",
+            &root("[machines.box]\ntags = [\"work\"]\n[variables]\nv = \"global\"\n"),
+        ),
+        ("tags/work.toml", "[variables]\nv = \"work\"\nwork = true\n"),
+        ("tags/dev.toml", "[variables]\nv = \"dev\"\ndev = true\n"),
+        ("tags/games.toml", "[variables]\nv = \"games\"\n"),
+        ("machines/box.toml", "[variables]\nmine = \"box\"\n"),
+    ]);
+    let chosen = |name: &str, profiles: &[&str]| {
+        let facts = Facts {
+            profiles: strings(profiles),
+            ..facts(name, Os::Linux)
+        };
+        resolve::resolve(&tree.loadout, &facts).map(|(resolved, _)| resolved)
+    };
+
+    let stranger = chosen("stranger", &["dev"]).unwrap();
+    assert_eq!(stranger.tags, strings(&["dev"]));
+    assert_eq!(stranger.variables["v"], text("dev"));
+    assert!(!stranger.variables.contains_key("work"));
+
+    let ordered = chosen("stranger", &["games", "dev"]).unwrap();
+    assert_eq!(
+        ordered.variables["v"],
+        text("dev"),
+        "the profile chosen later wins"
+    );
+
+    let declared = chosen("box", &["dev", "work"]).unwrap();
+    assert_eq!(
+        declared.tags,
+        strings(&["work", "dev"]),
+        "declared tags come first and a profile already declared is not applied twice"
+    );
+    assert_eq!(declared.variables["v"], text("dev"));
+    assert_eq!(declared.variables["work"], Variable::Boolean(true));
+    assert_eq!(declared.variables["mine"], text("box"));
+
+    let missing = chosen("stranger", &["gone"]).unwrap_err();
+    assert!(
+        lines(&missing).contains(
+            "machine.toml: error: profiles: this machine uses profile \"gone\", but the loadout has no tags/gone.toml"
+        ),
+        "{}",
+        lines(&missing)
+    );
 }
 
 #[test]
@@ -908,7 +961,7 @@ fn check_all_names_each_machine_and_os_a_problem_appears_on() {
     let lines: Vec<&str> = all.lines().collect();
     assert_eq!(lines.len(), 3, "{all}");
     assert!(
-        lines.contains(&"tags/work.toml: error: files.bad.target: \"a|b\" contains '|', which Windows paths cannot hold (drive, stream, or reserved character), so ~/a|b has no valid Windows path for files.bad; remove or override it in os/windows.toml, or add a when condition (on laptop: windows)"),
+        lines.contains(&"tags/work.toml: error: files.bad.target: \"a|b\" contains '|', which Windows paths cannot hold (drive, stream, or reserved character), so ~/a|b has no valid Windows path for files.bad; remove or override it in os/windows.toml, or add a when condition (on laptop: windows; a machine with only profile work: windows)"),
         "{all}"
     );
     assert!(
@@ -919,7 +972,7 @@ fn check_all_names_each_machine_and_os_a_problem_appears_on() {
         "{all}"
     );
     assert!(
-        lines.contains(&"os/linux.toml: error: files.distro.target: files.distro (~/.arm) and files.arm (~/.arm) both write ~/.arm (on desk: linux aarch64 fedora; laptop: linux aarch64 fedora; unlisted machine ghost: linux aarch64 fedora; any other unlisted machine: linux aarch64 fedora)"),
+        lines.contains(&"os/linux.toml: error: files.distro.target: files.distro (~/.arm) and files.arm (~/.arm) both write ~/.arm (on desk: linux aarch64 fedora; laptop: linux aarch64 fedora; unlisted machine ghost: linux aarch64 fedora; a machine with only profile work: linux aarch64 fedora; any other unlisted machine: linux aarch64 fedora)"),
         "{all}"
     );
 }

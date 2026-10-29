@@ -146,9 +146,6 @@ impl Checker {
         for file in &loadout.layers {
             self.file = Some(file.file.clone());
             match &file.scope {
-                Scope::Tag(tag) if !used.contains(tag.as_str()) => {
-                    self.warn("", format!("no machine in [machines] lists tag {tag:?}"));
-                }
                 Scope::Machine(name) if !loadout.machines.contains_key(name) => self.error(
                     "",
                     format!("machine {name:?} has a layer file but no [machines.{name}] entry in loadout.toml"),

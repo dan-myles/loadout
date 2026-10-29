@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::apply::{self, Mode, Options};
 use crate::cli::Exit;
 use crate::commands::apply::show;
+use crate::commands::profile;
 use crate::context::Context;
 use crate::machine::{self, NameSource};
 use crate::manifest::Loadout;
@@ -20,7 +21,12 @@ pub struct Args {
         help = "The loadout Git repository, such as https://github.com/you/loadout.git or git@github.com:you/loadout.git"
     )]
     pub url: String,
-    /// This machine's name in the loadout [default: the saved name, else one made from the hostname]
+    /// A profile for this machine, such as `work`; repeat it or separate names with commas.
+    /// Without it, init asks in a terminal and chooses none elsewhere
+    #[arg(long = "profile", value_name = "PROFILE", value_parser = profile::profile_name, value_delimiter = ',')]
+    pub profiles: Vec<String>,
+    /// This machine's name, only for a loadout that declares machines in [machines] [default: the
+    /// saved name, else one made from the hostname]
     #[arg(long, value_name = "NAME", value_parser = machine_name)]
     pub name: Option<String>,
     /// Don't install the background sync service, even when the loadout's [update] auto is true
@@ -37,12 +43,12 @@ fn machine_name(value: &str) -> Result<String, String> {
 }
 
 /// Sets this machine up from a loadout: clones it into loadout's own checkout, saves the
-/// machine's name and the loadout's URL, applies it, and installs the background sync service
+/// machine's name, its chosen profiles, and the loadout's URL, applies it, and installs the background sync service
 /// unless the loadout's `[update] auto` is false or `--no-service` is given.
 ///
 /// The existing setup, a conflicting `--name`, and a URL carrying a password are refused before
-/// anything is written; a clone, machine-file, apply or service failure can still come after the
-/// clone. The state lock is held from the clone through the apply. A private loadout clones with
+/// anything is written; a clone, unknown `--profile`, machine-file, apply or service failure can
+/// still come after the clone. The state lock is held from the clone through the apply. A private loadout clones with
 /// the user's own Git credentials or SSH keys; loadout stores no token, and shows the URL only
 /// with its userinfo hidden.
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
@@ -82,13 +88,67 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     );
     sync::clone(&args.url, context, &lock)?;
 
+    let loadout = Loadout::load_guarded(&checkout, context)
+        .ok()
+        .map(|(loadout, _)| loadout);
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let name = match (&args.name, saved) {
         (Some(name), _) => name.clone(),
         (None, Some(saved)) => saved,
-        (None, None) => choose(context, &checkout)?,
+        (None, None) => choose(context, loadout.as_ref(), interactive)?,
     };
-    machine::save(context, &name, &args.url)?;
+    let available = loadout.as_ref().map(Loadout::profiles);
+    let profiles = match &available {
+        Some(available) if args.profiles.is_empty() && interactive && !available.is_empty() => {
+            let declared = loadout
+                .as_ref()
+                .and_then(|loadout| loadout.machines.get(&name))
+                .map(|entry| entry.tags.clone())
+                .unwrap_or_default();
+            profile::ask(
+                available,
+                &[],
+                &declared,
+                &mut io::stdin().lock(),
+                &mut io::stdout(),
+            )?
+        }
+        _ => args.profiles.clone(),
+    };
+    let unknown: Vec<&String> = match &available {
+        Some(available) => profiles
+            .iter()
+            .filter(|profile| !available.contains(profile))
+            .collect(),
+        None => Vec::new(),
+    };
+    if !unknown.is_empty() {
+        machine::save(context, &name, &args.url, &[])?;
+        for profile in unknown {
+            println!("no profile {profile} in this loadout (no tags/{profile}.toml)");
+        }
+        println!(
+            "{}",
+            profile::offered(available.as_deref().unwrap_or_default())
+        );
+        println!(
+            "nothing applied: run `loadout profile set PROFILE...`, then `loadout sync` and `loadout service install`"
+        );
+        return Ok(Exit::Invalid);
+    }
+    machine::save(context, &name, &args.url, &profiles)?;
     println!("this machine is {name}");
+    if profiles.is_empty() {
+        match &available {
+            Some(available) if !available.is_empty() => println!(
+                "no profiles chosen, so this machine gets the global and OS layers only; `loadout profile choose` picks some later ({})",
+                profile::offered(available)
+            ),
+            _ => {}
+        }
+    } else {
+        println!("profiles: {}", profiles.join(", "));
+    }
 
     let options = Options {
         force: false,
@@ -114,13 +174,20 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
 }
 
 /// The name for a machine with no saved name: the hostname's, or in a terminal the one the user
-/// picks, preferably among the machines the loadout lists.
-fn choose(context: &Context, checkout: &Path) -> anyhow::Result<String> {
+/// picks when the loadout declares machines. A loadout without [machines] never asks, since only
+/// a declared machine's name changes what it gets.
+fn choose(
+    context: &Context,
+    loadout: Option<&Loadout>,
+    interactive: bool,
+) -> anyhow::Result<String> {
     let default = machine::name(context)?.name;
-    let listed: Vec<String> = Loadout::load_guarded(checkout, context)
-        .map(|(loadout, _)| loadout.machines.into_keys().collect())
+    let listed: Vec<String> = loadout
+        .map(|loadout| loadout.machines.keys().cloned().collect())
         .unwrap_or_default();
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if listed.is_empty() {
+        return Ok(default);
+    }
     let name = if interactive {
         prompt(
             &default,
@@ -131,9 +198,9 @@ fn choose(context: &Context, checkout: &Path) -> anyhow::Result<String> {
     } else {
         default
     };
-    if !listed.is_empty() && !listed.contains(&name) {
+    if !listed.contains(&name) {
         println!(
-            "note: the loadout's [machines] doesn't list {name}, so it gets the global and OS layers only"
+            "note: the loadout's [machines] doesn't list {name}, so it gets the global and OS layers and its chosen profiles"
         );
     }
     Ok(name)

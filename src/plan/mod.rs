@@ -434,6 +434,7 @@ mod tests {
             distro: None,
             arch: Arch::X86_64,
             home: PathBuf::from("/h"),
+            profiles: Vec::new(),
         };
         let declared = BTreeMap::from([(
             "rg".to_owned(),

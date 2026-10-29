@@ -106,6 +106,7 @@ impl Sandbox {
             distro: None,
             arch: Arch::X86_64,
             home: context.home.clone(),
+            profiles: Vec::new(),
         };
         let (resolved, _) = resolve::resolve(&loadout, &facts)
             .unwrap_or_else(|diagnostics| panic!("fixture must resolve: {diagnostics:?}"));
@@ -123,6 +124,7 @@ impl Sandbox {
             distro: None,
             arch: Arch::X86_64,
             home: context.home.clone(),
+            profiles: Vec::new(),
         };
         let (resolved, _) = resolve::resolve(&loadout, &facts).map_err(|errors| lines(&errors))?;
         let targets = resolve::check_targets(&resolved, context, &self.loadout);
@@ -897,6 +899,7 @@ fn a_skill_changed_after_validation_is_refused_before_anything_is_planned() {
         distro: None,
         arch: Arch::X86_64,
         home: sandbox.home.clone(),
+        profiles: Vec::new(),
     };
     let (resolved, _) = resolve::resolve(&loadout, &facts).unwrap();
 
@@ -933,6 +936,7 @@ fn a_skill_link_that_leaves_the_loadout_or_names_a_folder_is_refused() {
         distro: None,
         arch: Arch::X86_64,
         home: sandbox.home.clone(),
+        profiles: Vec::new(),
     };
     let (resolved, _) = resolve::resolve(&loadout, &facts).unwrap();
     let secret = sandbox.home_file(".codex/auth.json", "sentinel");
@@ -1143,6 +1147,7 @@ fn git_metadata_named_by_a_gitfile_or_commondir_stays_refused_after_validation()
         distro: None,
         arch: Arch::X86_64,
         home: sandbox.home.clone(),
+        profiles: Vec::new(),
     };
     let (resolved, _) = resolve::resolve(&loadout, &facts).unwrap();
     let link = sandbox.loadout.join("skills/review/extra");
