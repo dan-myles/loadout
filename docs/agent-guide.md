@@ -607,6 +607,10 @@ Loadout is built to run without a person at the keyboard.
 - `--json` is available on `doctor`, `validate`, `plan`, `status`, and `service status`. `apply`,
   `sync`, `init`, and `rollback` print one line per action. Their exit code is the contract.
 - Diagnostics go to stdout. A runtime error goes to stderr as `error: <message>` with exit 1.
+- When stderr is a terminal, `apply`, `sync`, and `init` show a spinner there naming what they
+  wait on: planning, each program install, and `init`'s service install. Each erases itself
+  when its step ends. An install that may ask for a `sudo` password gets a plain line instead.
+  Piped or redirected stderr gets none of this, so captured output is unchanged.
 - A writing command takes the state lock without waiting. A second one exits 1 at once rather than
   queueing.
 

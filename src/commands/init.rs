@@ -7,6 +7,7 @@ use crate::commands::apply::show;
 use crate::context::Context;
 use crate::machine::{self, NameSource};
 use crate::manifest::Loadout;
+use crate::progress::Spinner;
 use crate::state;
 use crate::sync;
 
@@ -177,7 +178,11 @@ fn service(args: &Args, context: &Context, checkout: &Path) -> anyhow::Result<Ex
         println!("background service not installed: the loadout sets [update] auto = false");
         return Ok(Exit::Success);
     }
-    match sync::service::install(context, settings.interval_minutes) {
+    let installed = {
+        let _spinner = Spinner::start(true, "installing the background service");
+        sync::service::install(context, settings.interval_minutes)
+    };
+    match installed {
         Ok(installed) => {
             for warning in &installed.warnings {
                 println!("warning: {warning}");
