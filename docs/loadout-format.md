@@ -305,6 +305,9 @@ uses the first manager that is on `PATH`, in this order:
 The language managers come in the order `cargo`, `uv`, `pipx`, `npm`, `pnpm`, `bun`, `go`.
 
 - Only missing programs are installed. Loadout never upgrades, pins versions, or uninstalls.
+- A brew or cask id from a third-party tap, such as `oven-sh/bun/bun`, trusts that tap: apply runs
+  `brew tap` and `brew trust --tap` before installing it, and its installed check reads the keg in
+  `Cellar` or `Caskroom` so plan never needs the trust.
 - Per-user managers run directly. System-wide ones (`apt`, `dnf`, `pacman`, `zypper`, `snap`,
   `choco`, machine-scoped winget installers) are `blocked` unless `loadout apply --elevated` is
   passed. The background sync never elevates.

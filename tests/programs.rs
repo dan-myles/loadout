@@ -136,7 +136,12 @@ mark() { [ -n "$FAKE_LIE" ] || : > "$S/$1"; }
             "brew",
             r#"case "$1" in
 install) printf 'HOMEBREW_NO_INSTALL_UPGRADE=%s\n' "$HOMEBREW_NO_INSTALL_UPGRADE" >> "$FAKE_LOG"
+  case "$3" in */*/*) case "$2" in --cask) d=Caskroom;; *) d=Cellar;; esac
+    [ -n "$FAKE_LIE" ] || /bin/mkdir -p "$S/prefix/$d/${3##*/}/1.0"; exit 0;; esac
   case "$2" in --cask) mark cask;; *) mark brew;; esac; exit 0;;
+--prefix) printf '%s\n' "$S/prefix"; exit 0;;
+tap) exit 0;;
+trust) if [ -n "$FAKE_NO_TRUST" ]; then echo 'Error: Unknown command: trust' >&2; exit 1; fi; exit 0;;
 info) case "$3" in
   --cask) if [ -e "$S/cask" ]; then v='"1.0"'; else v=null; fi
     printf '{"formulae":[],"casks":[{"token":"%s","installed":%s}]}\n' "$4" "$v";;
@@ -609,6 +614,54 @@ esac; exit 64"#,
                     .any(|command| command.contains(case.install)),
                 "an installed program is never installed again: {label}\n{commands:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_tap_package_is_tapped_and_trusted_before_it_installs_and_found_by_its_keg() {
+        for (manager, flag, older_brew) in [
+            ("brew", "--formula", false),
+            ("cask", "--cask", false),
+            ("brew", "--formula", true),
+        ] {
+            let bench = Bench::new(&fake_tools());
+            let program = request("macos", true, false, &[("bun", manager, "oven-sh/bun/bun")]);
+            let extra: &[(&str, &str)] = if older_brew {
+                &[("FAKE_NO_TRUST", "1")]
+            } else {
+                &[]
+            };
+            let label = format!("{manager} older_brew={older_brew}");
+            let first = bench.probe(&program, extra);
+            assert_eq!(
+                first.step("bun")["state"],
+                "missing",
+                "{label}: {}",
+                first.result
+            );
+            assert_eq!(
+                first.step("bun")["install"],
+                "ok",
+                "{label}: {}",
+                first.result
+            );
+            let commands = first.commands(&bench.bin());
+            assert_eq!(
+                commands,
+                [
+                    "brew --prefix".to_owned(),
+                    "brew --prefix".to_owned(),
+                    "brew tap oven-sh/bun".to_owned(),
+                    "brew trust --tap oven-sh/bun".to_owned(),
+                    format!("brew install {flag} oven-sh/bun/bun"),
+                    "brew --prefix".to_owned(),
+                ],
+                "brew info, which needs trust, never runs for a tap package: {label}"
+            );
+
+            let second = bench.probe(&program, extra);
+            assert_eq!(second.step("bun")["state"], "installed", "{label}");
+            assert_eq!(second.commands(&bench.bin()), ["brew --prefix"], "{label}");
         }
     }
 

@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.1` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.2` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -55,7 +55,7 @@ script writes only that folder (the binary, its install record, and a lock file)
 nothing and installs no service, so it is safe to run before asking about the user's loadout.
 
 ```sh
-loadout --version          # loadout 0.1.1
+loadout --version          # loadout 0.1.2
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go

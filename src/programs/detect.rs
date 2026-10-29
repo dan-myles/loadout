@@ -66,6 +66,15 @@ pub(super) fn installed(
     program: &Path,
     package: &str,
 ) -> Result<bool, Unanswered> {
+    // brew refuses to load a formula or cask from a tap that isn't tapped and trusted, and
+    // trusting writes, which a query never does. Apply taps and trusts it before installing;
+    // until then, the keg or Caskroom entry on disk answers.
+    if matches!(manager, Manager::Brew | Manager::Cask)
+        && let Some((_, name)) = third_party_tap(package)
+    {
+        let prefix = query(containment, program, ["--prefix"])?;
+        return Ok(kept(&prefix, name, manager == Manager::Cask)?);
+    }
     let answer = match manager {
         Manager::Brew => brew(
             &query(
@@ -280,6 +289,36 @@ fn json(text: &str) -> Result<Value, String> {
 /// One `brew info --json=v2` entry for the requested name (its name, tap-qualified name, alias,
 /// or old name). A formula's `installed` is a list of `{ "version": … }` records; a cask's is a
 /// version string, or `null` when it isn't installed.
+/// The `user/repo` tap and the name of a fully qualified `user/repo/name`, unless the tap is one
+/// of Homebrew's own, which brew loads without a local checkout or trust.
+pub(super) fn third_party_tap(package: &str) -> Option<(&str, &str)> {
+    let (tap, name) = package.rsplit_once('/')?;
+    let (user, repo) = tap.split_once('/')?;
+    let plain = |part: &str| !part.is_empty() && !part.contains('/');
+    (plain(user) && plain(repo) && plain(name) && !user.eq_ignore_ascii_case("homebrew"))
+        .then_some((tap, name))
+}
+
+/// Reads `brew --prefix`: a formula is installed when its `Cellar/<name>` holds a keg, a cask
+/// when its `Caskroom/<name>` holds a version.
+fn kept(prefix: &Captured, name: &str, cask: bool) -> Result<bool, String> {
+    if !prefix.success() {
+        return Err(prefix.unexpected());
+    }
+    let prefix = match prefix.stdout.trim() {
+        "" => return Err("brew --prefix printed no path".to_owned()),
+        path => Path::new(path),
+    };
+    let dir = prefix
+        .join(if cask { "Caskroom" } else { "Cellar" })
+        .join(name);
+    match std::fs::read_dir(&dir) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("could not read {}: {error}", dir.display())),
+    }
+}
+
 fn brew(output: &Captured, package: &str, cask: bool) -> Result<bool, String> {
     if !output.success() {
         return Err(output.unexpected());
@@ -829,6 +868,61 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_third_party_qualified_names_have_a_tap_to_check() {
+        assert_eq!(
+            third_party_tap("oven-sh/bun/bun"),
+            Some(("oven-sh/bun", "bun"))
+        );
+        assert_eq!(
+            third_party_tap("withgraphite/tap/graphite"),
+            Some(("withgraphite/tap", "graphite"))
+        );
+        for unqualified in [
+            "ripgrep",
+            "python@3.12",
+            "a/b",
+            "a//c",
+            "/b/c",
+            "a/b/",
+            "a/b/c/d",
+        ] {
+            assert_eq!(third_party_tap(unqualified), None, "{unqualified}");
+        }
+        assert_eq!(third_party_tap("homebrew/core/ripgrep"), None);
+        assert_eq!(third_party_tap("Homebrew/cask/firefox"), None);
+    }
+
+    #[test]
+    fn a_tap_package_is_installed_when_its_keg_or_caskroom_entry_exists() {
+        let prefix = tempfile::tempdir().unwrap();
+        let answer = |name: &str, cask: bool| {
+            kept(
+                &out(0, &format!("{}\n", prefix.path().display()), ""),
+                name,
+                cask,
+            )
+        };
+        std::fs::create_dir_all(prefix.path().join("Cellar/bun/1.3.11")).unwrap();
+        std::fs::create_dir_all(prefix.path().join("Cellar/empty")).unwrap();
+        std::fs::create_dir_all(prefix.path().join("Caskroom/tool/2.0")).unwrap();
+        assert_eq!(answer("bun", false), Ok(true));
+        assert_eq!(
+            answer("empty", false),
+            Ok(false),
+            "a keg folder with no version"
+        );
+        assert_eq!(answer("absent", false), Ok(false));
+        assert_eq!(answer("tool", true), Ok(true));
+        assert_eq!(
+            answer("bun", true),
+            Ok(false),
+            "a formula's keg is not a cask"
+        );
+        assert!(kept(&out(0, "\n", ""), "bun", false).is_err());
+        assert!(kept(&out(1, "", "Error"), "bun", false).is_err());
     }
 
     #[test]

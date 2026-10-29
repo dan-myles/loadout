@@ -436,6 +436,7 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
             package: package.id.clone(),
         });
     }
+    trust_tap(program, package, &missing.containment)?;
     let invocation = manager::install(manager, &package.executable, &package.id, missing.scope);
     let invocation = if missing.scope == Scope::System {
         elevate(invocation).ok_or_else(|| Error::NoSudo {
@@ -470,6 +471,45 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
         });
     }
     verified(program, missing)
+}
+
+/// Taps and trusts the third-party tap a `user/repo/name` brew package comes from: naming it in
+/// the loadout is the trust. Homebrew from before `brew trust` loads any tapped formula, so its
+/// unknown-command answer counts as trusted.
+fn trust_tap(program: &str, package: &Package, containment: &Containment) -> Result<(), Error> {
+    if !matches!(package.manager, Manager::Brew | Manager::Cask) {
+        return Ok(());
+    }
+    let Some((tap, _)) = detect::third_party_tap(&package.id) else {
+        return Ok(());
+    };
+    for args in [&["tap", tap][..], &["trust", "--tap", tap][..]] {
+        let invocation = Invocation::new(&package.executable, args);
+        let command = invocation.display();
+        let output = process::install(&invocation, containment).map_err(|source| {
+            if process::install_refused(&source) {
+                Error::NotStarted {
+                    program: program.to_owned(),
+                }
+            } else {
+                Error::Spawn {
+                    program: program.to_owned(),
+                    command: command.clone(),
+                    source,
+                }
+            }
+        })?;
+        let older_brew = args[0] == "trust" && output.stderr.contains("Unknown command");
+        if !output.success() && !older_brew {
+            return Err(Error::Install {
+                program: program.to_owned(),
+                command,
+                status: output.status(),
+                output: output.tail(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The installed-query after a successful install. An answer that can't be classified cancels a
