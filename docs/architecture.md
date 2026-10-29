@@ -762,7 +762,8 @@ defaults to the hostname, cut at the first `.`, lowercased, with other character
 Once the file is written, renaming the computer doesn't change the name.
 
 `profiles` is optional and written only when non-empty, so a machine with none keeps a file older
-versions read. Each entry must be an id; a bad one makes the whole identity invalid (plan and
+versions read. 0.1.5 and older refuse a file that has it (`deny_unknown_fields`), so a background job
+registered with an older binary fails until that binary is upgraded or the job is reinstalled. Each entry must be an id; a bad one makes the whole identity invalid (plan and
 apply block, exit 4). `machine::detect` puts it in `Facts.profiles`, which every resolution on the
 host (plan, apply, sync, background sync, `sync::settings`) reads. Only `init` and
 `loadout profile set|choose` write it: `machine::save` (init) and `machine::save_profiles`, which
