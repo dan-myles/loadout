@@ -11,6 +11,7 @@ REPO=dan-myles/loadout
 RECORD_KEYS='installer repository source target version archive_sha256 binary binary_sha256'
 version=latest
 homebrew=1
+modify_path=1
 base_url=
 tmp=
 staged=
@@ -20,7 +21,7 @@ say() { printf 'loadout-install: %s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 usage() {
   cat <<'EOF'
-usage: install.sh [--version vX.Y.Z] [--base-url URL] [--no-homebrew] [LOADOUT_URL [INIT_ARGS...]]
+usage: install.sh [--version vX.Y.Z] [--base-url URL] [--no-homebrew] [--no-modify-path] [LOADOUT_URL [INIT_ARGS...]]
 
 Installs loadout to ~/.local/bin after verifying the release archive's sha256. Needs curl and git.
 Without Homebrew, it first runs Homebrew's installer, so a loadout's brew programs (and casks, on
@@ -30,6 +31,7 @@ and a compiler must already be there.
   --base-url URL     fetch the assets, and Homebrew's installer, from URL instead of GitHub:
                      https, or http on localhost
   --no-homebrew      never install Homebrew
+  --no-modify-path   never add brew or ~/.local/bin to your shell profile
 Given LOADOUT_URL, runs `loadout init LOADOUT_URL INIT_ARGS...` afterwards.
 An existing ~/.local/bin/loadout is replaced only if this installer put it there.
 EOF
@@ -58,6 +60,10 @@ while [ $# -gt 0 ]; do
       ;;
     --no-homebrew)
       homebrew=0
+      shift
+      ;;
+    --no-modify-path)
+      modify_path=0
       shift
       ;;
     -h | --help)
@@ -380,10 +386,12 @@ fi
 
 # The init below, and the background service it records PATH for, find brew only on PATH, which a
 # fresh install or a shell without Homebrew's profile line doesn't have yet.
+# The line that keeps brew there in later shells, added to the profile once loadout is installed.
+brew_line=
 if ! command -v brew >/dev/null 2>&1 && brew=$(find_brew); then
   if brew_env=$("$brew" shellenv); then
     eval "$brew_env"
-    say "put Homebrew on PATH for this install. To keep it there in new shells, add this to your shell profile: eval \"\$($brew shellenv)\""
+    brew_line="eval \"\$($brew shellenv)\""
   else
     say "warning: $brew shellenv failed, so init won't find brew and the loadout's brew programs won't install"
   fi
@@ -477,10 +485,33 @@ staged_record=
 exec 9>&-
 say "installed loadout $installed_version ($target) to $dest"
 
+bin_line=
 case ":${PATH:-}:" in
   *":$bin_dir:"* | *":$canon_dir:"*) ;;
-  *) say "$bin_dir is not on PATH. Add it in your shell profile, for example: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  *) bin_line='export PATH="$HOME/.local/bin:$PATH"' ;;
 esac
+
+# The login profile of the user's shell: the file Homebrew's own instructions name for it.
+case ${SHELL:-}:$os in
+  */zsh:*) profile=$HOME/.zprofile ;;
+  */bash:Darwin) profile=$HOME/.bash_profile ;;
+  */bash:*) profile=$HOME/.bashrc ;;
+  *) profile=$HOME/.profile ;;
+esac
+
+# Appends each line the profile doesn't already hold, so running the installer again adds nothing.
+for line in "$brew_line" "$bin_line"; do
+  [ -n "$line" ] || continue
+  if [ "$modify_path" = 0 ]; then
+    say "to put it on PATH in new shells, add this to your shell profile: $line"
+  elif [ -f "$profile" ] && grep -qxF -- "$line" "$profile"; then
+    :
+  elif printf '\n# Added by the loadout installer.\n%s\n' "$line" >>"$profile"; then
+    say "added to $profile, for new shells: $line"
+  else
+    say "warning: could not write $profile. Add this to your shell profile yourself: $line"
+  fi
+done
 
 if [ -n "$loadout_url" ]; then
   cleanup

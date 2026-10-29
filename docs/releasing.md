@@ -233,8 +233,9 @@ Neither script installs git; each names the per-OS command instead.
      recovered. One that is still running can't be deleted and stays; the script never deletes an
      aside it didn't make in that run, whatever its name. Self-update keeps a ledger of its own
      (below).
-10. **PATH.** Each script says how to add the directory to `PATH` if it isn't on it. Neither edits
-    shell profiles or `PATH`.
+10. **PATH.** `install.sh` adds `~/.local/bin`, and Homebrew's `shellenv` line when it put brew on
+    PATH, to the shell's login profile once, unless `--no-modify-path`, which prints them instead.
+    `install.ps1` says how to add its directory to `PATH` and never edits it.
 11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
     remaining arguments. The URL must not start with `-`. The script's own message shows the URL
     with any userinfo as `***`, as loadout does, and never the init arguments; `init` itself

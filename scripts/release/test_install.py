@@ -673,11 +673,13 @@ class InstallShTest(unittest.TestCase):
         self.publish_recording_path()
         self.serve_homebrew_installer()
         result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(), homebrew=True,
-                              FAKE_OS="Darwin", HOMEBREW_PREFIX=str(self.brew_prefix))
+                              FAKE_OS="Darwin", HOMEBREW_PREFIX=str(self.brew_prefix), SHELL="/bin/zsh")
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertTrue((self.tmp / "homebrew-ran").exists())
         self.assertIn("running its installer", result.stderr)
         self.assertIn(str(self.brew_prefix / "bin"), Path(f"{self.init_args}.path").read_text().split(":"))
+        # And it stays there for later shells, such as one that runs init by hand.
+        self.assertIn(f'eval "$({self.brew_prefix}/bin/brew shellenv)"', (self.home / ".zprofile").read_text())
 
     def test_an_installed_brew_off_path_is_put_on_path_for_init(self):
         self.skip_if_host_has_homebrew()
@@ -707,6 +709,28 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertTrue((self.tmp / "homebrew-ran").exists())
         self.assertIn(str(self.brew_prefix / "bin"), Path(f"{self.init_args}.path").read_text().split(":"))
+
+    def test_the_profile_gets_each_path_line_once(self):
+        for shell, os_name, name in (
+            ("/bin/bash", "Linux", ".bashrc"),
+            ("/bin/bash", "Darwin", ".bash_profile"),
+            ("/usr/bin/zsh", "Linux", ".zprofile"),
+            ("/usr/bin/fish", "Linux", ".profile"),
+        ):
+            with self.subTest(shell=shell, os=os_name):
+                if os_name == "Darwin":
+                    self.publish_recording_path()
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir()
+                for _ in range(2):
+                    self.install_ok(SHELL=shell, FAKE_OS=os_name)
+                profile = (self.home / name).read_text()
+                self.assertEqual(profile.count('export PATH="$HOME/.local/bin:$PATH"'), 1, profile)
+
+    def test_no_modify_path_leaves_the_profile_alone(self):
+        result = self.install_ok("--no-modify-path", SHELL="/bin/bash")
+        self.assertFalse((self.home / ".bashrc").exists())
+        self.assertIn('add this to your shell profile: export PATH="$HOME/.local/bin:$PATH"', result.stderr)
 
     def test_linux_without_git_stops_before_homebrew(self):
         self.serve_homebrew_installer(body=f": > '{self.tmp}/homebrew-ran'\n")

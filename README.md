@@ -76,8 +76,10 @@ command takes a fresh machine to an applied loadout:
 curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
 ```
 
-This installs `loadout` to `~/.local/bin`. If that folder isn't on your `PATH`, the script prints the
-line to add to your shell profile.
+This installs `loadout` to `~/.local/bin`. If that folder or Homebrew isn't on your `PATH`, the script
+adds the line for it to your shell profile (`~/.zprofile` for zsh; `~/.bashrc` for bash on Linux,
+`~/.bash_profile` on macOS; `~/.profile` otherwise), once. Pass `--no-modify-path` to have it print
+the lines instead.
 
 **Windows**, in PowerShell 5.1 or 7.
 
@@ -114,7 +116,8 @@ curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/rele
 - **Updates.** A binary installed this way is **managed**: `loadout update` (alias `upgrade`)
   replaces it with a newer stable release, after checking that release's SHA-256.
 - **Existing installs.** The script replaces an existing binary only if this installer put it
-  there, and it never edits your shell profile or `PATH`.
+  there. `install.sh` edits only your shell profile's `PATH` lines, and never with
+  `--no-modify-path`; `install.ps1` never edits `PATH`.
 - Every check the scripts make is in [docs/releasing.md](docs/releasing.md#installing-from-a-release).
 
 **From source.** You need [rustup](https://rustup.rs), `git`, and the platform's C linker: Xcode
