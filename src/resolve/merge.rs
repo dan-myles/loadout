@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use super::{Update, report};
 
-/// Where a profile problem points: the machine's own saved selection, not the loadout.
 const MACHINE_FILE: &str = "machine.toml";
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::machine::Facts;

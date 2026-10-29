@@ -1,8 +1,3 @@
-//! Profiles chosen on the machine, through the real binary: `init --profile`, `loadout profile`,
-//! and the plan, apply, and sync that follow, for a machine the loadout never declares. Every run
-//! uses `LOADOUT_HOME` and `LOADOUT_STATE_DIR` in a temp dir and `--no-service`, and stdin is not
-//! a terminal, so nothing ever asks.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -41,9 +36,7 @@ struct Machine {
 }
 
 impl Machine {
-    /// A remote whose global layer places `~/base.md` and whose `development` and `work` profiles
-    /// each place their own file, with `extra` appended to `loadout.toml`.
-    fn new(extra: &str) -> Self {
+    fn with_base_development_and_work(extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let remote = dir.path().join("remote.git");
         let work = dir.path().join("work");
@@ -135,7 +128,7 @@ fn assert_code(output: &Output, code: i32) {
 
 #[test]
 fn an_undeclared_machine_gets_its_chosen_profile_on_init_and_every_later_run() {
-    let machine = Machine::new("");
+    let machine = Machine::with_base_development_and_work("");
     let init = machine.init(&["--profile", "development"]);
     assert_code(&init, 0);
     assert!(
@@ -174,7 +167,7 @@ fn an_undeclared_machine_gets_its_chosen_profile_on_init_and_every_later_run() {
 
 #[test]
 fn without_a_terminal_init_chooses_no_profile_and_profile_set_changes_it_later() {
-    let machine = Machine::new("");
+    let machine = Machine::with_base_development_and_work("");
     let init = machine.init(&[]);
     assert_code(&init, 0);
     let shown = text(&init);
@@ -225,7 +218,7 @@ fn without_a_terminal_init_chooses_no_profile_and_profile_set_changes_it_later()
 
 #[test]
 fn an_unknown_profile_changes_and_applies_nothing() {
-    let machine = Machine::new("");
+    let machine = Machine::with_base_development_and_work("");
     let init = machine.init(&["--profile", "gaming"]);
     assert_code(&init, 3);
     assert!(
@@ -246,7 +239,7 @@ fn an_unknown_profile_changes_and_applies_nothing() {
 
 #[test]
 fn a_chosen_profile_the_loadout_drops_blocks_the_sync_instead_of_removing_its_items() {
-    let machine = Machine::new("");
+    let machine = Machine::with_base_development_and_work("");
     assert_code(&machine.init(&["--profile", "development"]), 0);
     git(&machine.work, &["rm", "--quiet", "tags/development.toml"]);
     git(
@@ -271,7 +264,7 @@ fn a_chosen_profile_the_loadout_drops_blocks_the_sync_instead_of_removing_its_it
 
 #[test]
 fn a_declared_machine_keeps_its_tags_and_adds_its_chosen_profiles() {
-    let machine = Machine::new("[machines.box]\ntags = [\"work\"]\n");
+    let machine = Machine::with_base_development_and_work("[machines.box]\ntags = [\"work\"]\n");
     assert_code(&machine.init(&["--name", "box"]), 0);
     assert!(machine.has("work.md"), "the declared tag still applies");
     assert!(!machine.has("development.md"));
@@ -297,7 +290,7 @@ fn a_declared_machine_keeps_its_tags_and_adds_its_chosen_profiles() {
 
 #[test]
 fn validate_checks_each_profile_for_a_machine_the_loadout_never_names() {
-    let machine = Machine::new("");
+    let machine = Machine::with_base_development_and_work("");
     fs::write(
         machine.work.join("tags").join("work.toml"),
         "[files.work]\ntarget = \"~/work.md\"\n",

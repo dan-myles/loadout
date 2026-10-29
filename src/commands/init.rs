@@ -114,11 +114,13 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     } else {
         args.profiles.clone()
     };
-    // An invalid loadout lists no profiles; its apply below reports why, so nothing is refused here.
-    let unknown: Vec<&String> = profiles
-        .iter()
-        .filter(|profile| loadout.is_some() && !available.contains(profile))
-        .collect();
+    let unknown: Vec<&String> = match &loadout {
+        Some(_) => profiles
+            .iter()
+            .filter(|profile| !available.contains(profile))
+            .collect(),
+        None => Vec::new(),
+    };
     if !unknown.is_empty() {
         machine::save(context, &name, &args.url, &[])?;
         for profile in unknown {
@@ -170,31 +172,30 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
 }
 
 /// The name for a machine with no saved name: the hostname's, or in a terminal the one the user
-/// picks when the loadout declares machines. A loadout without [machines] never asks, since only
-/// a declared machine's name changes what it gets.
+/// picks among the loadout's declared machines.
 fn choose(
     context: &Context,
     loadout: Option<&Loadout>,
     interactive: bool,
 ) -> anyhow::Result<String> {
     let default = machine::name(context)?.name;
-    let listed: Vec<String> = loadout
+    let declared_machines: Vec<String> = loadout
         .map(|loadout| loadout.machines.keys().cloned().collect())
         .unwrap_or_default();
-    if listed.is_empty() {
+    if declared_machines.is_empty() {
         return Ok(default);
     }
     let name = if interactive {
         prompt(
             &default,
-            &listed,
+            &declared_machines,
             &mut io::stdin().lock(),
             &mut io::stdout(),
         )?
     } else {
         default
     };
-    if !listed.contains(&name) {
+    if !declared_machines.contains(&name) {
         println!(
             "note: the loadout's [machines] doesn't list {name}, so it gets the global and OS layers and its chosen profiles"
         );

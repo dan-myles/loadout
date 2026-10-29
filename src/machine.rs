@@ -77,14 +77,13 @@ struct MachineFile {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
-    // Left out when empty, so a machine with no profiles keeps a file older versions can read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiles: Vec<String>,
 }
 
 /// Saves this machine's name, its loadout's URL, and its chosen profiles in
-/// `<state>/machine.toml` (init, U9). Once saved, the name no longer follows the hostname. The
-/// state dir must already exist (init takes the state lock first, which creates it). The file is
+/// `<state>/machine.toml`. Once saved, the name no longer follows the hostname. The
+/// state dir must already exist. The file is
 /// written to a new name in the state dir, synced, and renamed over the old one, so a crash leaves
 /// the old file or the new one. Like [`name`], it refuses an existing `machine.toml` that is a
 /// link or not a regular file, and it refuses a remote that carries a password, because loadout
