@@ -64,6 +64,10 @@ command takes a fresh machine to an applied loadout:
 - **Linux:** Homebrew, through its own installer. `git`, `curl`, and a compiler (`build-essential`
   or your distribution's equivalent) must already be there. Pass `--no-homebrew` to skip it.
 
+Homebrew is never installed as root: run `install.sh` as your own user, not as root or through
+`sudo`. As root, it stops before changing anything unless brew is already there or you pass
+`--no-homebrew`.
+
 | OS | CPU | Script |
 | --- | --- | --- |
 | macOS | Apple Silicon (arm64) and Intel (x86_64) | `install.sh` |
