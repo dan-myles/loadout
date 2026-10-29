@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.3` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.4` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -58,7 +58,12 @@ stick in later shells:
   on Linux `git` and `curl` must already be there, and the script stops if `git` is missing). It
   then adds Homebrew's `shellenv` line and `~/.local/bin` to the shell's login profile, once:
   `~/.zprofile` for zsh, `~/.bashrc` for bash on Linux, `~/.bash_profile` for bash on macOS,
-  `~/.profile` otherwise.
+  `~/.profile` otherwise. In `~/.bashrc` they go at the top, above Ubuntu's and Debian's early
+  return for non-interactive shells, so `ssh host loadout …` and scripts see brew and npm. An
+  install from before 0.1.4 appended them below that return; if `ssh host loadout plan` reports
+  brew programs `unsupported`, move those two lines to the top of `~/.bashrc`, then run
+  `loadout service install` again from a shell that has brew on `PATH` so the background sync
+  records it.
 - **Windows (`install.ps1`):** registers winget if it is missing, installs Scoop for the user,
   installs Chocolatey only when run as an administrator, and installs `git` through Scoop. It never
   edits `PATH`; it prints the command that adds its folder.
@@ -79,7 +84,7 @@ record, and a lock file), applies nothing, and installs no service. If the folde
 call loadout by its full path.
 
 ```sh
-loadout --version          # loadout 0.1.3
+loadout --version          # loadout 0.1.4
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go

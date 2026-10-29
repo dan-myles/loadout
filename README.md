@@ -78,8 +78,9 @@ curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/rele
 
 This installs `loadout` to `~/.local/bin`. If that folder or Homebrew isn't on your `PATH`, the script
 adds the line for it to your shell profile (`~/.zprofile` for zsh; `~/.bashrc` for bash on Linux,
-`~/.bash_profile` on macOS; `~/.profile` otherwise), once. Pass `--no-modify-path` to have it print
-the lines instead.
+`~/.bash_profile` on macOS; `~/.profile` otherwise), once. In `~/.bashrc` the lines go at the top,
+above the check that stops non-interactive shells, so `ssh host loadout sync` finds brew too. Pass
+`--no-modify-path` to have it print the lines instead.
 
 **Windows**, in PowerShell 5.1 or 7.
 
@@ -94,7 +95,7 @@ that adds it.
 Then check the install:
 
 ```sh
-loadout --version   # loadout 0.1.3
+loadout --version   # loadout 0.1.4
 loadout doctor
 ```
 
@@ -129,7 +130,7 @@ first build.
 git clone https://github.com/dan-myles/loadout.git
 cd loadout
 cargo install --locked --path .
-loadout --version   # loadout 0.1.3
+loadout --version   # loadout 0.1.4
 loadout doctor
 ```
 
@@ -306,7 +307,7 @@ system-wide managers need `--elevated`.
 
 ## Status
 
-Loadout `0.1.3` is under active development, and its scope is deliberately narrow.
+Loadout `0.1.4` is under active development, and its scope is deliberately narrow.
 
 - **Tested natively** at specific commits, under the real schedulers:
   - macOS 27 on Apple Silicon: the full acceptance harness and a legacy launchd migration;

@@ -235,6 +235,7 @@ Neither script installs git; each names the per-OS command instead.
      (below).
 10. **PATH.** `install.sh` adds `~/.local/bin`, and Homebrew's `shellenv` line when it put brew on
     PATH, to the shell's login profile once, unless `--no-modify-path`, which prints them instead.
+    In `~/.bashrc` they go at the top, above the early return for non-interactive shells.
     `install.ps1` says how to add its directory to `PATH` and never edits it.
 11. **Init.** With a loadout URL, the script runs `<installed binary> init <URL>` followed by the
     remaining arguments. The URL must not start with `-`. The script's own message shows the URL

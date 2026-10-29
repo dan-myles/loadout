@@ -727,6 +727,17 @@ class InstallShTest(unittest.TestCase):
                 profile = (self.home / name).read_text()
                 self.assertEqual(profile.count('export PATH="$HOME/.local/bin:$PATH"'), 1, profile)
 
+    def test_bashrc_gets_the_path_lines_above_its_interactive_guard(self):
+        guard = "case $- in\n    *i*) ;;\n      *) return;;\nesac\n"
+        (self.home / ".bashrc").write_text(guard)
+        self.install_ok(SHELL="/bin/bash", FAKE_OS="Linux")
+        profile = (self.home / ".bashrc").read_text()
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        self.assertLess(profile.index(line), profile.index(guard), profile)
+        self.assertTrue(profile.endswith(guard), profile)
+        self.assertEqual(profile.count(line), 1, profile)
+        self.assertEqual(list(self.home.glob(".bashrc.loadout-*")), [])
+
     def test_no_modify_path_leaves_the_profile_alone(self):
         result = self.install_ok("--no-modify-path", SHELL="/bin/bash")
         self.assertFalse((self.home / ".bashrc").exists())

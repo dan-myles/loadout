@@ -499,19 +499,47 @@ case ${SHELL:-}:$os in
   *) profile=$HOME/.profile ;;
 esac
 
-# Appends each line the profile doesn't already hold, so running the installer again adds nothing.
+# Adds each line the profile doesn't already hold, so running the installer again adds nothing.
+# Ubuntu's and Debian's ~/.bashrc returns early when the shell isn't interactive, so a line
+# appended there never reaches `ssh host loadout sync` or a login shell; .bashrc gets them at the
+# top instead. Every other profile gets them appended.
+added=
 for line in "$brew_line" "$bin_line"; do
   [ -n "$line" ] || continue
   if [ "$modify_path" = 0 ]; then
     say "to put it on PATH in new shells, add this to your shell profile: $line"
   elif [ -f "$profile" ] && grep -qxF -- "$line" "$profile"; then
     :
-  elif printf '\n# Added by the loadout installer.\n%s\n' "$line" >>"$profile"; then
-    say "added to $profile, for new shells: $line"
   else
-    say "warning: could not write $profile. Add this to your shell profile yourself: $line"
+    added="$added# Added by the loadout installer.
+$line
+
+"
   fi
 done
+if [ -n "$added" ]; then
+  case $profile in
+    */.bashrc)
+      staged="$profile.loadout-$$"
+      if { printf '%s' "$added"; if [ -f "$profile" ]; then cat "$profile"; fi; } >"$staged" &&
+        cat "$staged" >"$profile"; then
+        wrote=1
+      else
+        wrote=0
+      fi
+      rm -f "$staged"
+      ;;
+    *) if printf '\n%s' "$added" >>"$profile"; then wrote=1; else wrote=0; fi ;;
+  esac
+  printf '%s\n' "$added" | while IFS= read -r line; do
+    case $line in "" | "# Added by the loadout installer.") continue ;; esac
+    if [ "$wrote" = 1 ]; then
+      say "added to $profile, for new shells: $line"
+    else
+      say "warning: could not write $profile. Add this to your shell profile yourself: $line"
+    fi
+  done
+fi
 
 if [ -n "$loadout_url" ]; then
   cleanup
