@@ -49,10 +49,34 @@ Windows PowerShell:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
 ```
 
-The binary goes to `~/.local/bin` (or `%LOCALAPPDATA%\Programs\loadout`). If that folder isn't on
-`PATH`, call it by its full path or add the folder as the script says. Without a loadout URL, the
-script writes only that folder (the binary, its install record, and a lock file). It applies
-nothing and installs no service, so it is safe to run before asking about the user's loadout.
+The binary goes to `~/.local/bin` (or `%LOCALAPPDATA%\Programs\loadout`). Before that, the install
+scripts set up package managers so a loadout's programs can install, and `install.sh` makes `PATH`
+stick in later shells:
+
+- **macOS and Linux (`install.sh`):** runs Homebrew's installer when brew is missing. It asks for
+  the user's password on the terminal (on macOS it also brings `git` with the Command Line Tools;
+  on Linux `git` and `curl` must already be there, and the script stops if `git` is missing). It
+  then adds Homebrew's `shellenv` line and `~/.local/bin` to the shell's login profile, once:
+  `~/.zprofile` for zsh, `~/.bashrc` for bash on Linux, `~/.bash_profile` for bash on macOS,
+  `~/.profile` otherwise.
+- **Windows (`install.ps1`):** registers winget if it is missing, installs Scoop for the user,
+  installs Chocolatey only when run as an administrator, and installs `git` through Scoop. It never
+  edits `PATH`; it prints the command that adds its folder.
+
+So the installer is no longer write-only-its-folder. For a discovery install that changes nothing
+else, before you have asked the user, pass the opt-outs:
+
+```sh
+sh install.sh --no-homebrew --no-modify-path        # macOS and Linux
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1))) -NoPackageManagers
+```
+
+With those, and without a loadout URL, the script writes only its folder (the binary, its install
+record, and a lock file), applies nothing, and installs no service. If the folder isn't on `PATH`,
+call loadout by its full path.
 
 ```sh
 loadout --version          # loadout 0.1.2
@@ -197,6 +221,13 @@ Rules worth knowing before you write:
   variable is an error.
 - A narrower layer edits an inherited item by naming its id: fields merge, `remove = true` drops
   it, and `replace = true` swaps it whole.
+- A program installs only through a manager listed in its table that is on `PATH` when apply plans.
+  Casks are macOS-only, so a cask-only program is `unsupported` on Linux and Windows. Give a program
+  an `apt`, `dnf`, or `winget` id too if those machines need it without Homebrew.
+- A manager installed by the same run isn't seen until the next one: with `node` from brew and
+  `t3` from npm, `t3` is `unsupported` on the first apply and installs on the next sync.
+- A brew or cask id from a third-party tap (`oven-sh/bun/bun`) trusts that tap. Naming it is the
+  user's trust decision, so don't add a tap the user didn't ask for.
 
 [The loadout format](loadout-format.md) has every table, override rule, condition, path rule, and
 agent and manager table.
@@ -319,6 +350,11 @@ What apply guarantees:
   drifted is released from ownership and left in place. Programs are never uninstalled.
 - **MCP servers are per key.** Loadout edits only the keys it owns in an agent's shared config, and
   never overwrites a same-named server it didn't write.
+- **Programs install only when missing**, through the manager chosen at plan time. For a
+  third-party tap package, apply first runs `brew tap user/repo` and `brew trust --tap user/repo`
+  (Homebrew 7 refuses untrusted taps; an older brew without `trust` is accepted), then installs.
+  Plan never taps or trusts: it reads the package's folder under `Cellar` or `Caskroom` instead of
+  asking brew, so it stays read-only.
 
 Its output is one line per action, then the run id. For example:
 
@@ -341,6 +377,19 @@ prompt. Don't pass it unattended.
 
 ## 8. Set up a machine with init
 
+On a fresh machine, the install script does everything in one command: package managers, the CLI,
+the profile `PATH` lines, then `init`. The repository needs no credentials when it is public;
+loadout only reads it.
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh
+sh install.sh https://github.com/ada/loadout.git --name work-laptop
+```
+
+The `curl` line only downloads the script and prints nothing; the `sh` line runs it. On Linux run
+`sudo apt install -y git curl` (or the distribution's equivalent) first. With loadout already
+installed:
+
 ```sh
 loadout init https://github.com/ada/loadout.git --name work-laptop
 loadout init git@github.com:ada/loadout.git --name work-laptop --no-service
@@ -358,6 +407,13 @@ background sync service unless `--no-service` is passed or the loadout sets `[up
   the user's Git credential helper or SSH key.
 - Exits: 0 on success, 3 when the loadout is invalid (the service is then not installed), 4 when the
   apply or the service install was unhealthy, 1 on an error such as a failed clone.
+- **Brew must be on `PATH` when init runs.** The install script arranges that. An init run by hand
+  from a shell without Homebrew's `shellenv` line reports every brew program `unsupported`, and the
+  service records that same `PATH`. Fix the profile, open a new shell, then run
+  `loadout service install` so the service records the new `PATH`.
+- **The service syncs as soon as it is installed.** On Linux its systemd timer fires right away,
+  and a sync applies. Tell the user before running `loadout service install` if they asked for
+  nothing to be applied.
 
 ## 9. Sync
 
@@ -583,8 +639,12 @@ loadout validate . --json
 loadout plan --loadout . --json > plan.json
 loadout apply --loadout .
 
-# a new machine
-loadout init https://github.com/ada/loadout.git --name work-laptop
+# a new machine (package managers, the CLI, PATH, then init)
+curl -fsSL -o install.sh https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh
+sh install.sh https://github.com/ada/loadout.git --name work-laptop
+
+# install only the CLI, touching nothing else
+sh install.sh --no-homebrew --no-modify-path
 
 # keep it current
 loadout sync
