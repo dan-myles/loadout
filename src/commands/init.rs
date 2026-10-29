@@ -25,8 +25,8 @@ pub struct Args {
     /// Without it, init asks in a terminal and chooses none elsewhere
     #[arg(long = "profile", value_name = "PROFILE", value_parser = profile::profile_name, value_delimiter = ',')]
     pub profiles: Vec<String>,
-    /// This machine's name, only for a loadout that declares machines in [machines] [default: the
-    /// saved name, else one made from the hostname]
+    /// This machine's name, needed only for a loadout that declares machines in [machines]
+    /// [default: the saved name, else one made from the hostname]
     #[arg(long, value_name = "NAME", value_parser = machine_name)]
     pub name: Option<String>,
     /// Don't install the background sync service, even when the loadout's [update] auto is true

@@ -2,7 +2,7 @@
 # Install the loadout CLI on macOS or Linux from a GitHub release, then optionally run `loadout init`.
 #
 #   curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- https://github.com/you/your-loadout.git --name laptop
+#   curl -fsSL .../install.sh | sh -s -- https://github.com/you/your-loadout.git --profile laptop
 #
 # Run with --help for the options. docs/releasing.md describes every step and the install record.
 set -eu

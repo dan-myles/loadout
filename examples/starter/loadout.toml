@@ -2,9 +2,6 @@
 [loadout]
 version = 1
 
-[machines.work-laptop]
-tags = ["work"]
-
 [variables]
 name = "Ada Lovelace"
 email = "ada@example.com"

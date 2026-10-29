@@ -2,7 +2,7 @@
 Install the loadout CLI on Windows from a GitHub release, then optionally run `loadout init`.
 
   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
-  & ([scriptblock]::Create((irm .../install.ps1))) -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+  & ([scriptblock]::Create((irm .../install.ps1))) -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--profile','desktop'
   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v1.2.3
 
 -Version vX.Y.Z  install that release instead of the latest one

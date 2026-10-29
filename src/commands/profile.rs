@@ -30,8 +30,9 @@ pub enum Action {
     },
     /// Pick this machine's profiles from the loadout's list, in a terminal
     Choose,
-    /// Replace this machine's profiles; with none, it gets the global and OS layers only
+    /// Replace this machine's profiles; with none, it uses no profiles
     Set {
+        /// Profiles from the loadout's tags/ folder, in order; a later one wins a clash
         #[arg(value_name = "PROFILE", value_parser = profile_name, value_delimiter = ',')]
         profiles: Vec<String>,
     },

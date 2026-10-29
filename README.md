@@ -23,8 +23,9 @@ on macOS, Linux, and Windows.
 - **Built for coding agents.** Skills, `CLAUDE.md`/`AGENTS.md`-style instructions, and MCP servers
   reach exactly the agents you enable, at each agent's real path: Claude, Codex, Cursor, Grok,
   OpenCode, Pi, Muse, Antigravity, or one you declare.
-- **Layered, not forked.** Global, then OS, then tags such as `work` or `laptop`, then one machine.
-  A narrower layer adds, edits, replaces, or removes items from a broader one.
+- **Layered, not forked.** Global, then OS, then profiles such as `work` or `laptop`. Each machine
+  picks its profiles when you set it up, so the loadout never has to list your machines. A
+  narrower layer adds, edits, replaces, or removes items from a broader one.
 - **Safe by default.** `plan` shows every change first. `apply` backs up everything it overwrites,
   leaves a file you changed after it wrote it alone unless you pass `--force`, and `rollback`
   undoes a run.
@@ -108,12 +109,12 @@ to [`loadout init`](#quickstart).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh \
-  | sh -s -- https://github.com/you/your-loadout.git --name laptop
+  | sh -s -- https://github.com/you/your-loadout.git --profile laptop
 ```
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1))) `
-  -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--name','desktop'
+  -LoadoutUrl https://github.com/you/your-loadout.git -InitArgs '--profile','desktop'
 ```
 
 - **Pin a release** with `--version v0.1.1` (`sh -s -- --version v0.1.1`) or `-Version v0.1.1`.
@@ -176,16 +177,27 @@ plan for ada-desktop from /home/ada/my-loadout
 ```
 
 `apt` installs system-wide, so that program waits for `loadout apply --elevated`, and plan exits 4
-to say something is blocked. Until the machine is named, it goes by its hostname and gets only the
-global and OS layers. Once `init --name work-laptop` saves its name, the `work` tag applies too.
+to say something is blocked. The plan covers the global and OS layers: this machine hasn't chosen
+a profile yet, so `tags/work.toml` doesn't apply.
 
-**3. Push it, then set up each machine.** `init` clones the loadout, names the machine, applies,
-and installs a background sync.
+**3. Push it, then set up each machine.** `init` clones the loadout, asks which profiles this
+machine uses, applies, and installs a background sync. The machine keeps its choice, so you never
+add it to the loadout.
 
 ```sh
 git remote add origin git@github.com:you/loadout.git && git push -u origin main
-loadout init git@github.com:you/loadout.git --name work-laptop
+loadout init git@github.com:you/loadout.git
 ```
+
+```text
+profiles in this loadout:
+  1. work
+profiles for this machine, by number or name; - for none [none]: 1
+```
+
+Without a terminal, `init` asks nothing and chooses no profile; pass `--profile work` (repeat it
+or use commas) to choose up front. `loadout profile` shows this machine's profiles later, and
+`loadout profile set` or `loadout profile choose` changes them.
 
 **4. Keep it current.** Change the loadout repo, push, and every machine picks it up on its next
 background sync, or now with:
@@ -204,9 +216,8 @@ loadout status
 
 ```text
 my-loadout/
-├── loadout.toml                 the global layer, [loadout], and [machines]
-├── tags/work.toml               what every machine tagged "work" changes
-├── machines/work-laptop.toml    what one machine changes
+├── loadout.toml                 the global layer and [loadout]
+├── tags/work.toml               the "work" profile: what it changes on machines that choose it
 ├── files/gitconfig.tmpl         a templated user file
 ├── skills/code-review/SKILL.md  an agent skill
 └── instructions/AGENTS.md       global agent instructions
@@ -216,9 +227,6 @@ my-loadout/
 # loadout.toml
 [loadout]
 version = 1
-
-[machines.work-laptop]
-tags = ["work"]
 
 [variables]
 name = "Ada Lovelace"
@@ -250,7 +258,7 @@ winget = "BurntSushi.ripgrep.MSVC"
 ```toml
 # tags/work.toml
 [variables]
-email = "ada@work.example"             # wins on work machines
+email = "ada@work.example"             # wins on machines with the work profile
 
 [mcp.github]
 agents = ["claude"]                    # only Claude gets this server at work
@@ -269,7 +277,8 @@ agents = ["claude"]                    # only Claude gets this server at work
 ```
 
 The whole example is in [`examples/starter/`](examples/starter). Every table and rule is in
-[the loadout format](docs/loadout-format.md).
+[the loadout format](docs/loadout-format.md), including the optional `[machines]` table for a
+machine that needs its own layer.
 
 ## Commands
 
@@ -280,7 +289,8 @@ The whole example is in [`examples/starter/`](examples/starter). Every table and
 | `loadout plan [--loadout DIR] [--json]` | shows what apply would change here | no |
 | `loadout status [--json]` | shows what loadout owns, drift, and every run | no |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | brings this machine in line with the loadout | yes |
-| `loadout init <URL> [--name NAME] [--no-service]` | clones, names the machine, applies, schedules sync | yes |
+| `loadout init <URL> [--profile PROFILE]... [--no-service]` | clones, chooses this machine's profiles, applies, schedules sync | yes |
+| `loadout profile [list [--json]\|choose\|set [PROFILE]...]` | shows or changes this machine's profiles; `apply` or the next sync uses them | `set` and `choose` save the choice |
 | `loadout sync [--loadout DIR]` | fetches and fast-forwards loadout's clone, then applies | yes |
 | `loadout rollback [RUN]` | undoes the newest or the named run | yes |
 | `loadout service install\|uninstall\|status` | manages the scheduled background sync | install and uninstall |

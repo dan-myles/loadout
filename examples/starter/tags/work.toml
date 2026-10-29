@@ -3,3 +3,8 @@ email = "ada@work.example"
 
 [mcp.github]
 agents = ["claude"]
+
+[programs.jq]
+brew = "jq"
+apt = "jq"
+winget = "jqlang.jq"
