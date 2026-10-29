@@ -171,7 +171,7 @@ class InstallShTest(unittest.TestCase):
         (self.served / f"{ASSET}.sha256").write_bytes(sidecar.encode() if isinstance(sidecar, str) else sidecar)
         return archive
 
-    def install(self, *args, path=None, home=None, **env):
+    def install(self, *args, path=None, home=None, homebrew=False, **env):
         variables = dict(
             os.environ,
             HOME=str(home or self.home),
@@ -181,7 +181,8 @@ class InstallShTest(unittest.TestCase):
             **{"HOMEBREW_PREFIX": "", **env},
         )
         return subprocess.run(
-            ["/bin/sh", str(SCRIPT), "--base-url", self.base, *args],
+            # Only the tests about Homebrew let a host without it run Homebrew's installer.
+            ["/bin/sh", str(SCRIPT), "--base-url", self.base, *(() if homebrew else ("--no-homebrew",)), *args],
             cwd=str(self.cwd),
             env=variables,
             stdout=subprocess.PIPE,
@@ -628,13 +629,13 @@ class InstallShTest(unittest.TestCase):
     def test_missing_git_prints_guidance_and_installs_nothing(self):
         for os_name, hint in (("Linux", "sudo apt install git"), ("Darwin", "xcode-select --install")):
             with self.subTest(os=os_name):
-                result = self.install("--no-homebrew", path=str(self.fakebin), FAKE_OS=os_name)
+                result = self.install(path=str(self.fakebin), FAKE_OS=os_name)
                 self.assert_refused(result, "git is required", None)
                 self.assertIn(hint, result.stderr)
 
-    def publish_macos(self):
-        # A loadout that records the PATH init runs with, under the macOS asset name.
-        prefix = "loadout-x86_64-apple-darwin"
+    def publish_recording_path(self, target="x86_64-apple-darwin"):
+        # A loadout that records the PATH init runs with.
+        prefix = f"loadout-{target}"
         binary = fake_loadout().replace(b"exit 7", b'printf "%s" "$PATH" > "$LOADOUT_TEST_ARGS.path"\nexit 7')
         archive = tar_gz([(prefix, "dir", None), (f"{prefix}/loadout", "file", binary)])
         (self.served / f"{prefix}.tar.gz").write_bytes(archive)
@@ -662,14 +663,16 @@ class InstallShTest(unittest.TestCase):
 
     def skip_if_host_has_homebrew(self):
         # find_brew also looks in Homebrew's default prefixes, which a test PATH can't hide.
-        if any(Path(p).exists() for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")):
+        prefixes = ("/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/home/linuxbrew/.linuxbrew/bin/brew",
+                    str(self.home / ".linuxbrew" / "bin" / "brew"))
+        if any(Path(p).exists() for p in prefixes):
             self.skipTest("this host has Homebrew in a default prefix")
 
     def test_macos_without_homebrew_runs_its_installer_then_init_with_brew_on_path(self):
         self.skip_if_host_has_homebrew()
-        self.publish_macos()
+        self.publish_recording_path()
         self.serve_homebrew_installer()
-        result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(),
+        result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(), homebrew=True,
                               FAKE_OS="Darwin", HOMEBREW_PREFIX=str(self.brew_prefix))
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertTrue((self.tmp / "homebrew-ran").exists())
@@ -678,11 +681,11 @@ class InstallShTest(unittest.TestCase):
 
     def test_an_installed_brew_off_path_is_put_on_path_for_init(self):
         self.skip_if_host_has_homebrew()
-        self.publish_macos()
+        self.publish_recording_path()
         self.serve_homebrew_installer()
         (self.served / "homebrew-install.sh").unlink()
         self.write_exe(self.brew_prefix / "bin" / "brew", (self.tmp / "fake-brew").read_text())
-        result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(),
+        result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(), homebrew=True,
                               FAKE_OS="Darwin", HOMEBREW_PREFIX=str(self.brew_prefix))
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertNotIn("running its installer", result.stderr)
@@ -690,19 +693,35 @@ class InstallShTest(unittest.TestCase):
 
     def test_a_failed_homebrew_install_installs_nothing(self):
         self.skip_if_host_has_homebrew()
-        self.publish_macos()
+        self.publish_recording_path()
         self.serve_homebrew_installer(body="exit 3\n")
-        result = self.install(path=self.path_without(), FAKE_OS="Darwin")
+        result = self.install(path=self.path_without(), homebrew=True, FAKE_OS="Darwin")
         self.assert_refused(result, "Homebrew's installer failed", None)
 
+    def test_linux_without_homebrew_runs_its_installer_then_init_with_brew_on_path(self):
+        self.skip_if_host_has_homebrew()
+        self.publish_recording_path(TARGET)
+        self.serve_homebrew_installer()
+        result = self.install("https://example.invalid/me/loadout.git", path=self.path_without(), homebrew=True,
+                              HOMEBREW_PREFIX=str(self.brew_prefix))
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertTrue((self.tmp / "homebrew-ran").exists())
+        self.assertIn(str(self.brew_prefix / "bin"), Path(f"{self.init_args}.path").read_text().split(":"))
+
+    def test_linux_without_git_stops_before_homebrew(self):
+        self.serve_homebrew_installer(body=f": > '{self.tmp}/homebrew-ran'\n")
+        result = self.install(path=str(self.fakebin), homebrew=True)
+        self.assert_refused(result, "git is required", None)
+        self.assertFalse((self.tmp / "homebrew-ran").exists())
+
     def test_macos_with_homebrew_or_no_homebrew_never_fetches_its_installer(self):
-        self.publish_macos()
+        self.publish_recording_path()
         with_brew = self.path_without()
         self.write_exe(Path(with_brew) / "brew", "#!/bin/sh\nexit 0\n")
         for args, path in (((), with_brew), (("--no-homebrew",), self.path_without("curl-kept"))):
             with self.subTest(args=args):
                 shutil.rmtree(self.home / ".local", ignore_errors=True)
-                result = self.install(*args, path=path, FAKE_OS="Darwin")
+                result = self.install(*args, path=path, homebrew=True, FAKE_OS="Darwin")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("running its installer", result.stderr)
 

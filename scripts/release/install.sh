@@ -23,8 +23,9 @@ usage() {
 usage: install.sh [--version vX.Y.Z] [--base-url URL] [--no-homebrew] [LOADOUT_URL [INIT_ARGS...]]
 
 Installs loadout to ~/.local/bin after verifying the release archive's sha256. Needs curl and git.
-On macOS without Homebrew, it first runs Homebrew's installer, which also brings git through the
-Command Line Tools, so a loadout's brew and cask programs can install.
+Without Homebrew, it first runs Homebrew's installer, so a loadout's brew programs (and casks, on
+macOS) can install. On macOS that also brings git through the Command Line Tools; on Linux git, curl,
+and a compiler must already be there.
   --version vX.Y.Z   install that release instead of the latest one
   --base-url URL     fetch the assets, and Homebrew's installer, from URL instead of GitHub:
                      https, or http on localhost
@@ -157,7 +158,8 @@ require_git() {
 # Prints the brew on PATH, in $HOMEBREW_PREFIX, or in Homebrew's default prefixes, or returns 1.
 find_brew() {
   if command -v brew 2>/dev/null; then return 0; fi
-  for brew_path in ${HOMEBREW_PREFIX:+"$HOMEBREW_PREFIX/bin/brew"} /opt/homebrew/bin/brew /usr/local/bin/brew; do
+  for brew_path in ${HOMEBREW_PREFIX:+"$HOMEBREW_PREFIX/bin/brew"} /opt/homebrew/bin/brew /usr/local/bin/brew \
+    /home/linuxbrew/.linuxbrew/bin/brew "$HOME/.linuxbrew/bin/brew"; do
     if [ -x "$brew_path" ]; then
       printf '%s\n' "$brew_path"
       return 0
@@ -166,13 +168,11 @@ find_brew() {
   return 1
 }
 
-# Homebrew's installer brings git along, so on macOS a missing git waits until it has run.
+# On macOS Homebrew's installer brings git along, so a missing git waits until it has run. On Linux
+# the installer needs git itself.
 bootstrap_homebrew=0
-if [ "$os" = Darwin ] && [ "$homebrew" = 1 ] && ! find_brew >/dev/null; then
-  bootstrap_homebrew=1
-else
-  require_git
-fi
+if [ "$homebrew" = 1 ] && ! find_brew >/dev/null; then bootstrap_homebrew=1; fi
+if [ "$os" != Darwin ] || [ "$bootstrap_homebrew" = 0 ]; then require_git; fi
 # wget can't be restricted to https redirects, so it is not a fallback.
 command -v curl >/dev/null 2>&1 || die "curl is required to download loadout over https only. Install curl, then run this installer again"
 command -v tar >/dev/null 2>&1 || die "tar is required to unpack loadout"
@@ -375,15 +375,18 @@ if [ "$bootstrap_homebrew" = 1 ]; then
   else
     NONINTERACTIVE=1 /bin/bash "$tmp/homebrew-install.sh" </dev/null || die "Homebrew's installer failed"
   fi
-  find_brew >/dev/null || die "Homebrew's installer finished, but brew is not on PATH or in /opt/homebrew or /usr/local"
+  find_brew >/dev/null || die "Homebrew's installer finished, but brew is not on PATH or in its default prefix"
 fi
 
 # The init below, and the background service it records PATH for, find brew only on PATH, which a
 # fresh install or a shell without Homebrew's profile line doesn't have yet.
-if [ "$os" = Darwin ] && ! command -v brew >/dev/null 2>&1 && brew=$(find_brew); then
-  brew_env=$("$brew" shellenv) || die "$brew shellenv failed"
-  eval "$brew_env"
-  say "put Homebrew on PATH for this install. To keep it there in new shells, add this to your shell profile: eval \"\$($brew shellenv)\""
+if ! command -v brew >/dev/null 2>&1 && brew=$(find_brew); then
+  if brew_env=$("$brew" shellenv); then
+    eval "$brew_env"
+    say "put Homebrew on PATH for this install. To keep it there in new shells, add this to your shell profile: eval \"\$($brew shellenv)\""
+  else
+    say "warning: $brew shellenv failed, so init won't find brew and the loadout's brew programs won't install"
+  fi
 fi
 if [ "$bootstrap_homebrew" = 1 ]; then require_git; fi
 

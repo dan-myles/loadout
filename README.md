@@ -61,7 +61,8 @@ command takes a fresh machine to an applied loadout:
   with the Command Line Tools. Pass `--no-homebrew` to skip it.
 - **Windows:** winget (registering App Installer if needed), Scoop for your user, Chocolatey when
   run as an administrator, and `git` through Scoop. Pass `-NoPackageManagers` to skip them.
-- **Linux:** nothing; the distribution's own manager is already there.
+- **Linux:** Homebrew, through its own installer. `git`, `curl`, and a compiler (`build-essential`
+  or your distribution's equivalent) must already be there. Pass `--no-homebrew` to skip it.
 
 | OS | CPU | Script |
 | --- | --- | --- |
@@ -69,7 +70,7 @@ command takes a fresh machine to an applied loadout:
 | Linux, any distribution (static musl build) | x86_64 and aarch64 | `install.sh` |
 | Windows | x64 and ARM64 | `install.ps1` |
 
-**macOS and Linux**, from any POSIX shell. Needs `curl`, and `git` on Linux.
+**macOS and Linux**, from any POSIX shell. Needs `curl`, plus `git` and a compiler on Linux.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
