@@ -114,13 +114,20 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     } else {
         args.profiles.clone()
     };
-    let unknown: Vec<&String> = match &loadout {
-        Some(_) => profiles
-            .iter()
-            .filter(|profile| !available.contains(profile))
-            .collect(),
+    let profiles = match &loadout {
+        Some(_) => profiles,
+        None if !profiles.is_empty() => {
+            println!(
+                "profiles not saved: the loadout is invalid, so they can't be checked; fix it, then run `loadout profile set PROFILE...`"
+            );
+            Vec::new()
+        }
         None => Vec::new(),
     };
+    let unknown = loadout
+        .as_ref()
+        .map(|loadout| loadout.unknown_profiles(&profiles))
+        .unwrap_or_default();
     if !unknown.is_empty() {
         machine::save(context, &name, &args.url, &[])?;
         for profile in unknown {

@@ -106,6 +106,15 @@ impl Loadout {
             .collect()
     }
 
+    /// The entries of `chosen` that name no profile in this loadout.
+    pub fn unknown_profiles<'a>(&self, chosen: &'a [String]) -> Vec<&'a String> {
+        let profiles = self.profiles();
+        chosen
+            .iter()
+            .filter(|profile| !profiles.contains(profile))
+            .collect()
+    }
+
     pub fn global(&self) -> &Layer {
         &self.layers[0].layer
     }

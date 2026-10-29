@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use serde::Serialize;
@@ -64,15 +64,11 @@ struct Entry<'a> {
 /// `machine.toml`, never in the loadout, and every later plan, apply, and sync uses them.
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = plan::checkout(context, args.loadout.as_deref())?;
-    let loadout = match Loadout::load_guarded(&checkout, context) {
-        Ok((loadout, _)) => loadout,
-        Err(diagnostics) => {
-            for diagnostic in diagnostics.iter() {
-                println!("{diagnostic}");
-            }
-            println!("invalid: fix the loadout first; `loadout validate` shows the same problems");
-            return Ok(Exit::Invalid);
-        }
+    if let Some(Action::Set { profiles }) = &args.action {
+        return set(context, &checkout, profiles);
+    }
+    let Some(loadout) = load(context, &checkout) else {
+        return Ok(Exit::Invalid);
     };
     let available = loadout.profiles();
     let name = machine::name(context)?.name;
@@ -106,7 +102,6 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
             println!("{}", serde_json::to_string_pretty(&listing)?);
             Ok(Exit::Success)
         }
-        Some(Action::Set { profiles }) => set(context, &available, profiles),
         Some(Action::Choose) => {
             if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
                 anyhow::bail!(
@@ -120,7 +115,21 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
                 &mut io::stdin().lock(),
                 &mut io::stdout(),
             )?;
-            set(context, &available, &picked)
+            set(context, &checkout, &picked)
+        }
+        Some(Action::Set { .. }) => unreachable!("set returned above"),
+    }
+}
+
+fn load(context: &Context, checkout: &Path) -> Option<Loadout> {
+    match Loadout::load_guarded(checkout, context) {
+        Ok((loadout, _)) => Some(loadout),
+        Err(diagnostics) => {
+            for diagnostic in diagnostics.iter() {
+                println!("{diagnostic}");
+            }
+            println!("invalid: fix the loadout first; `loadout validate` shows the same problems");
+            None
         }
     }
 }
@@ -161,20 +170,22 @@ fn summary(chosen: &[String]) -> String {
     }
 }
 
-fn set(context: &Context, available: &[String], profiles: &[String]) -> anyhow::Result<Exit> {
-    let unknown: Vec<&String> = profiles
-        .iter()
-        .filter(|profile| !available.contains(profile))
-        .collect();
+/// Checks `profiles` against the checkout as it is once the lock is held, so a sync that lands
+/// while `choose` is asking can't leave a profile saved that the loadout no longer has.
+fn set(context: &Context, checkout: &Path, profiles: &[String]) -> anyhow::Result<Exit> {
+    let _lock = state::lock(context)?;
+    let Some(loadout) = load(context, checkout) else {
+        return Ok(Exit::Invalid);
+    };
+    let unknown = loadout.unknown_profiles(profiles);
     if !unknown.is_empty() {
         for profile in &unknown {
             println!("no profile {profile} in this loadout (no tags/{profile}.toml)");
         }
-        println!("{}", offered(available));
+        println!("{}", offered(&loadout.profiles()));
         println!("nothing changed");
         return Ok(Exit::Invalid);
     }
-    let _lock = state::lock(context)?;
     machine::save_profiles(context, profiles).context("cannot save this machine's profiles")?;
     println!("{}", summary(profiles));
     println!(
@@ -243,15 +254,14 @@ fn parse(answer: &str, available: &[String]) -> Result<Option<Vec<String>>, Stri
     }
     let mut picked: Vec<String> = Vec::new();
     for word in answer.split([',', ' ']).filter(|word| !word.is_empty()) {
-        let profile = match word.parse::<usize>() {
-            Ok(number) => number
+        let by_name = available.iter().find(|profile| *profile == word);
+        let profile = match (by_name, word.parse::<usize>()) {
+            (Some(profile), _) => profile,
+            (None, Ok(number)) => number
                 .checked_sub(1)
                 .and_then(|index| available.get(index))
                 .ok_or_else(|| format!("{word} is not a number in the list"))?,
-            Err(_) => available
-                .iter()
-                .find(|profile| *profile == word)
-                .ok_or_else(|| format!("{word:?} is not a profile in this loadout"))?,
+            (None, Err(_)) => return Err(format!("{word:?} is not a profile in this loadout")),
         };
         if !picked.contains(profile) {
             picked.push(profile.clone());
@@ -290,6 +300,14 @@ mod tests {
         assert!(pick(&[], "\n").0.is_empty());
         assert_eq!(pick(&["work"], "").0, ["work"]);
         assert_eq!(pick(&["work"], "\n").0, ["work"]);
+    }
+
+    #[test]
+    fn a_profile_named_like_a_number_is_chosen_by_name() {
+        let available: Vec<String> = ["2", "work"].map(str::to_owned).to_vec();
+        let mut output = Vec::new();
+        let picked = ask(&available, &[], &[], &mut "2\n".as_bytes(), &mut output).unwrap();
+        assert_eq!(picked, ["2"]);
     }
 
     #[test]

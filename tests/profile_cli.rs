@@ -309,3 +309,16 @@ fn validate_checks_each_profile_for_a_machine_the_loadout_never_names() {
         text(&validate)
     );
 }
+
+#[test]
+fn init_saves_no_profile_it_cannot_check_against_an_invalid_loadout() {
+    let machine = Machine::with_base_development_and_work("[bogus]\nkey = 1\n");
+    let init = machine.init(&["--profile", "development"]);
+    assert_code(&init, 3);
+    assert!(
+        text(&init).contains("profiles not saved"),
+        "{}",
+        text(&init)
+    );
+    assert!(!machine.machine_file().contains("profiles"));
+}
