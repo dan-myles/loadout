@@ -178,6 +178,16 @@ find_brew() {
 # the installer needs git itself.
 bootstrap_homebrew=0
 if [ "$homebrew" = 1 ] && ! find_brew >/dev/null; then bootstrap_homebrew=1; fi
+# A Homebrew installed as root leaves a prefix that only root can write, and every later brew as
+# your own user then fails; Homebrew's installer asks for sudo itself when it needs it.
+if [ "$bootstrap_homebrew" = 1 ]; then
+  uid=$(id -u) || die "id -u failed, so this installer can't tell whether it would install Homebrew as root"
+  if [ "$uid" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    die "Homebrew must not be installed as root, and this installer is running through sudo. Run it again as $SUDO_USER, without sudo, or pass --no-homebrew to install loadout for root without Homebrew"
+  elif [ "$uid" = 0 ]; then
+    die "Homebrew must not be installed as root. Run this installer again as your own user, or pass --no-homebrew to install loadout for root without Homebrew"
+  fi
+fi
 if [ "$os" != Darwin ] || [ "$bootstrap_homebrew" = 0 ]; then require_git; fi
 # wget can't be restricted to https redirects, so it is not a fallback.
 command -v curl >/dev/null 2>&1 || die "curl is required to download loadout over https only. Install curl, then run this installer again"

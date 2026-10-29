@@ -55,7 +55,9 @@ stick in later shells:
 
 - **macOS and Linux (`install.sh`):** runs Homebrew's installer when brew is missing. It asks for
   the user's password on the terminal (on macOS it also brings `git` with the Command Line Tools;
-  on Linux `git` and `curl` must already be there, and the script stops if `git` is missing). It
+  on Linux `git` and `curl` must already be there, and the script stops if `git` is missing). Run
+  as root or through `sudo`, it stops before any download instead of installing Homebrew as root,
+  and says to run it as the user or pass `--no-homebrew`. It
   then adds Homebrew's `shellenv` line and `~/.local/bin` to the shell's login profile, once:
   `~/.zprofile` for zsh, `~/.bashrc` for bash on Linux, `~/.bash_profile` for bash on macOS,
   `~/.profile` otherwise. In `~/.bashrc` they go at the top, above Ubuntu's and Debian's early
