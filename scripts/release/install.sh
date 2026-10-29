@@ -178,8 +178,6 @@ find_brew() {
 # the installer needs git itself.
 bootstrap_homebrew=0
 if [ "$homebrew" = 1 ] && ! find_brew >/dev/null; then bootstrap_homebrew=1; fi
-# A Homebrew installed as root leaves a prefix that only root can write, and every later brew as
-# your own user then fails; Homebrew's installer asks for sudo itself when it needs it.
 if [ "$bootstrap_homebrew" = 1 ]; then
   uid=$(id -u) || die "id -u failed, so this installer can't tell whether it would install Homebrew as root"
   if [ "$uid" = 0 ] && [ -n "${SUDO_USER:-}" ]; then

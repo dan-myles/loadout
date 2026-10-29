@@ -39,7 +39,6 @@ case $1 in
   -m) echo "${FAKE_ARCH:-x86_64}" ;;
 esac
 """
-# The effective UID install.sh sees, so the Homebrew tests run the same whether the host runs them as root.
 FAKE_ID = """#!/bin/sh
 [ "$1" = -u ] && echo "${FAKE_UID:-1000}"
 """
