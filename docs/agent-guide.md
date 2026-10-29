@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.5` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.6` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -86,7 +86,7 @@ record, and a lock file), applies nothing, and installs no service. If the folde
 call loadout by its full path.
 
 ```sh
-loadout --version          # loadout 0.1.5
+loadout --version          # loadout 0.1.6
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go
@@ -441,6 +441,11 @@ passed or the loadout sets `[update] auto = false`. The machine doesn't need to 
 - **Change profiles later** with `loadout profile set <profile>...` (`--none` clears them) or
   `loadout profile choose`, then `loadout apply`. The background sync uses the saved choice and
   never asks.
+- **Upgrade every loadout binary first.** Loadout 0.1.5 and older can't read a `machine.toml`
+  with saved profiles: doctor fails on ``unknown field `profiles` `` and plan and apply block. That
+  includes the binary the background job was registered with, which `loadout service status`
+  names: upgrade it, or run `loadout service install` from the new one. To go back to an older
+  binary, run `loadout profile set --none` first.
 - **`--name` is for declared machines.** Init asks for a name only when the loadout has
   `[machines]` and it runs in a terminal; otherwise the name comes from the hostname. A saved name
   never changes: a different `--name` on a machine that already has one is refused.
