@@ -70,8 +70,11 @@ pub(super) fn finish(
         .collect();
     let programs = present(&merged.programs, facts)
         .map(|(id, item)| {
-            let packages = item.draft.packages.clone();
-            (id.clone(), Program { packages })
+            let program = Program {
+                packages: item.draft.packages.clone(),
+                apt_repo: item.draft.apt_repo.clone(),
+            };
+            (id.clone(), program)
         })
         .collect();
 

@@ -478,11 +478,25 @@ pub struct ProgramPatch {
     pub uv: Option<String>,
     pub pipx: Option<String>,
     pub go: Option<String>,
+    #[serde(rename = "apt-repo")]
+    pub apt_repo: Option<AptRepo>,
     pub when: Option<Condition>,
     #[serde(default)]
     pub remove: bool,
     #[serde(default)]
     pub replace: bool,
+}
+
+/// The third-party apt repository an `apt` package comes from. Naming it in the loadout is the
+/// trust, as with a brew tap. `{codename}` in any field becomes the machine's
+/// `VERSION_CODENAME`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AptRepo {
+    pub url: String,
+    pub key: String,
+    pub suite: Option<String>,
+    pub components: Option<Vec<String>>,
 }
 
 impl ProgramPatch {

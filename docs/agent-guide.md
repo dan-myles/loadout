@@ -228,6 +228,10 @@ Rules worth knowing before you write:
   `t3` from npm, `t3` is `unsupported` on the first apply and installs on the next sync.
 - A brew or cask id from a third-party tap (`oven-sh/bun/bun`) trusts that tap. Naming it is the
   user's trust decision, so don't add a tap the user didn't ask for.
+- An `apt` package that isn't in the distro's own repositories names its repository with
+  `apt-repo = { url = "https://…", key = "https://…" }` (optional `suite`, default `{codename}`,
+  and `components`, default `["main"]`). It is a trust decision like a tap: add one only for a
+  repository the user asked for, and take the URL and key from the vendor's install docs.
 
 [The loadout format](loadout-format.md) has every table, override rule, condition, path rule, and
 agent and manager table.
@@ -354,7 +358,13 @@ What apply guarantees:
   third-party tap package, apply first runs `brew tap user/repo` and `brew trust --tap user/repo`
   (Homebrew 7 refuses untrusted taps; an older brew without `trust` is accepted), then installs.
   Plan never taps or trusts: it reads the package's folder under `Cellar` or `Caskroom` instead of
-  asking brew, so it stays read-only.
+  asking brew, so it stays read-only. For an apt package with an `apt-repo`, apply (elevated, like
+  any apt install) first downloads the key to `/etc/apt/keyrings/loadout-<id>.{gpg,asc}`, writes
+  `/etc/apt/sources.list.d/loadout-<id>.list`, and runs `apt-get update` for that list only. Plan
+  shows it as an ordinary `install`; a machine that already has the package is never touched,
+  and a repository another source already names (say, from the vendor's install script) is left
+  as it is.
+  A failure here is `programs.<id>: cannot add its apt repository: …` or the failed command.
 
 Its output is one line per action, then the run id. For example:
 

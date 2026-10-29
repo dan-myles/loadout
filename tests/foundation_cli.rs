@@ -1726,3 +1726,32 @@ fn relative_home_override_is_a_runtime_error() {
         String::from_utf8_lossy(&output.stderr).contains("LOADOUT_HOME must be an absolute path")
     );
 }
+
+#[test]
+fn an_apt_repo_is_https_words_with_only_the_codename_placeholder() {
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n\
+         [programs.ok]\napt = \"ok\"\n\
+         apt-repo = { url = \"https://pkgs.example.com/{codename}\", key = \"https://pkgs.example.com/k.gpg\" }\n\
+         [programs.bad]\napt = \"bad\"\n\
+         apt-repo = { url = \"http://pkgs.example.com\", key = \"https://k [trusted=yes]\", suite = \"{distro}\", components = [] }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(!text.contains("programs.ok"), "{text}");
+    assert!(
+        text.contains("programs.bad.apt-repo.url: must be an https:// URL"),
+        "{text}"
+    );
+    assert!(
+        text.contains("programs.bad.apt-repo.key: must be one non-empty word"),
+        "{text}"
+    );
+    assert!(
+        text.contains("programs.bad.apt-repo.suite: the only placeholder is {codename}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("programs.bad.apt-repo.components: needs at least one component"),
+        "{text}"
+    );
+}

@@ -308,12 +308,32 @@ The language managers come in the order `cargo`, `uv`, `pipx`, `npm`, `pnpm`, `b
 - A brew or cask id from a third-party tap, such as `oven-sh/bun/bun`, trusts that tap: apply runs
   `brew tap` and `brew trust --tap` before installing it, and its installed check reads the keg in
   `Cellar` or `Caskroom` so plan never needs the trust.
+- An `apt` package from a third-party repository names that repository with `apt-repo`. Naming it
+  is the trust, as with a tap:
+
+  ```toml
+  [programs.tailscaled]
+  brew = "tailscale"
+  apt = "tailscale"
+  apt-repo = { url = "https://pkgs.tailscale.com/stable/ubuntu", key = "https://pkgs.tailscale.com/stable/ubuntu/{codename}.noarmor.gpg" }
+  ```
+
+  `url` and `key` are `https://` URLs. `suite` defaults to `{codename}` and `components` to
+  `["main"]`. `{codename}` is the machine's `VERSION_CODENAME` from `/etc/os-release`, and is the
+  only placeholder. Only when the apt package is missing does apply download the key into
+  `/etc/apt/keyrings/loadout-<id>.gpg` (`.asc` if it is ASCII-armored), write
+  `/etc/apt/sources.list.d/loadout-<id>.list` signed by only that key, run `apt-get update` for
+  that list alone, then install. A machine that already has the package is never touched, and a
+  repository some other source already names is left as it is, since apt refuses two `signed-by`
+  keys for one repository. The
+  files stay after an uninstall or rollback, like the package. A PPA works the same way, with its
+  `ppa.launchpadcontent.net` URL and its key from `keyserver.ubuntu.com`.
 - Per-user managers run directly. System-wide ones (`apt`, `dnf`, `pacman`, `zypper`, `snap`,
   `choco`, machine-scoped winget installers) are `blocked` unless `loadout apply --elevated` is
   passed. The background sync never elevates.
 - A program with no available manager is `unsupported` on that machine.
-- `apply` and the background sync never install a package manager, and never run a download or an
-  install script. The install scripts set up Homebrew on macOS and Linux, and winget, Scoop, and Chocolatey
+- `apply` and the background sync never install a package manager, and never run an install
+  script. The only download is an `apt-repo` signing key. The install scripts set up Homebrew on macOS and Linux, and winget, Scoop, and Chocolatey
   (as an administrator) on Windows, before the first init.
 
 ## Validation

@@ -439,6 +439,7 @@ mod tests {
             "rg".to_owned(),
             Program {
                 packages: BTreeMap::from([(Manager::Apt, "ripgrep".to_owned())]),
+                apt_repo: None,
             },
         )]);
         let steps = Steps {

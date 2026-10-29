@@ -5,8 +5,8 @@ use super::{Update, report};
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::machine::Facts;
 use crate::manifest::{
-    Condition, CustomAgent, FilePatch, InstructionsPatch, LayerFile, List, ListEdit, Loadout,
-    Manager, McpPatch, ProgramPatch, ROOT_FILE, Scope, SkillPatch, Value, Variable,
+    AptRepo, Condition, CustomAgent, FilePatch, InstructionsPatch, LayerFile, List, ListEdit,
+    Loadout, Manager, McpPatch, ProgramPatch, ROOT_FILE, Scope, SkillPatch, Value, Variable,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +234,7 @@ impl Draft for McpDraft {
 #[derive(Debug, Default)]
 pub(super) struct ProgramDraft {
     pub(super) packages: BTreeMap<Manager, String>,
+    pub(super) apt_repo: Option<AptRepo>,
     pub(super) when: Option<Condition>,
 }
 
@@ -249,6 +250,7 @@ impl Draft for ProgramDraft {
         for (manager, package) in patch.packages() {
             self.packages.insert(manager, package.to_owned());
         }
+        set(&mut self.apt_repo, patch.apt_repo.as_ref());
         set(&mut self.when, patch.when.as_ref());
     }
 

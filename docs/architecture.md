@@ -1510,8 +1510,18 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
 - **Isolation.** Under `LOADOUT_HOME` (`Context.isolated`), every program step is
   `blocked("programs are not installed under LOADOUT_HOME isolation")` and no manager is run.
   Real installs are tested only in a disposable VM guest's actual `HOME` (section 4).
-- No direct downloads and no install scripts in v1. The CLI never installs a package manager itself;
-  doctor names what is missing. The install scripts (section 9) set them up before the first init.
+- **Apt repositories.** `apt-repo = { url, key, suite?, components? }` names the third-party
+  repository of an item's `apt` package; `{codename}` (from `/etc/os-release`) is its only
+  placeholder. It travels on `Missing` only when apt was selected. `programs::install` adds it
+  just before the apt install, elevated: the key goes to `/etc/apt/keyrings/loadout-<id>.gpg`
+  (`.asc` when armored), a `deb [signed-by=…]` line to
+  `/etc/apt/sources.list.d/loadout-<id>.list`, then `apt-get update` reads only that list. Plan
+  never fetches or writes; an installed package never triggers it, and a URL another source
+  already names is skipped (apt rejects conflicting `signed-by` keys for one repository). The files are not recorded
+  in state and are never removed.
+- No install scripts in v1, and the only direct download is an `apt-repo` key. The CLI never
+  installs a package manager itself; doctor names what is missing. The install scripts
+  (section 9) set them up before the first init.
 
 ### How U7 runs each manager (built)
 

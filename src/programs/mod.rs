@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use crate::context::{self, Context};
 use crate::diagnostic::{Check, CheckStatus};
 use crate::machine::Facts;
-use crate::manifest::Manager;
+use crate::manifest::{AptRepo, Manager};
 use crate::platform::Os;
 use crate::process::{self, Containment};
 use crate::resolve::Program;
 
+mod apt_repo;
 mod detect;
 mod manager;
 
@@ -85,6 +86,8 @@ pub enum Error {
         status: String,
         output: String,
     },
+    #[error("programs.{program}: cannot add its apt repository: {detail}")]
+    AptRepo { program: String, detail: String },
     #[error(
         "programs.{program}: {manager} reported success, but {package:?} is still not installed"
     )]
@@ -151,6 +154,7 @@ pub struct Missing {
     package: Package,
     scope: Scope,
     containment: Containment,
+    apt_repo: Option<AptRepo>,
 }
 
 impl Missing {
@@ -235,6 +239,10 @@ fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Resu
         {
             Observation::Installed => State::Installed(package),
             Observation::Missing(scope) => State::Missing(Missing {
+                apt_repo: program
+                    .apt_repo
+                    .clone()
+                    .filter(|_| package.manager == Manager::Apt),
                 package,
                 scope,
                 containment: containment.clone(),
@@ -437,6 +445,7 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
         });
     }
     trust_tap(program, package, &missing.containment)?;
+    add_apt_repo(program, missing)?;
     let invocation = manager::install(manager, &package.executable, &package.id, missing.scope);
     let invocation = if missing.scope == Scope::System {
         elevate(invocation).ok_or_else(|| Error::NoSudo {
@@ -486,19 +495,7 @@ fn trust_tap(program: &str, package: &Package, containment: &Containment) -> Res
     for args in [&["tap", tap][..], &["trust", "--tap", tap][..]] {
         let invocation = Invocation::new(&package.executable, args);
         let command = invocation.display();
-        let output = process::install(&invocation, containment).map_err(|source| {
-            if process::install_refused(&source) {
-                Error::NotStarted {
-                    program: program.to_owned(),
-                }
-            } else {
-                Error::Spawn {
-                    program: program.to_owned(),
-                    command: command.clone(),
-                    source,
-                }
-            }
-        })?;
+        let output = run(program, &invocation, containment)?;
         let older_brew = args[0] == "trust" && output.stderr.contains("Unknown command");
         if !output.success() && !older_brew {
             return Err(Error::Install {
@@ -510,6 +507,113 @@ fn trust_tap(program: &str, package: &Package, containment: &Containment) -> Res
         }
     }
     Ok(())
+}
+
+/// Adds the apt repository the loadout names for this package: its key under
+/// `/etc/apt/keyrings`, a `sources.list.d` entry signed by only that key, and an `apt-get update`
+/// of only that entry. Runs as root, like the apt install it precedes, and only for a missing
+/// package, so a machine that already has the package is never touched.
+fn add_apt_repo(program: &str, missing: &Missing) -> Result<(), Error> {
+    let Some(repo) = &missing.apt_repo else {
+        return Ok(());
+    };
+    let failed = |detail: String| Error::AptRepo {
+        program: program.to_owned(),
+        detail,
+    };
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let repo =
+        apt_repo::fill(repo, apt_repo::codename(&os_release).as_deref()).ok_or_else(|| {
+            failed("it uses {codename}, and /etc/os-release has no VERSION_CODENAME".to_owned())
+        })?;
+    if apt_repo::configured(&repo.url, &apt_repo::list(program)) {
+        return Ok(());
+    }
+    let key = apt_repo::fetch_key(&repo.key).map_err(failed)?;
+    let entry = apt_repo::entry(program, &repo, &key);
+    let install =
+        context::which("install").ok_or_else(|| failed("install is not on PATH".to_owned()))?;
+    let staging = std::env::temp_dir().join(format!("loadout-apt-{}", std::process::id()));
+    let staged = |name: &str, bytes: &[u8]| -> Result<PathBuf, Error> {
+        std::fs::create_dir_all(&staging)
+            .and_then(|()| std::fs::write(staging.join(name), bytes))
+            .map(|()| staging.join(name))
+            .map_err(|error| failed(format!("cannot stage {name}: {error}")))
+    };
+    let result = (|| {
+        let key_file = staged("key", &key)?;
+        let list_file = staged("list", entry.line.as_bytes())?;
+        let place = |from: PathBuf, to: &Path| {
+            Invocation::new(
+                &install,
+                [
+                    "-D".into(),
+                    "-m".into(),
+                    "0644".into(),
+                    from.into_os_string(),
+                    to.as_os_str().to_owned(),
+                ],
+            )
+        };
+        let update = Invocation::new(
+            &missing.package.executable,
+            [
+                "update".to_owned(),
+                "-o".to_owned(),
+                format!("Dir::Etc::sourcelist={}", entry.list.display()),
+                "-o".to_owned(),
+                "Dir::Etc::sourceparts=-".to_owned(),
+                "-o".to_owned(),
+                "APT::Get::List-Cleanup=0".to_owned(),
+            ],
+        );
+        let steps = [
+            place(key_file, &entry.key),
+            place(list_file, &entry.list),
+            update,
+        ];
+        for step in steps {
+            let step = elevate(step).ok_or_else(|| Error::NoSudo {
+                program: program.to_owned(),
+                manager: Manager::Apt.id(),
+                package: missing.package.id.clone(),
+            })?;
+            let command = step.display();
+            let output = run(program, &step, &missing.containment)?;
+            if !output.success() {
+                return Err(Error::Install {
+                    program: program.to_owned(),
+                    command,
+                    status: output.status(),
+                    output: output.tail(),
+                });
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Runs one setup command for `program`'s install, mapping a refused or failed start.
+fn run(
+    program: &str,
+    invocation: &Invocation,
+    containment: &Containment,
+) -> Result<process::Captured, Error> {
+    process::install(invocation, containment).map_err(|source| {
+        if process::install_refused(&source) {
+            Error::NotStarted {
+                program: program.to_owned(),
+            }
+        } else {
+            Error::Spawn {
+                program: program.to_owned(),
+                command: invocation.display(),
+                source,
+            }
+        }
+    })
 }
 
 /// The installed-query after a successful install. An answer that can't be classified cancels a
@@ -703,6 +807,7 @@ mod tests {
                 .iter()
                 .map(|(manager, package)| (*manager, (*package).to_owned()))
                 .collect(),
+            apt_repo: None,
         }
     }
 
@@ -894,6 +999,7 @@ mod tests {
             let missing = Missing {
                 package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 2)),
                 scope: Scope::User,
+                apt_repo: None,
                 containment: containment.clone(),
             };
             let error = verified("tool", &missing).unwrap_err();
@@ -908,6 +1014,7 @@ mod tests {
             let missing = Missing {
                 package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 0)),
                 scope: Scope::User,
+                apt_repo: None,
                 containment: containment.clone(),
             };
             containment.cancel().unwrap().cancel();
@@ -943,6 +1050,7 @@ mod tests {
             let missing = Missing {
                 package: package(Manager::Cargo, cargo),
                 scope: Scope::User,
+                apt_repo: None,
                 containment: containment.clone(),
             };
             let flag = containment.cancel().unwrap().clone();
@@ -1240,6 +1348,7 @@ mod tests {
                 },
                 scope: Scope::System,
                 containment: Containment::OwnGroup,
+                apt_repo: None,
             }),
         };
         assert!(step.needs_elevation());

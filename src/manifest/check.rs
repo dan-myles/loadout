@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
 use super::schema::{
-    AgentsPatch, BuiltinAgent, Condition, CustomAgent, EnvSyntax, List, MIN_INTERVAL_MINUTES,
-    McpFormat, McpPatch, OneOrMany, PerOs, Value,
+    AgentsPatch, AptRepo, BuiltinAgent, Condition, CustomAgent, EnvSyntax, List,
+    MIN_INTERVAL_MINUTES, McpFormat, McpPatch, OneOrMany, PerOs, Value,
 };
 use super::{Guard, LayerFile, Loadout, Scope, is_id};
 use crate::context::{split_base, windows_problem};
@@ -302,7 +302,11 @@ impl Checker {
         for (id, item) in &layer.programs {
             let key = format!("programs.{id}");
             let packages: Vec<_> = item.packages().collect();
-            let fields = [!packages.is_empty(), item.when.is_some()];
+            let fields = [
+                !packages.is_empty(),
+                item.apt_repo.is_some(),
+                item.when.is_some(),
+            ];
             if !self.item(&key, id, global, item.remove, item.replace, &fields) {
                 continue;
             }
@@ -317,7 +321,46 @@ impl Checker {
                     self.error(format!("{key}.{}", manager.id()), "package id is empty");
                 }
             }
+            if let Some(repo) = &item.apt_repo {
+                self.apt_repo(&format!("{key}.apt-repo"), repo);
+            }
             self.condition(&key, item.when.as_ref());
+        }
+    }
+
+    fn apt_repo(&mut self, key: &str, repo: &AptRepo) {
+        for (field, value) in [("url", &repo.url), ("key", &repo.key)] {
+            if !value.starts_with("https://") {
+                self.error(format!("{key}.{field}"), "must be an https:// URL");
+            }
+            self.apt_word(&format!("{key}.{field}"), value);
+        }
+        if let Some(suite) = &repo.suite {
+            self.apt_word(&format!("{key}.suite"), suite);
+        }
+        match repo.components.as_deref() {
+            Some([]) => self.error(format!("{key}.components"), "needs at least one component"),
+            Some(components) => {
+                for component in components {
+                    self.apt_word(&format!("{key}.components"), component);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// One field of a sources.list line: no spaces or option brackets, and no placeholder but
+    /// `{codename}`.
+    fn apt_word(&mut self, key: &str, value: &str) {
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '[' | ']' | '#'))
+        {
+            self.error(key, "must be one non-empty word with no spaces, [, ] or #");
+        }
+        if value.replace("{codename}", "").contains(['{', '}']) {
+            self.error(key, "the only placeholder is {codename}");
         }
     }
 
