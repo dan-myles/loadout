@@ -101,7 +101,7 @@ loadout doctor             # what this machine has, and where every agent's file
 | `apply [--loadout DIR] [--force] [--elevated]` | brings this machine in line with the loadout | yes | |
 | `init <URL> [--profile PROFILE]... [--name NAME] [--no-service]` | clones the loadout, saves this machine's profiles, applies, installs the sync service | yes | |
 | `profile [list]` | lists the loadout's profiles and marks the ones this machine uses | no | `list --json` |
-| `profile set [PROFILE]...` | replaces this machine's profiles; none clears them | the state dir only | |
+| `profile set PROFILE...`, `profile set --none` | replaces this machine's profiles, or clears them; refused before `init` | the state dir only | |
 | `profile choose` | asks which profiles this machine uses (needs a terminal) | the state dir only | |
 | `sync [--loadout DIR]` | fetches and fast-forwards loadout's clone, then applies it | yes | |
 | `rollback [RUN]` | undoes a run: restores its backups, deletes what it created | yes | |
@@ -438,15 +438,17 @@ passed or the loadout sets `[update] auto = false`. The machine doesn't need to 
 - **An unknown profile stops init.** `--profile` naming no `tags/<profile>.toml` exits 3 after the
   clone, applies nothing, and lists the loadout's profiles. Then run `loadout profile set`,
   `loadout sync`, and `loadout service install`.
-- **Change profiles later** with `loadout profile set <profile>...` (none clears them) or
+- **Change profiles later** with `loadout profile set <profile>...` (`--none` clears them) or
   `loadout profile choose`, then `loadout apply`. The background sync uses the saved choice and
   never asks.
 - **`--name` is for declared machines.** Init asks for a name only when the loadout has
   `[machines]` and it runs in a terminal; otherwise the name comes from the hostname. A saved name
   never changes: a different `--name` on a machine that already has one is refused.
 - **Run it once.** If `<state>/loadout` exists, init refuses and points at `loadout sync`. An init
-  stopped at its prompt (Ctrl-C) leaves the clone and saves nothing; `loadout profile set` and
-  `loadout sync` finish it.
+  stopped at its prompt (Ctrl-C) leaves the clone with the machine's name and URL saved and
+  nothing applied; `loadout profile set`, `loadout sync`, and `loadout service install` finish it.
+- **Running init again keeps the saved profiles.** After the clone is removed, a new `init` without
+  `--profile` keeps (and in a terminal, offers as the default) the profiles already saved.
 - **No credentials in the URL.** A URL with a password is refused before anything is written. Use
   the user's Git credential helper or SSH key.
 - Exits: 0 on success, 3 when the loadout is invalid (the service is then not installed), 4 when the
@@ -477,7 +479,7 @@ checkout. `profile list --json` prints:
 `chosen` means saved on this machine, `declared` means listed in its `[machines]` entry, and
 `available` means the loadout has `tags/<name>.toml`. A chosen profile the loadout dropped shows
 `available: false`, and until it is cleared `plan`, `apply`, and `sync` exit 3 with
-`machine.toml: error: profiles: ...` and write nothing. `profile set` exits 3 and saves nothing when
+`error: profiles: this machine chose profile ...` and write nothing. `profile set` exits 3 and saves nothing when
 a name isn't available. Which tags apply, in order: the declared tags, then the chosen profiles;
 see [the loadout format](loadout-format.md#profiles).
 

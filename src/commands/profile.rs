@@ -30,20 +30,20 @@ pub enum Action {
     },
     /// Pick this machine's profiles from the loadout's list, in a terminal
     Choose,
-    /// Replace this machine's profiles; with none, it uses no profiles
+    /// Replace this machine's profiles
     Set {
         /// Profiles from the loadout's tags/ folder, in order; a later one wins a clash
-        #[arg(value_name = "PROFILE", value_parser = profile_name, value_delimiter = ',')]
+        #[arg(
+            value_name = "PROFILE",
+            value_parser = crate::id::parse,
+            value_delimiter = ',',
+            required_unless_present = "none"
+        )]
         profiles: Vec<String>,
+        /// Clear this machine's profiles instead
+        #[arg(long, conflicts_with = "profiles")]
+        none: bool,
     },
-}
-
-pub fn profile_name(value: &str) -> Result<String, String> {
-    if crate::id::is_id(value) {
-        Ok(value.to_owned())
-    } else {
-        Err("must be lowercase letters, digits, - or _, starting with a letter or digit".to_owned())
-    }
 }
 
 #[derive(Serialize)]
@@ -64,7 +64,7 @@ struct Entry<'a> {
 /// `machine.toml`, never in the loadout, and every later plan, apply, and sync uses them.
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = plan::checkout(context, args.loadout.as_deref())?;
-    if let Some(Action::Set { profiles }) = &args.action {
+    if let Some(Action::Set { profiles, .. }) = &args.action {
         return set(context, &checkout, profiles);
     }
     let Some(loadout) = load(context, &checkout) else {

@@ -231,8 +231,8 @@ tags = ["work", "laptop"]
 machine's tags are its `[machines.<name>]` tags in listed order, then its chosen profiles in chosen
 order, skipping any already listed; its `machines/<name>.toml` layer comes after all of them. A
 machine the loadout doesn't list gets the global and OS layers plus its chosen profiles. A chosen
-profile with no `tags/<profile>.toml` is a resolution error on key `profiles` in file
-`machine.toml`, so plan, apply, and sync exit 3 and write nothing. These are errors: a
+profile with no `tags/<profile>.toml` is a resolution error on key `profiles` with no file (the
+choice isn't in the loadout; the message names the state dir's `machine.toml`), so plan, apply, and sync exit 3 and write nothing. These are errors: a
 `machines/<name>.toml` with no `[machines.<name>]` entry, a listed tag that isn't an id, a tag
 listed twice, and a listed tag with no valid `tags/<tag>.toml` layer. The match is exact and
 case-sensitive against the tag layers the confined loader actually loaded. It is never a path probe
@@ -765,8 +765,8 @@ versions read. Each entry must be an id; a bad one makes the whole identity inva
 apply block, exit 4). `machine::detect` puts it in `Facts.profiles`, which every resolution on the
 host (plan, apply, sync, background sync, `sync::settings`) reads. Only `init` and
 `loadout profile set|choose` write it: `machine::save` (init) and `machine::save_profiles`, which
-keeps the saved `name` and `remote` (or saves the hostname's name when there is no file yet), under
-the state lock, deduplicated in chosen order. Neither ever chooses a profile the user didn't.
+keeps the saved `name` and `remote` and refuses a machine with no file yet (`Error::NotSetUp`, so
+a name is never pinned to the hostname outside init), under the state lock, deduplicated in chosen order. Neither ever chooses a profile the user didn't.
 
 **State files (built, U3, `src/state/`).** Loadout creates the state dir and `runs/` as `0700` on
 Unix, and writes `state.json` and every journal as `0600`, through a temp file, `fsync`, and rename.
@@ -1802,10 +1802,13 @@ Automatic updates are required, so they are on by default.
     `[machines]` and stdin and stdout are a terminal, the user's pick (it lists the loadout's
     `[machines]`, defaulting to the hostname's name), else the hostname's.
   - The profiles are `--profile` (repeatable, comma-separated), else in a terminal the user's pick
-    from the loadout's tag layers (numbers or names; empty or end of input keeps none, `-` is none),
-    else none. A `--profile` the loadout lacks saves the name with no profiles, applies nothing,
-    and exits 3. With a loadout that doesn't load, init saves no profiles (it can't check them) and its apply reports the loadout invalid. Ctrl-C at a prompt leaves the clone and saves nothing; `loadout profile set` then
-    `loadout sync` finish the setup.
+    from the loadout's tag layers (names first, then menu numbers; empty or end of input keeps the
+    saved choice, `-` is none), else the saved choice, which is none on a new machine. The name,
+    URL, and saved choice are written before the prompt, so Ctrl-C leaves them and the clone, and
+    `loadout profile set`, `loadout sync`, and `loadout service install` finish the setup. A
+    `--profile` the loadout lacks is not saved; init applies nothing and exits 3. With a loadout
+    that doesn't load, init keeps the saved choice (it can't check new ones) and its apply reports
+    the loadout invalid.
   - `machine::save` writes `name`, `remote`, and `profiles` atomically (0600 on Unix), and refuses a
     remote with a password.
   - A URL carrying a password is refused before anything is shown or written, and the URL is only
@@ -1976,7 +1979,7 @@ Automatic updates are required, so they are on by default.
 | `loadout update [--prerelease]`, alias `loadout upgrade`: on-demand self-update of the installer-managed CLI, stable releases only unless `--prerelease`; never syncs; exit 0 updated/up to date/none published, 4 can't update this binary, 1 failure. The hidden legacy `update --background` form still runs `sync --background` | source | U9 |
 | `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
 | `loadout init <URL> [--profile PROFILE]... [--name NAME] [--no-service]`: clone, save the machine's name and profiles, apply, install the service; exit 3 invalid or unknown profile, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
-| `loadout profile [list [--json] \| choose \| set [PROFILE]...] [--loadout DIR]`: list the checkout's tag layers with this machine's chosen and declared ones; `set` (and `choose`, after asking) takes the state lock, reloads the checkout, and replaces the choice (exit 3 and nothing saved for an unknown profile or an invalid loadout); `choose` asks, and exits 1 without a terminal; never applies | built | I005 |
+| `loadout profile [list [--json] \| choose \| set PROFILE... \| set --none] [--loadout DIR]`: list the checkout's tag layers with this machine's chosen and declared ones; `set` (and `choose`, after asking) takes the state lock, reloads the checkout, and replaces the choice (exit 3 and nothing saved for an unknown profile or an invalid loadout); `choose` asks, and exits 1 without a terminal; never applies | built | I005 |
 
 `plan`, `apply`, and `sync` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
 at another checkout.
@@ -2184,7 +2187,7 @@ pub enum Error { Isolated, Unmanaged { reason }, NoRelease, Download { detail },
 impl Error { pub fn skipped(&self) -> bool; }                                // Isolated | Unmanaged | NoRelease | Busy: report, don't fail
 // machine (U9 addition)
 pub fn save(context: &Context, name: &str, remote: &str, profiles: &[String]) -> Result<(), machine::Error>; // atomic, 0600 on Unix; refuses links, invalid names or profiles, password remotes
-pub fn save_profiles(context: &Context, profiles: &[String]) -> Result<(), machine::Error>; // keeps the saved name and remote; same checks
+pub fn save_profiles(context: &Context, profiles: &[String]) -> Result<(), machine::Error>; // keeps the saved name and remote; NotSetUp before init; same checks
 // manifest (I005 addition)
 impl Loadout { pub fn profiles(&self) -> Vec<String>; }                    // the tag layers, by name
 ```

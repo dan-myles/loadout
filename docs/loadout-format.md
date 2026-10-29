@@ -65,7 +65,7 @@ nothing chooses a profile for it.
 | --- | --- |
 | choose on setup | `loadout init <URL>` asks in a terminal; `--profile work` (repeat it, or `work,laptop`) chooses without asking |
 | see them | `loadout profile` (or `loadout profile list --json`) |
-| change them | `loadout profile choose` in a terminal, or `loadout profile set work laptop`; `loadout profile set` with no names clears them |
+| change them | `loadout profile choose` in a terminal, or `loadout profile set work laptop`; `loadout profile set --none` clears them; a machine `init` hasn't set up is refused |
 
 `plan`, `apply`, `sync`, and the background sync all read the saved profiles and never ask.
 Changing them takes effect on the next `apply` or sync.

@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{Update, report};
-
-const MACHINE_FILE: &str = "machine.toml";
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::machine::Facts;
 use crate::manifest::{
@@ -374,10 +372,10 @@ fn layers<'a>(
             None if chosen => report(
                 diagnostics,
                 Severity::Error,
-                Some(Path::new(MACHINE_FILE)),
+                None,
                 "profiles",
                 format!(
-                    "this machine uses profile {tag:?}, but the loadout has no tags/{tag}.toml; `loadout profile list` shows the profiles it has and `loadout profile set` changes this machine's"
+                    "this machine chose profile {tag:?} (saved in its state dir's machine.toml), but the loadout has no tags/{tag}.toml; `loadout profile list` shows the profiles it has and `loadout profile set` changes this machine's"
                 ),
             ),
             None => report(

@@ -115,7 +115,6 @@ impl Checker {
                 _ => None,
             })
             .collect();
-        let mut used = BTreeSet::new();
         for (name, entry) in &loadout.machines {
             let key = format!("machines.{name}");
             if !is_id(name) {
@@ -139,7 +138,6 @@ impl Checker {
                         format!("tag {tag:?} has no valid layer file tags/{tag}.toml"),
                     );
                 }
-                used.insert(tag.as_str());
             }
         }
 

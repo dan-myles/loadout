@@ -19,6 +19,10 @@ pub enum Error {
     },
     #[error("{path} is invalid: {message}")]
     Invalid { path: PathBuf, message: String },
+    #[error(
+        "this machine isn't set up yet ({path} doesn't exist); `loadout init <URL>` sets it up and chooses its profiles"
+    )]
+    NotSetUp { path: PathBuf },
     #[error("cannot write {path}")]
     Write {
         path: PathBuf,
@@ -99,21 +103,21 @@ pub fn save(context: &Context, name: &str, remote: &str, profiles: &[String]) ->
     )
 }
 
-/// Replaces this machine's chosen profiles and keeps its saved name and URL. A machine with no
-/// saved name gets the hostname's saved with them, as `init` would.
+/// Replaces this machine's chosen profiles and keeps its saved name and URL. A machine `init`
+/// hasn't set up is refused, so its name is never pinned to the hostname here.
 pub fn save_profiles(context: &Context, profiles: &[String]) -> Result<(), Error> {
-    let file = match read(context)? {
-        Some(file) => MachineFile {
+    let Some(file) = read(context)? else {
+        return Err(Error::NotSetUp {
+            path: context.machine_file(),
+        });
+    };
+    write(
+        context,
+        MachineFile {
             profiles: profiles.to_vec(),
             ..file
         },
-        None => MachineFile {
-            name: hostname(),
-            remote: None,
-            profiles: profiles.to_vec(),
-        },
-    };
-    write(context, file)
+    )
 }
 
 /// The profiles saved on this machine, in the order they were chosen; none before any are saved.
@@ -421,8 +425,11 @@ mod tests {
         )
         .unwrap();
         assert!(profiles(&context).unwrap().is_empty());
-        save_profiles(&context, &["work".to_owned()]).unwrap();
-        assert_eq!(name(&context).unwrap().source, NameSource::Saved);
+        assert!(matches!(
+            save_profiles(&context, &["work".to_owned()]),
+            Err(Error::NotSetUp { .. })
+        ));
+        assert_eq!(name(&context).unwrap().source, NameSource::Hostname);
 
         save(&context, "box", "https://x/y.git", &[]).unwrap();
         assert!(

@@ -23,23 +23,15 @@ pub struct Args {
     pub url: String,
     /// A profile for this machine, such as `work`; repeat it or separate names with commas.
     /// Without it, init asks in a terminal and chooses none elsewhere
-    #[arg(long = "profile", value_name = "PROFILE", value_parser = profile::profile_name, value_delimiter = ',')]
+    #[arg(long = "profile", value_name = "PROFILE", value_parser = crate::id::parse, value_delimiter = ',')]
     pub profiles: Vec<String>,
     /// This machine's name, needed only for a loadout that declares machines in [machines]
     /// [default: the saved name, else one made from the hostname]
-    #[arg(long, value_name = "NAME", value_parser = machine_name)]
+    #[arg(long, value_name = "NAME", value_parser = crate::id::parse)]
     pub name: Option<String>,
     /// Don't install the background sync service, even when the loadout's [update] auto is true
     #[arg(long)]
     pub no_service: bool,
-}
-
-fn machine_name(value: &str) -> Result<String, String> {
-    if crate::id::is_id(value) {
-        Ok(value.to_owned())
-    } else {
-        Err("must be lowercase letters, digits, - or _, starting with a letter or digit".to_owned())
-    }
 }
 
 /// Sets this machine up from a loadout: clones it into loadout's own checkout, saves the
@@ -103,33 +95,34 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
         .and_then(|loadout| loadout.machines.get(&name))
         .map(|entry| entry.tags.clone())
         .unwrap_or_default();
-    let profiles = if args.profiles.is_empty() && interactive && !available.is_empty() {
+    let kept = machine::profiles(context)?;
+    // Saved before asking, so a cancelled prompt still leaves the name a declared machine chose.
+    machine::save(context, &name, &args.url, &kept)?;
+    let profiles = if !args.profiles.is_empty() {
+        if loadout.is_none() {
+            println!(
+                "profiles not saved: the loadout is invalid, so they can't be checked; fix it, then run `loadout profile set PROFILE...`"
+            );
+            kept
+        } else {
+            args.profiles.clone()
+        }
+    } else if interactive && !available.is_empty() {
         profile::ask(
             &available,
-            &[],
+            &kept,
             &declared,
             &mut io::stdin().lock(),
             &mut io::stdout(),
         )?
     } else {
-        args.profiles.clone()
-    };
-    let profiles = match &loadout {
-        Some(_) => profiles,
-        None if !profiles.is_empty() => {
-            println!(
-                "profiles not saved: the loadout is invalid, so they can't be checked; fix it, then run `loadout profile set PROFILE...`"
-            );
-            Vec::new()
-        }
-        None => Vec::new(),
+        kept
     };
     let unknown = loadout
         .as_ref()
         .map(|loadout| loadout.unknown_profiles(&profiles))
         .unwrap_or_default();
     if !unknown.is_empty() {
-        machine::save(context, &name, &args.url, &[])?;
         for profile in unknown {
             println!("no profile {profile} in this loadout (no tags/{profile}.toml)");
         }
@@ -230,7 +223,7 @@ fn prompt(
         if answer.is_empty() {
             return Ok(default.to_owned());
         }
-        match machine_name(answer) {
+        match crate::id::parse(answer) {
             Ok(name) => return Ok(name),
             Err(problem) => writeln!(output, "{answer:?} {problem}")?,
         }
@@ -311,9 +304,9 @@ mod tests {
 
     #[test]
     fn name_flag_uses_the_id_rule() {
-        assert!(machine_name("work-laptop").is_ok());
+        assert!(crate::id::parse("work-laptop").is_ok());
         for bad in ["", "Work", "-x", "a b", "../x"] {
-            assert!(machine_name(bad).is_err(), "{bad}");
+            assert!(crate::id::parse(bad).is_err(), "{bad}");
         }
     }
 }

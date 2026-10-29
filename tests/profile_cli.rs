@@ -199,7 +199,7 @@ fn without_a_terminal_init_chooses_no_profile_and_profile_set_changes_it_later()
     assert_eq!(listing["profiles"][0]["chosen"], true);
     assert_eq!(listing["profiles"][0]["declared"], false);
 
-    assert_code(&machine.run(&["profile", "set"]), 0);
+    assert_code(&machine.run(&["profile", "set", "--none"]), 0);
     assert_code(&machine.run(&["apply"]), 0);
     assert!(machine.has("base.md"));
     assert!(
@@ -251,13 +251,13 @@ fn a_chosen_profile_the_loadout_drops_blocks_the_sync_instead_of_removing_its_it
     let sync = machine.run(&["sync"]);
     assert_code(&sync, 3);
     assert!(
-        text(&sync).contains("this machine uses profile \"development\""),
+        text(&sync).contains("this machine chose profile \"development\""),
         "{}",
         text(&sync)
     );
     assert!(machine.has("development.md"), "nothing was removed");
 
-    assert_code(&machine.run(&["profile", "set"]), 0);
+    assert_code(&machine.run(&["profile", "set", "--none"]), 0);
     assert_code(&machine.run(&["sync"]), 0);
     assert!(!machine.has("development.md"));
 }
@@ -280,7 +280,7 @@ fn a_declared_machine_keeps_its_tags_and_adds_its_chosen_profiles() {
     assert_code(&machine.run(&["apply"]), 0);
     assert!(machine.has("work.md") && machine.has("development.md"));
 
-    assert_code(&machine.run(&["profile", "set"]), 0);
+    assert_code(&machine.run(&["profile", "set", "--none"]), 0);
     assert_code(&machine.run(&["apply"]), 0);
     assert!(
         machine.has("work.md"),
@@ -321,4 +321,31 @@ fn init_saves_no_profile_it_cannot_check_against_an_invalid_loadout() {
         text(&init)
     );
     assert!(!machine.machine_file().contains("profiles"));
+}
+
+#[test]
+fn a_new_init_keeps_the_saved_choice_and_profile_set_needs_a_set_up_machine() {
+    let machine = Machine::with_base_development_and_work("");
+    let checkout = machine.work.to_str().unwrap().to_owned();
+    let early = machine.run(&["profile", "set", "work", "--loadout", &checkout]);
+    assert_code(&early, 1);
+    assert!(
+        text(&early).contains("isn't set up yet"),
+        "{}",
+        text(&early)
+    );
+
+    assert_code(&machine.init(&["--profile", "work"]), 0);
+    fs::remove_dir_all(machine.state.join("loadout")).unwrap();
+    let again = machine.init(&[]);
+    assert_code(&again, 0);
+    assert!(text(&again).contains("profiles: work"), "{}", text(&again));
+    assert!(
+        machine.has("work.md"),
+        "re-init keeps what the profile placed"
+    );
+
+    let bare = machine.run(&["profile", "set"]);
+    assert_code(&bare, 2);
+    assert!(machine.machine_file().contains("profiles = [\"work\"]"));
 }

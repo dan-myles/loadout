@@ -225,7 +225,7 @@ fn chosen_profiles_follow_the_declared_tags_and_the_machine_layer_still_wins() {
     let missing = chosen("stranger", &["gone"]).unwrap_err();
     assert!(
         lines(&missing).contains(
-            "machine.toml: error: profiles: this machine uses profile \"gone\", but the loadout has no tags/gone.toml"
+            "error: profiles: this machine chose profile \"gone\" (saved in its state dir's machine.toml), but the loadout has no tags/gone.toml"
         ),
         "{}",
         lines(&missing)

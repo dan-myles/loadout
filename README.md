@@ -290,7 +290,7 @@ machine that needs its own layer.
 | `loadout status [--json]` | shows what loadout owns, drift, and every run | no |
 | `loadout apply [--loadout DIR] [--force] [--elevated]` | brings this machine in line with the loadout | yes |
 | `loadout init <URL> [--profile PROFILE]... [--no-service]` | clones, chooses this machine's profiles, applies, schedules sync | yes |
-| `loadout profile [list [--json]\|choose\|set [PROFILE]...]` | shows or changes this machine's profiles; `apply` or the next sync uses them | `set` and `choose` save the choice |
+| `loadout profile [list [--json]\|choose\|set PROFILE...\|set --none]` | shows or changes this machine's profiles; `apply` or the next sync uses them | `set` and `choose` save the choice |
 | `loadout sync [--loadout DIR]` | fetches and fast-forwards loadout's clone, then applies | yes |
 | `loadout rollback [RUN]` | undoes the newest or the named run | yes |
 | `loadout service install\|uninstall\|status` | manages the scheduled background sync | install and uninstall |
