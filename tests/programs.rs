@@ -56,7 +56,15 @@ fn probe() {
                 .map(|(manager, package)| (manager, package.to_owned()))
                 .collect();
             let apt_repo = patch.apt_repo.clone();
-            (id.clone(), Program { packages, apt_repo })
+            let github = patch.github.clone();
+            (
+                id.clone(),
+                Program {
+                    packages,
+                    apt_repo,
+                    github,
+                },
+            )
         })
         .collect();
     let result = match programs::steps(&programs, &facts, &context) {

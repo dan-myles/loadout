@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.4` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.5` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -84,7 +84,7 @@ record, and a lock file), applies nothing, and installs no service. If the folde
 call loadout by its full path.
 
 ```sh
-loadout --version          # loadout 0.1.4
+loadout --version          # loadout 0.1.5
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go
@@ -233,6 +233,11 @@ Rules worth knowing before you write:
   `t3` from npm, `t3` is `unsupported` on the first apply and installs on the next sync.
 - A brew or cask id from a third-party tap (`oven-sh/bun/bun`) trusts that tap. Naming it is the
   user's trust decision, so don't add a tap the user didn't ask for.
+- A program that ships only as GitHub release assets (an AppImage, a `.tar.gz` CLI, a macOS app
+  `.zip`) uses `github = { repo, asset = { <os>-<arch> = "<pattern>" }, tag?, prerelease?, bin?, app? }`.
+  It is tried after every manager and installs per user. Follow a channel with `tag` (for example
+  `"v*-nightly.*"` with `prerelease = true`); loadout installs once and the program updates itself.
+  Naming the repository is a trust decision like a tap.
 - An `apt` package that isn't in the distro's own repositories names its repository with
   `apt-repo = { url = "https://…", key = "https://…" }` (optional `suite`, default `{codename}`,
   and `components`, default `["main"]`). It is a trust decision like a tap: add one only for a
@@ -370,6 +375,12 @@ What apply guarantees:
   and a repository another source already names (say, from the vendor's install script) is left
   as it is.
   A failure here is `programs.<id>: cannot add its apt repository: …` or the failed command.
+- **GitHub releases install per user, no `--elevated`.** Plan shows `install github owner/repo:<place>`
+  and never touches the network: it checks only the install path. Apply lists the repository's
+  newest releases (unauthenticated GitHub API), downloads the matching asset, and refuses it
+  unless its sha256 matches GitHub's digest. Failures read `programs.<id>: cannot install its
+  github release: …`. Under `LOADOUT_HOME` it is `blocked` like every program; to rehearse a real
+  install, point `HOME` and `LOADOUT_STATE_DIR` at a temporary directory instead.
 
 Its output is one line per action, then the run id. For example:
 

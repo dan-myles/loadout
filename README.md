@@ -95,7 +95,7 @@ that adds it.
 Then check the install:
 
 ```sh
-loadout --version   # loadout 0.1.4
+loadout --version   # loadout 0.1.5
 loadout doctor
 ```
 
@@ -130,7 +130,7 @@ first build.
 git clone https://github.com/dan-myles/loadout.git
 cd loadout
 cargo install --locked --path .
-loadout --version   # loadout 0.1.4
+loadout --version   # loadout 0.1.5
 loadout doctor
 ```
 
@@ -307,7 +307,7 @@ system-wide managers need `--elevated`.
 
 ## Status
 
-Loadout `0.1.4` is under active development, and its scope is deliberately narrow.
+Loadout `0.1.5` is under active development, and its scope is deliberately narrow.
 
 - **Tested natively** at specific commits, under the real schedulers:
   - macOS 27 on Apple Silicon: the full acceptance harness and a legacy launchd migration;

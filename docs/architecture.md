@@ -1519,7 +1519,18 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
   never fetches or writes; an installed package never triggers it, and a URL another source
   already names is skipped (apt rejects conflicting `signed-by` keys for one repository). The files are not recorded
   in state and are never removed.
-- No install scripts in v1, and the only direct download is an `apt-repo` key. The CLI never
+- **GitHub releases.** `github = { repo, asset, tag?, prerelease?, bin?, app? }` is
+  `Manager::Github`, outside `Manager::ALL` and every OS order: `programs::state` falls back to it
+  only when `select` finds no manager. `programs::github::Target` resolves the `<os>-<arch>`
+  asset pattern and its kind (`AssetKind` from the suffix), and decides installed from the
+  install path alone, so plan stays offline. Its package id is `repo:<place>` (the AppImage id,
+  `bin`, or `<app>.app`), so two programs from one repository stay apart. `install` lists
+  `/repos/<repo>/releases`, picks the newest non-draft release allowed by `prerelease` and `tag`
+  with a matching asset, streams it into a staging folder under
+  `~/.local/share/loadout/github/` while hashing, requires GitHub's `sha256:` digest to match,
+  then places it (`ditto -x -k` for a macOS zip). Nothing is recorded in state; nothing is
+  removed on rollback.
+- No install scripts in v1. The only direct downloads are an `apt-repo` key and a `github` asset. The CLI never
   installs a package manager itself; doctor names what is missing. The install scripts
   (section 9) set them up before the first init.
 

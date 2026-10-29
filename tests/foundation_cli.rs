@@ -1755,3 +1755,26 @@ fn an_apt_repo_is_https_words_with_only_the_codename_placeholder() {
         "{text}"
     );
 }
+
+#[test]
+fn a_github_release_names_a_repo_and_an_installable_asset_per_platform() {
+    let (code, text) = validate_text(
+        "[loadout]\nversion = 1\n\
+         [programs.ok]\n\
+         github = { repo = \"owner/tool\", tag = \"v*-nightly.*\", prerelease = true, bin = \"tool\", app = \"Tool\", \
+         asset = { linux-x86_64 = \"Tool-*.AppImage\", linux-aarch64 = \"tool-*-linux-arm64.tar.gz\", macos-aarch64 = \"Tool-*-arm64.zip\" } }\n\
+         [programs.bad]\n\
+         github = { repo = \"owner\", asset = { windows-x86_64 = \"tool.exe\", macos-aarch64 = \"Tool.AppImage\", linux-x86_64 = \"t.zip\", linux-aarch64 = \"t.tar.gz\" } }\n",
+    );
+    assert_eq!(code, 3, "{text}");
+    assert!(!text.contains("programs.ok"), "{text}");
+    for expected in [
+        "programs.bad.github.repo: must be owner/name",
+        "programs.bad.github.asset.windows-x86_64: keys are linux or macos",
+        "programs.bad.github.asset.macos-aarch64: an .AppImage installs only on linux",
+        "programs.bad.github.asset.linux-x86_64: a .zip installs only on macos",
+        "programs.bad.github.asset.linux-aarch64: a .tar.gz needs bin",
+    ] {
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+}

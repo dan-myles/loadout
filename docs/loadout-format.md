@@ -328,12 +328,34 @@ The language managers come in the order `cargo`, `uv`, `pipx`, `npm`, `pnpm`, `b
   keys for one repository. The
   files stay after an uninstall or rollback, like the package. A PPA works the same way, with its
   `ppa.launchpadcontent.net` URL and its key from `keyserver.ubuntu.com`.
+- A program can also come from a GitHub release, tried after every manager, so a machine with a
+  declared manager uses that instead. Naming the repository is the trust:
+
+  ```toml
+  [programs.t3]
+  github = { repo = "pingdotgg/t3code", tag = "v*-nightly.*", prerelease = true, bin = "t3", asset = { macos-aarch64 = "t3-*-darwin-arm64.tar.gz", linux-x86_64 = "t3-*-linux-x64.tar.gz" } }
+  ```
+
+  `asset` maps `<os>-<arch>` (`linux` or `macos`, then `x86_64` or `aarch64`) to a file name with
+  `*` for any text; a machine with no key for it is `unsupported`. Apply takes the newest release
+  (GitHub's order) that isn't a draft, is stable unless `prerelease = true`, has a tag matching
+  `tag` if given, and has a matching asset. It refuses an asset without GitHub's sha256 digest,
+  and checks the download against it. The suffix decides the install, always per user:
+
+  | Asset | Installs to | Installed when |
+  | --- | --- | --- |
+  | `.AppImage` (linux) | `~/.local/bin/<id>`, with `~/.local/share/applications/loadout-<id>.desktop` | that file exists |
+  | `.tar.gz` / `.tgz` | unpacked to `~/.local/share/loadout/github/<id>`, `bin` linked from `~/.local/bin` | `~/.local/bin/<bin>` exists |
+  | `.zip` (macos) | `<app>.app` from inside it, to `~/Applications` | `~/Applications/<app>.app` or `/Applications/<app>.app` exists |
+
+  Plan reads only those paths, so it stays offline. Loadout never looks at a newer release: the
+  program updates itself, as Electron apps and self-updating CLIs do.
 - Per-user managers run directly. System-wide ones (`apt`, `dnf`, `pacman`, `zypper`, `snap`,
   `choco`, machine-scoped winget installers) are `blocked` unless `loadout apply --elevated` is
   passed. The background sync never elevates.
 - A program with no available manager is `unsupported` on that machine.
 - `apply` and the background sync never install a package manager, and never run an install
-  script. The only download is an `apt-repo` signing key. The install scripts set up Homebrew on macOS and Linux, and winget, Scoop, and Chocolatey
+  script. The only downloads are an `apt-repo` signing key and a `github` release asset. The install scripts set up Homebrew on macOS and Linux, and winget, Scoop, and Chocolatey
   (as an administrator) on Windows, before the first init.
 
 ## Validation

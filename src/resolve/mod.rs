@@ -11,7 +11,9 @@ use serde::Serialize;
 use crate::context::Context;
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::machine::Facts;
-use crate::manifest::{AptRepo, BuiltinAgent, CustomAgent, Loadout, Manager, Value, Variable};
+use crate::manifest::{
+    AptRepo, BuiltinAgent, CustomAgent, GithubRelease, Loadout, Manager, Value, Variable,
+};
 
 /// `Ok` carries warnings too, such as an item naming an agent this machine doesn't enable.
 pub fn resolve(loadout: &Loadout, facts: &Facts) -> Result<(Resolved, Diagnostics), Diagnostics> {
@@ -145,4 +147,6 @@ pub struct Program {
     pub packages: BTreeMap<Manager, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apt_repo: Option<AptRepo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRelease>,
 }

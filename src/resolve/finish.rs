@@ -73,6 +73,7 @@ pub(super) fn finish(
             let program = Program {
                 packages: item.draft.packages.clone(),
                 apt_repo: item.draft.apt_repo.clone(),
+                github: item.draft.github.clone(),
             };
             (id.clone(), program)
         })

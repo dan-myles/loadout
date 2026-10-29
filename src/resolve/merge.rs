@@ -5,8 +5,9 @@ use super::{Update, report};
 use crate::diagnostic::{Diagnostics, Severity};
 use crate::machine::Facts;
 use crate::manifest::{
-    AptRepo, Condition, CustomAgent, FilePatch, InstructionsPatch, LayerFile, List, ListEdit,
-    Loadout, Manager, McpPatch, ProgramPatch, ROOT_FILE, Scope, SkillPatch, Value, Variable,
+    AptRepo, Condition, CustomAgent, FilePatch, GithubRelease, InstructionsPatch, LayerFile, List,
+    ListEdit, Loadout, Manager, McpPatch, ProgramPatch, ROOT_FILE, Scope, SkillPatch, Value,
+    Variable,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,7 @@ impl Draft for McpDraft {
 pub(super) struct ProgramDraft {
     pub(super) packages: BTreeMap<Manager, String>,
     pub(super) apt_repo: Option<AptRepo>,
+    pub(super) github: Option<GithubRelease>,
     pub(super) when: Option<Condition>,
 }
 
@@ -251,13 +253,13 @@ impl Draft for ProgramDraft {
             self.packages.insert(manager, package.to_owned());
         }
         set(&mut self.apt_repo, patch.apt_repo.as_ref());
+        set(&mut self.github, patch.github.as_ref());
         set(&mut self.when, patch.when.as_ref());
     }
 
     fn missing(&self) -> Option<&'static str> {
-        self.packages
-            .is_empty()
-            .then_some("a package for at least one manager")
+        (self.packages.is_empty() && self.github.is_none())
+            .then_some("a package for at least one manager, or a github release")
     }
 
     fn when(&self) -> Option<&Condition> {

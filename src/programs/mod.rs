@@ -12,6 +12,7 @@ use crate::resolve::Program;
 
 mod apt_repo;
 mod detect;
+mod github;
 mod manager;
 
 use detect::{Eligibility, Unanswered};
@@ -86,6 +87,8 @@ pub enum Error {
         status: String,
         output: String,
     },
+    #[error("programs.{program}: cannot install its github release: {detail}")]
+    Github { program: String, detail: String },
     #[error("programs.{program}: cannot add its apt repository: {detail}")]
     AptRepo { program: String, detail: String },
     #[error(
@@ -155,6 +158,7 @@ pub struct Missing {
     scope: Scope,
     containment: Containment,
     apt_repo: Option<AptRepo>,
+    github: Option<Box<github::Target>>,
 }
 
 impl Missing {
@@ -207,7 +211,7 @@ pub fn steps(
             let state = if context.isolated {
                 State::Blocked(ISOLATED.to_owned())
             } else {
-                state(id, program, facts.os, &context.containment)?
+                state(id, program, facts, &context.containment)?
             };
             Ok(Step {
                 program: id.clone(),
@@ -217,10 +221,20 @@ pub fn steps(
         .collect()
 }
 
-fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Result<State, Error> {
-    let (manager, package, executable) = match select(program, os, manager::available) {
+fn state(
+    id: &str,
+    program: &Program,
+    facts: &Facts,
+    containment: &Containment,
+) -> Result<State, Error> {
+    let (manager, package, executable) = match select(program, facts.os, manager::available) {
         Ok(selected) => selected,
-        Err(reason) => return Ok(State::Unsupported(reason)),
+        Err(reason) => {
+            return Ok(match &program.github {
+                Some(release) => github_state(id, release, facts, containment),
+                None => State::Unsupported(reason),
+            });
+        }
     };
     manager::check_package(manager, package).map_err(|reason| Error::Package {
         program: id.to_owned(),
@@ -239,6 +253,7 @@ fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Resu
         {
             Observation::Installed => State::Installed(package),
             Observation::Missing(scope) => State::Missing(Missing {
+                github: None,
                 apt_repo: program
                     .apt_repo
                     .clone()
@@ -250,6 +265,35 @@ fn state(id: &str, program: &Program, os: Os, containment: &Containment) -> Resu
             Observation::Unsupported(reason) => State::Unsupported(reason),
         },
     )
+}
+
+/// A github release is the last resort, after every manager: installed when its install path
+/// exists, which plan reads without the network.
+fn github_state(
+    id: &str,
+    release: &crate::manifest::GithubRelease,
+    facts: &Facts,
+    containment: &Containment,
+) -> State {
+    let target = match github::Target::new(id, release, facts.os, facts.arch, &facts.home) {
+        Ok(target) => target,
+        Err(reason) => return State::Unsupported(reason),
+    };
+    let package = Package {
+        manager: Manager::Github,
+        id: target.package_id(),
+        executable: PathBuf::new(),
+    };
+    if target.installed() {
+        return State::Installed(package);
+    }
+    State::Missing(Missing {
+        package,
+        scope: Scope::User,
+        containment: containment.clone(),
+        apt_repo: None,
+        github: Some(Box::new(target)),
+    })
 }
 
 enum Observation {
@@ -381,6 +425,9 @@ pub fn install(step: &Step, elevated: bool) -> Result<Installed, Error> {
             program: program.to_owned(),
         });
     };
+    if let Some(target) = &missing.github {
+        return install_github(program, missing, target);
+    }
     let package = &missing.package;
     let manager = package.manager;
     let changed = |detail: String| Error::Changed {
@@ -593,6 +640,61 @@ fn add_apt_repo(program: &str, missing: &Missing) -> Result<(), Error> {
     })();
     let _ = std::fs::remove_dir_all(&staging);
     result
+}
+
+fn install_github(
+    program: &str,
+    missing: &Missing,
+    target: &github::Target,
+) -> Result<Installed, Error> {
+    if target.installed() {
+        return Ok(Installed::Already);
+    }
+    let containment = &missing.containment;
+    if containment.is_cancelled() {
+        return Err(Error::NotStarted {
+            program: program.to_owned(),
+        });
+    }
+    let failed = |detail: String| Error::Github {
+        program: program.to_owned(),
+        detail,
+    };
+    let asset = target.find().map_err(failed)?;
+    let unzip = |zip: &Path, dest: &Path| -> Result<(), String> {
+        let ditto = context::which("ditto").ok_or("ditto is not on PATH")?;
+        let invocation = Invocation::new(
+            &ditto,
+            [
+                "-x".into(),
+                "-k".into(),
+                zip.as_os_str().to_owned(),
+                dest.as_os_str().to_owned(),
+            ],
+        );
+        let output = run(program, &invocation, containment).map_err(|error| error.to_string())?;
+        if output.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} failed: {}",
+                invocation.display(),
+                output.tail()
+            ))
+        }
+    };
+    target
+        .install(&asset, &unzip, &|| containment.is_cancelled())
+        .map_err(failed)?;
+    if target.installed() {
+        Ok(Installed::Now)
+    } else {
+        Err(Error::NotInstalled {
+            program: program.to_owned(),
+            manager: Manager::Github.id(),
+            package: missing.package.id.clone(),
+        })
+    }
 }
 
 /// Runs one setup command for `program`'s install, mapping a refused or failed start.
@@ -808,6 +910,7 @@ mod tests {
                 .map(|(manager, package)| (*manager, (*package).to_owned()))
                 .collect(),
             apt_repo: None,
+            github: None,
         }
     }
 
@@ -1000,6 +1103,7 @@ mod tests {
                 package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 2)),
                 scope: Scope::User,
                 apt_repo: None,
+                github: None,
                 containment: containment.clone(),
             };
             let error = verified("tool", &missing).unwrap_err();
@@ -1015,6 +1119,7 @@ mod tests {
                 package: package(Manager::Cargo, manager(dir.path(), "cargo", "", 0)),
                 scope: Scope::User,
                 apt_repo: None,
+                github: None,
                 containment: containment.clone(),
             };
             containment.cancel().unwrap().cancel();
@@ -1051,6 +1156,7 @@ mod tests {
                 package: package(Manager::Cargo, cargo),
                 scope: Scope::User,
                 apt_repo: None,
+                github: None,
                 containment: containment.clone(),
             };
             let flag = containment.cancel().unwrap().clone();
@@ -1349,6 +1455,7 @@ mod tests {
                 scope: Scope::System,
                 containment: Containment::OwnGroup,
                 apt_repo: None,
+                github: None,
             }),
         };
         assert!(step.needs_elevation());

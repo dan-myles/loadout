@@ -401,6 +401,9 @@ pub enum Manager {
     Uv,
     Pipx,
     Go,
+    /// A GitHub release asset, from a program's `github` table. Not in `ALL`: it takes no
+    /// package id and is tried after every manager.
+    Github,
 }
 
 impl Manager {
@@ -445,6 +448,7 @@ impl Manager {
             Manager::Uv => "uv",
             Manager::Pipx => "pipx",
             Manager::Go => "go",
+            Manager::Github => "github",
         }
     }
 
@@ -480,6 +484,7 @@ pub struct ProgramPatch {
     pub go: Option<String>,
     #[serde(rename = "apt-repo")]
     pub apt_repo: Option<AptRepo>,
+    pub github: Option<GithubRelease>,
     pub when: Option<Condition>,
     #[serde(default)]
     pub remove: bool,
@@ -497,6 +502,56 @@ pub struct AptRepo {
     pub key: String,
     pub suite: Option<String>,
     pub components: Option<Vec<String>>,
+}
+
+/// A program installed from a GitHub release's asset, tried after every package manager. Naming
+/// the repository in the loadout is the trust. `asset` maps `<os>-<arch>` (such as
+/// `linux-x86_64` or `macos-aarch64`) to a `*` pattern for that machine's asset; its suffix
+/// decides how it installs: `.AppImage`, a `.tar.gz` holding `bin`, or a macOS `.zip` holding
+/// `app`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubRelease {
+    pub repo: String,
+    pub asset: BTreeMap<String, String>,
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub prerelease: bool,
+    pub bin: Option<String>,
+    pub app: Option<String>,
+}
+
+/// How a release asset installs, from its file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    AppImage,
+    TarGz,
+    Zip,
+}
+
+impl AssetKind {
+    pub fn of(name: &str) -> Option<Self> {
+        let path = std::path::Path::new(name);
+        let is = |extension: &str| {
+            path.extension()
+                .is_some_and(|found| found.eq_ignore_ascii_case(extension))
+        };
+        let tar = || {
+            path.file_stem()
+                .map(std::path::Path::new)
+                .and_then(std::path::Path::extension)
+                .is_some_and(|found| found.eq_ignore_ascii_case("tar"))
+        };
+        if is("AppImage") {
+            Some(AssetKind::AppImage)
+        } else if is("tgz") || (is("gz") && tar()) {
+            Some(AssetKind::TarGz)
+        } else if is("zip") {
+            Some(AssetKind::Zip)
+        } else {
+            None
+        }
+    }
 }
 
 impl ProgramPatch {
@@ -520,6 +575,7 @@ impl ProgramPatch {
             Manager::Uv => self.uv.as_deref(),
             Manager::Pipx => self.pipx.as_deref(),
             Manager::Go => self.go.as_deref(),
+            Manager::Github => None,
         }
     }
 

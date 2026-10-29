@@ -76,6 +76,11 @@ pub(super) fn installed(
         return Ok(kept(&prefix, name, manager == Manager::Cask)?);
     }
     let answer = match manager {
+        Manager::Github => {
+            return Err(Unanswered::Failed(
+                "a github release is detected by its install path, not a query".to_owned(),
+            ));
+        }
         Manager::Brew => brew(
             &query(
                 containment,

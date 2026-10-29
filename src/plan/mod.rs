@@ -440,6 +440,7 @@ mod tests {
             Program {
                 packages: BTreeMap::from([(Manager::Apt, "ripgrep".to_owned())]),
                 apt_repo: None,
+                github: None,
             },
         )]);
         let steps = Steps {

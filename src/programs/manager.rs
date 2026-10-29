@@ -54,6 +54,8 @@ pub(super) fn tools(manager: Manager) -> &'static [&'static str] {
         Manager::Uv => &["uv"],
         Manager::Pipx => &["pipx"],
         Manager::Go => &["go"],
+        // Never on PATH: `select` never picks it, and `programs::github` installs it in-process.
+        Manager::Github => &[],
     }
 }
 
@@ -83,7 +85,8 @@ pub(super) fn scope(manager: Manager) -> Option<Scope> {
         | Manager::Cargo
         | Manager::Uv
         | Manager::Pipx
-        | Manager::Go => Some(Scope::User),
+        | Manager::Go
+        | Manager::Github => Some(Scope::User),
     }
 }
 
@@ -119,6 +122,7 @@ pub(super) use crate::process::Invocation;
 
 pub(super) fn install(manager: Manager, program: &Path, package: &str, scope: Scope) -> Invocation {
     let args: Vec<&str> = match manager {
+        Manager::Github => unreachable!("a github release installs in-process, never as a command"),
         Manager::Brew => vec!["install", "--formula", package],
         Manager::Cask => vec!["install", "--cask", package],
         Manager::Apt => vec!["install", "-y", "--no-upgrade", package],

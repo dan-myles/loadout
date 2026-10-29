@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
 use super::schema::{
-    AgentsPatch, AptRepo, BuiltinAgent, Condition, CustomAgent, EnvSyntax, List,
-    MIN_INTERVAL_MINUTES, McpFormat, McpPatch, OneOrMany, PerOs, Value,
+    AgentsPatch, AptRepo, AssetKind, BuiltinAgent, Condition, CustomAgent, EnvSyntax,
+    GithubRelease, List, MIN_INTERVAL_MINUTES, McpFormat, McpPatch, OneOrMany, PerOs, Value,
 };
 use super::{Guard, LayerFile, Loadout, Scope, is_id};
 use crate::context::{split_base, windows_problem};
@@ -305,15 +305,16 @@ impl Checker {
             let fields = [
                 !packages.is_empty(),
                 item.apt_repo.is_some(),
+                item.github.is_some(),
                 item.when.is_some(),
             ];
             if !self.item(&key, id, global, item.remove, item.replace, &fields) {
                 continue;
             }
-            if (global || item.replace) && packages.is_empty() {
+            if (global || item.replace) && packages.is_empty() && item.github.is_none() {
                 self.error(
                     &key,
-                    "a program needs at least one manager, such as brew = \"<package>\"",
+                    "a program needs at least one manager, such as brew = \"<package>\", or a github release",
                 );
             }
             for (manager, package) in packages {
@@ -324,7 +325,83 @@ impl Checker {
             if let Some(repo) = &item.apt_repo {
                 self.apt_repo(&format!("{key}.apt-repo"), repo);
             }
+            if let Some(release) = &item.github {
+                self.github(&format!("{key}.github"), release);
+            }
             self.condition(&key, item.when.as_ref());
+        }
+    }
+
+    fn github(&mut self, key: &str, release: &GithubRelease) {
+        let name = |part: &str| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        if !matches!(release.repo.split_once('/'), Some((owner, repo)) if name(owner) && name(repo))
+        {
+            self.error(format!("{key}.repo"), "must be owner/name");
+        }
+        if release.asset.is_empty() {
+            self.error(
+                format!("{key}.asset"),
+                "needs a pattern for at least one <os>-<arch>",
+            );
+        }
+        let file = |value: &str| {
+            !value.is_empty()
+                && !value.starts_with('.')
+                && !value.contains(['/', '\\'])
+                && !value.chars().any(char::is_control)
+        };
+        for (platform, pattern) in &release.asset {
+            let at = format!("{key}.asset.{platform}");
+            let (os, arch) = platform.split_once('-').unwrap_or((platform, ""));
+            if !matches!(os, "linux" | "macos") || !matches!(arch, "x86_64" | "aarch64") {
+                self.error(
+                    &at,
+                    "keys are linux or macos, then x86_64 or aarch64, such as linux-x86_64",
+                );
+            }
+            if !file(pattern) {
+                self.error(&at, "must be an asset file name, with * for any text");
+            }
+            match AssetKind::of(pattern) {
+                Some(AssetKind::AppImage) if os != "linux" => {
+                    self.error(&at, "an .AppImage installs only on linux");
+                }
+                Some(AssetKind::TarGz) if release.bin.is_none() => {
+                    self.error(
+                        &at,
+                        "a .tar.gz needs bin, the executable inside it to put on PATH",
+                    );
+                }
+                Some(AssetKind::Zip) if os != "macos" => {
+                    self.error(&at, "a .zip installs only on macos, as an app");
+                }
+                Some(AssetKind::Zip) if release.app.is_none() => {
+                    self.error(&at, "a .zip needs app, the name of the .app inside it");
+                }
+                Some(_) => {}
+                None => self.error(&at, "must end in .AppImage, .tar.gz, .tgz, or .zip"),
+            }
+        }
+        for (field, value) in [
+            ("bin", &release.bin),
+            ("app", &release.app),
+            ("tag", &release.tag),
+        ] {
+            if let Some(value) = value
+                && !file(value)
+            {
+                self.error(
+                    format!("{key}.{field}"),
+                    "must be one file name, with no / or leading .",
+                );
+            }
         }
     }
 
