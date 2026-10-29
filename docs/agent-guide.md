@@ -99,7 +99,10 @@ loadout doctor             # what this machine has, and where every agent's file
 | `plan [--loadout DIR]` | shows what apply would change here | no | `--json` |
 | `status` | shows what loadout owns here, and the state of its runs | no | `--json` |
 | `apply [--loadout DIR] [--force] [--elevated]` | brings this machine in line with the loadout | yes | |
-| `init <URL> [--name NAME] [--no-service]` | clones the loadout, names the machine, applies, installs the sync service | yes | |
+| `init <URL> [--profile PROFILE]... [--name NAME] [--no-service]` | clones the loadout, saves this machine's profiles, applies, installs the sync service | yes | |
+| `profile [list]` | lists the loadout's profiles and marks the ones this machine uses | no | `list --json` |
+| `profile set PROFILE...`, `profile set --none` | replaces this machine's profiles, or clears them; refused before `init` | the state dir only | |
+| `profile choose` | asks which profiles this machine uses (needs a terminal) | the state dir only | |
 | `sync [--loadout DIR]` | fetches and fast-forwards loadout's clone, then applies it | yes | |
 | `rollback [RUN]` | undoes a run: restores its backups, deletes what it created | yes | |
 | `service install` | installs the scheduled background sync for this user | yes | |
@@ -127,7 +130,7 @@ flowchart LR
 - **Loadout's clone** is `<state>/loadout`. `init` creates it, and `sync` fast-forwards it. `plan`
   and `apply` read it unless you pass `--loadout DIR`. Don't edit it: `sync` refuses to touch a
   clone with local changes.
-- **The state dir** holds the machine name, ownership records, one journal and backup folder per
+- **The state dir** holds the machine name and its chosen profiles (`machine.toml`), ownership records, one journal and backup folder per
   run, the lock, and the background sync's records.
 
 | OS | State dir |
@@ -165,9 +168,8 @@ A loadout is a Git repository whose root holds `loadout.toml`. Start from
 
 ```text
 my-loadout/
-├── loadout.toml                 global layer, [loadout], [machines]
-├── tags/work.toml               what machines tagged "work" change
-├── machines/work-laptop.toml    what one machine changes
+├── loadout.toml                 global layer, [loadout]
+├── tags/work.toml               the "work" profile, for machines that choose it
 ├── files/gitconfig.tmpl         a templated user file
 ├── skills/code-review/SKILL.md  a skill
 └── instructions/AGENTS.md       global agent instructions
@@ -177,9 +179,6 @@ my-loadout/
 # loadout.toml
 [loadout]
 version = 1
-
-[machines.work-laptop]
-tags = ["work"]
 
 [variables]
 name = "Ada Lovelace"
@@ -213,8 +212,10 @@ To create a user's personal loadout:
 1. Copy `examples/starter/` into a new folder, then `git init` it.
 2. Replace the variables and add the user's items. Ask which agents they use, and list exactly
    those in `[agents] enabled`: the default is none, so nothing reaches an agent they didn't name.
-3. List each of their machines under `[machines]` with its tags. Add a `machines/<name>.toml` only
-   for what differs on one machine.
+3. Ask what differs between their machines, such as work or personal, and give each difference a
+   profile: a `tags/<profile>.toml` layer. Don't list their machines: each machine chooses its
+   profiles when it is set up. Declare a machine under `[machines]` only when it needs a
+   `machines/<name>.toml` of its own.
 4. Run `loadout validate .` until it exits 0, and fix any warnings that matter.
 5. Commit, and push to a repository the user owns. A private repository works through their
    existing Git credentials or SSH keys. Loadout stores no token.
@@ -226,6 +227,8 @@ Rules worth knowing before you write:
 - Targets start with `~/` or `{config}/`. Sources are relative paths inside the loadout.
 - Only a user file whose source ends in `.tmpl` is rendered. Templates are strict: a missing
   variable is an error.
+- A profile a machine chooses is saved on that machine, never in the loadout. A machine with no
+  profiles gets the global and OS layers only.
 - A narrower layer edits an inherited item by naming its id: fields merge, `remove = true` drops
   it, and `replace = true` swaps it whole.
 - A program installs only through a manager listed in its table that is on `PATH` when apply plans.
@@ -260,7 +263,7 @@ export LOADOUT_HOME="$SANDBOX/home" LOADOUT_STATE_DIR="$SANDBOX/state"
 
 cd my-loadout
 loadout validate .
-loadout init "file://$PWD" --name work-laptop --no-service > "$SANDBOX/init.log" 2>&1
+loadout init "file://$PWD" --profile work --no-service > "$SANDBOX/init.log" 2>&1
 loadout plan --loadout . --json > "$SANDBOX/plan.json"
 loadout apply --loadout . > "$SANDBOX/apply.log" 2>&1
 loadout status --json > "$SANDBOX/status.json"
@@ -271,7 +274,8 @@ rm -rf "$SANDBOX"
 ```
 
 - `init "file://$PWD"` clones the committed `HEAD`, so the repo needs at least one commit. It also
-  saves the machine name, so later `plan` and `apply` resolve that machine's tags. `--loadout .`
+  saves the machine's profiles, so later `plan` and `apply` resolve the same layers. Rehearse
+  another profile with `loadout profile set <profile>`. `--loadout .`
   then uses the working tree, uncommitted edits included.
 - In a sandbox, any `[programs]` item is `blocked` with "programs are not installed under
   LOADOUT_HOME isolation", which makes `init`, `plan`, and `apply` exit 4. That is expected. Any
@@ -286,10 +290,10 @@ loadout validate path/to/loadout          # default DIR: .
 loadout validate path/to/loadout --json
 ```
 
-Validate never touches the machine. It checks the schema, then resolves every listed machine on
-macOS, Linux, and Windows, on both CPU architectures, and checks every template's syntax. Each
+Validate never touches the machine. It checks the schema, then resolves every listed machine, a
+machine with each profile alone, and a machine with none, on macOS, Linux, and Windows, on both CPU architectures, and checks every template's syntax. Each
 diagnostic names its file and key. One that depends on the machine also names the machines and
-OSes it affects, such as `(on work-laptop: windows)`.
+OSes it affects, such as `(on a machine with only profile work: windows)`.
 
 ```json
 {
@@ -411,7 +415,7 @@ loadout only reads it.
 
 ```sh
 curl -fsSL -o install.sh https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh
-sh install.sh https://github.com/ada/loadout.git --name work-laptop
+sh install.sh https://github.com/ada/loadout.git --profile work
 ```
 
 The `curl` line only downloads the script and prints nothing; the `sh` line runs it. On Linux run
@@ -419,18 +423,32 @@ The `curl` line only downloads the script and prints nothing; the `sh` line runs
 installed:
 
 ```sh
-loadout init https://github.com/ada/loadout.git --name work-laptop
-loadout init git@github.com:ada/loadout.git --name work-laptop --no-service
+loadout init https://github.com/ada/loadout.git --profile work
+loadout init git@github.com:ada/loadout.git --profile work,laptop --no-service
+loadout init https://github.com/ada/loadout.git            # no profile: global and OS layers only
 ```
 
-`init` clones the loadout into `<state>/loadout`, saves the machine name, applies, and installs the
-background sync service unless `--no-service` is passed or the loadout sets `[update] auto = false`.
+`init` clones the loadout into `<state>/loadout`, saves the machine's name and profiles in
+`<state>/machine.toml`, applies, and installs the background sync service unless `--no-service` is
+passed or the loadout sets `[update] auto = false`. The machine doesn't need to be in the loadout.
 
-- **Pass `--name`.** Without it, init asks in a terminal and otherwise takes the hostname-derived
-  name. A name the loadout doesn't list gets the global and OS layers only, and init says so.
-- **A saved name never changes.** A different `--name` on a machine that already has one is
-  refused.
-- **Run it once.** If `<state>/loadout` exists, init refuses and points at `loadout sync`.
+- **Pass `--profile`.** Ask the user which profiles this machine should get (`loadout profile list
+  --loadout DIR` lists a checkout's). Without `--profile`, init asks in a terminal and chooses none
+  elsewhere, so an unattended init never waits. It never chooses a profile on its own.
+- **An unknown profile stops init.** `--profile` naming no `tags/<profile>.toml` exits 3 after the
+  clone, applies nothing, and lists the loadout's profiles. Then run `loadout profile set`,
+  `loadout sync`, and `loadout service install`.
+- **Change profiles later** with `loadout profile set <profile>...` (`--none` clears them) or
+  `loadout profile choose`, then `loadout apply`. The background sync uses the saved choice and
+  never asks.
+- **`--name` is for declared machines.** Init asks for a name only when the loadout has
+  `[machines]` and it runs in a terminal; otherwise the name comes from the hostname. A saved name
+  never changes: a different `--name` on a machine that already has one is refused.
+- **Run it once.** If `<state>/loadout` exists, init refuses and points at `loadout sync`. An init
+  stopped at its prompt (Ctrl-C) leaves the clone with the machine's name and URL saved and
+  nothing applied; `loadout profile set`, `loadout sync`, and `loadout service install` finish it.
+- **Running init again keeps the saved profiles.** After the clone is removed, a new `init` without
+  `--profile` keeps (and in a terminal, offers as the default) the profiles already saved.
 - **No credentials in the URL.** A URL with a password is refused before anything is written. Use
   the user's Git credential helper or SSH key.
 - Exits: 0 on success, 3 when the loadout is invalid (the service is then not installed), 4 when the
@@ -442,6 +460,28 @@ background sync service unless `--no-service` is passed or the loadout sets `[up
 - **The service syncs as soon as it is installed.** On Linux its systemd timer fires right away,
   and a sync applies. Tell the user before running `loadout service install` if they asked for
   nothing to be applied.
+
+### Profiles
+
+`loadout profile` (the same as `loadout profile list`) prints the loadout's profiles and marks the
+ones this machine chose and the ones its `[machines]` entry gives it. `--loadout DIR` reads another
+checkout. `profile list --json` prints:
+
+```json
+{
+  "machine": "ada-desktop",
+  "profiles": [
+    { "name": "work", "chosen": true, "declared": false, "available": true }
+  ]
+}
+```
+
+`chosen` means saved on this machine, `declared` means listed in its `[machines]` entry, and
+`available` means the loadout has `tags/<name>.toml`. A chosen profile the loadout dropped shows
+`available: false`, and until it is cleared `plan`, `apply`, and `sync` exit 3 with
+`error: profiles: this machine chose profile ...` and write nothing. `profile set` exits 3 and saves nothing when
+a name isn't available. Which tags apply, in order: the declared tags, then the chosen profiles;
+see [the loadout format](loadout-format.md#profiles).
 
 ## 9. Sync
 
@@ -506,6 +546,7 @@ It never writes.
   uncontained.
 
 **`doctor`** checks the machine: version, platform, home, config and state dirs, machine name,
+chosen profiles,
 `git`, the package managers on `PATH`, every agent's paths, elevation, loadout's clone, the
 service, the last background run, and how the CLI was installed. Each check has a `status` of
 `pass`, `info`, `warn`, or `fail`. Doctor exits 4 when any check fails, and never writes. `git` is
@@ -601,12 +642,14 @@ never elevates. Drift and blocked actions are recorded for `loadout status` and
 
 Loadout is built to run without a person at the keyboard.
 
-- No command prompts, with two exceptions. `init` asks for a machine name only when both stdin and
-  stdout are a terminal, so pass `--name`. `apply --elevated` may hit a `sudo` password prompt or a
-  UAC dialog, so don't pass it unattended.
+- No command prompts, with three exceptions. `init` asks for profiles (and, for a loadout with
+  `[machines]`, a machine name) only when both stdin and stdout are a terminal, so pass
+  `--profile`; without a terminal it chooses none. `profile choose` asks, and exits 1 without a
+  terminal; use `profile set`. `apply --elevated` may hit a `sudo` password prompt or a UAC dialog,
+  so don't pass it unattended.
 - Package managers run with a null stdin and `LC_ALL=C`, and with their own noninteractive flags
   where they have one, such as `apt-get install -y`.
-- `--json` is available on `doctor`, `validate`, `plan`, `status`, and `service status`. `apply`,
+- `--json` is available on `doctor`, `validate`, `plan`, `status`, `profile list`, and `service status`. `apply`,
   `sync`, `init`, and `rollback` print one line per action. Their exit code is the contract.
 - Diagnostics go to stdout. A runtime error goes to stderr as `error: <message>` with exit 1.
 - When stderr is a terminal, `apply`, `sync`, and `init` show a spinner there naming what they
@@ -673,7 +716,7 @@ loadout apply --loadout .
 
 # a new machine (package managers, the CLI, PATH, then init)
 curl -fsSL -o install.sh https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh
-sh install.sh https://github.com/ada/loadout.git --name work-laptop
+sh install.sh https://github.com/ada/loadout.git --profile work
 
 # install only the CLI, touching nothing else
 sh install.sh --no-homebrew --no-modify-path

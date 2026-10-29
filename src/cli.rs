@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
-    apply, doctor, init, plan, rollback, service, status, sync, update, validate,
+    apply, doctor, init, plan, profile, rollback, service, status, sync, update, validate,
 };
 use crate::context::Context;
 
@@ -40,8 +40,10 @@ pub enum Command {
     Update(update::Args),
     /// Install, remove, or check the scheduled background sync
     Service(service::Args),
-    /// Set this machine up from a loadout: clone it, name the machine, apply, and keep it synced
+    /// Set this machine up from a loadout: clone it, choose its profiles, apply, and keep it synced
     Init(init::Args),
+    /// Show or change the profiles this machine uses
+    Profile(profile::Args),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,5 +102,6 @@ pub fn run(cli: Cli) -> anyhow::Result<Exit> {
         Command::Update(args) => update::run(&args, &context),
         Command::Service(args) => service::run(&args, &context),
         Command::Init(args) => init::run(&args, &context),
+        Command::Profile(args) => profile::run(&args, &context),
     }
 }

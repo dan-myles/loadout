@@ -15,6 +15,7 @@ fn linux() -> Facts {
         distro: Some("ubuntu".to_owned()),
         arch: Arch::X86_64,
         home: PathBuf::from("/home/dan"),
+        profiles: Vec::new(),
     }
 }
 
@@ -25,6 +26,7 @@ fn windows() -> Facts {
         distro: None,
         arch: Arch::Aarch64,
         home: PathBuf::from(r"C:\Users\dan"),
+        profiles: Vec::new(),
     }
 }
 

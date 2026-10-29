@@ -17,22 +17,26 @@ One computer a loadout is brought onto.
 _Avoid_: host, device
 
 **Machine name**:
-The name a machine goes by in a loadout, chosen on its first run and kept on the machine. It defaults to the hostname and survives renaming the computer.
+The name a machine goes by, chosen on its first run and kept on the machine. It defaults to the hostname and survives renaming the computer. A loadout uses it only for a machine it declares in `[machines]`, which is optional.
 _Avoid_: hostname, machine ID
 
 ### Customization
 
 **Layer**:
 One level of declarations in a loadout. The layers, broadest first: global, OS, tag, machine.
-_Avoid_: profile, scope, level
+_Avoid_: scope, level
 
 **Global layer**:
 What every machine gets.
 _Avoid_: baseline, default, common
 
 **Tag**:
-A named group of machines, such as `work` or `laptop`, with its own layer. The loadout lists each machine's tags.
-_Avoid_: group, profile, role
+A named layer, such as `work` or `laptop`, in `tags/<name>.toml`. A machine gets a tag by choosing it as a profile, or from its optional `[machines]` entry.
+_Avoid_: group, role
+
+**Profile**:
+A tag a machine chooses for itself. The choice is kept on the machine, not in the loadout, so a new machine needs no edit to the loadout. A machine with no profiles gets the global and OS layers only.
+_Avoid_: role, machine type
 
 **Override**:
 A declaration in a narrower layer that adds, removes, replaces, or changes part of an item from a broader layer.

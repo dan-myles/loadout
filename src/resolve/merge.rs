@@ -356,12 +356,28 @@ fn layers<'a>(
         .into_iter()
         .flatten()
         .collect();
-    let Some(entry) = loadout.machines.get(&facts.name) else {
-        return layers;
-    };
-    for tag in &entry.tags {
+    let listed = loadout
+        .machines
+        .get(&facts.name)
+        .into_iter()
+        .flat_map(|entry| &entry.tags)
+        .map(|tag| (tag, false));
+    let chosen = facts.profiles.iter().map(|profile| (profile, true));
+    for (tag, chosen) in listed.chain(chosen) {
+        if tags.contains(tag) {
+            continue;
+        }
         match find(Scope::Tag(tag.clone())) {
-            Some(file) => layers.push(file),
+            Some(layer) => layers.push(layer),
+            None if chosen => report(
+                diagnostics,
+                Severity::Error,
+                None,
+                "profiles",
+                format!(
+                    "this machine chose profile {tag:?} (saved in its state dir's machine.toml), but the loadout has no tags/{tag}.toml; `loadout profile list` shows the profiles it has and `loadout profile set` changes this machine's"
+                ),
+            ),
             None => report(
                 diagnostics,
                 Severity::Error,

@@ -16,8 +16,8 @@ Resolved 2026-10-23 with Dan, through three grilling rounds he answered live.
 
 - **Layers**, broadest first: global → OS → tag → machine. A narrower layer wins.
 - **OS layer**: exactly three, `macos`, `linux`, and `windows`. Distro and CPU architecture are machine facts, not layers.
-- **Machine identity**: a machine name chosen on the first run, defaulting to the hostname and kept on the machine. Renaming the computer doesn't change it. A machine name the loadout doesn't list gets the global and OS layers only.
-- **Tags**: the loadout lists each machine's tags under its machine name. When two of a machine's tags set the same thing differently, the tag listed later wins.
+- **Machine identity**: a machine name chosen on the first run, defaulting to the hostname and kept on the machine. Renaming the computer doesn't change it.
+- **Tags**: a machine chooses its tags itself as **profiles**, saved on the machine, so a new machine needs no edit to the loadout and gets no profile it wasn't given. The loadout may still list a machine's tags under `[machines]` for a machine that needs its own layer; those come first, then its chosen profiles. When two of a machine's tags set the same thing differently, the later one wins. (Changed 2026-10-29 by the owner, who wants machines to get profiles locally instead of being declared; the earlier answer had the loadout list every machine's tags.)
 - **Override operations**: a narrower layer can add an item, remove an inherited item, replace one whole, or change any field of it.
 - **Lists**: assigning a list replaces it. Explicit add-to and remove-from operations edit an inherited list instead.
 - **Conditions**: any item in any layer may carry a condition on machine facts (OS, distro, arch), for example `when os = windows`. This covers combinations such as "work tag, Windows only" without extra tags.

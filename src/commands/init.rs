@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::apply::{self, Mode, Options};
 use crate::cli::Exit;
 use crate::commands::apply::show;
+use crate::commands::profile;
 use crate::context::Context;
 use crate::machine::{self, NameSource};
 use crate::manifest::Loadout;
@@ -20,29 +21,26 @@ pub struct Args {
         help = "The loadout Git repository, such as https://github.com/you/loadout.git or git@github.com:you/loadout.git"
     )]
     pub url: String,
-    /// This machine's name in the loadout [default: the saved name, else one made from the hostname]
-    #[arg(long, value_name = "NAME", value_parser = machine_name)]
+    /// A profile for this machine, such as `work`; repeat it or separate names with commas.
+    /// Without it, init asks in a terminal and chooses none elsewhere
+    #[arg(long = "profile", value_name = "PROFILE", value_parser = crate::id::parse, value_delimiter = ',')]
+    pub profiles: Vec<String>,
+    /// This machine's name, needed only for a loadout that declares machines in [machines]
+    /// [default: the saved name, else one made from the hostname]
+    #[arg(long, value_name = "NAME", value_parser = crate::id::parse)]
     pub name: Option<String>,
     /// Don't install the background sync service, even when the loadout's [update] auto is true
     #[arg(long)]
     pub no_service: bool,
 }
 
-fn machine_name(value: &str) -> Result<String, String> {
-    if crate::id::is_id(value) {
-        Ok(value.to_owned())
-    } else {
-        Err("must be lowercase letters, digits, - or _, starting with a letter or digit".to_owned())
-    }
-}
-
 /// Sets this machine up from a loadout: clones it into loadout's own checkout, saves the
-/// machine's name and the loadout's URL, applies it, and installs the background sync service
+/// machine's name, its chosen profiles, and the loadout's URL, applies it, and installs the background sync service
 /// unless the loadout's `[update] auto` is false or `--no-service` is given.
 ///
 /// The existing setup, a conflicting `--name`, and a URL carrying a password are refused before
-/// anything is written; a clone, machine-file, apply or service failure can still come after the
-/// clone. The state lock is held from the clone through the apply. A private loadout clones with
+/// anything is written; a clone, unknown `--profile`, machine-file, apply or service failure can
+/// still come after the clone. The state lock is held from the clone through the apply. A private loadout clones with
 /// the user's own Git credentials or SSH keys; loadout stores no token, and shows the URL only
 /// with its userinfo hidden.
 pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
@@ -54,7 +52,7 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     let checkout = sync::checkout(context);
     if checkout.exists() {
         anyhow::bail!(
-            "loadout is already set up on this machine ({} exists); run `loadout sync` to apply the latest loadout",
+            "loadout is already set up on this machine ({} exists); run `loadout sync` to apply the latest loadout, or `loadout profile set` to change this machine's profiles",
             checkout.display()
         );
     }
@@ -82,13 +80,73 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
     );
     sync::clone(&args.url, context, &lock)?;
 
+    let loadout = Loadout::load_guarded(&checkout, context)
+        .ok()
+        .map(|(loadout, _)| loadout);
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let name = match (&args.name, saved) {
         (Some(name), _) => name.clone(),
         (None, Some(saved)) => saved,
-        (None, None) => choose(context, &checkout)?,
+        (None, None) => choose(context, loadout.as_ref(), interactive)?,
     };
-    machine::save(context, &name, &args.url)?;
+    let available = loadout.as_ref().map(Loadout::profiles).unwrap_or_default();
+    let declared = loadout
+        .as_ref()
+        .and_then(|loadout| loadout.machines.get(&name))
+        .map(|entry| entry.tags.clone())
+        .unwrap_or_default();
+    let kept = machine::profiles(context)?;
+    // Saved before asking, so a cancelled prompt still leaves the name a declared machine chose.
+    machine::save(context, &name, &args.url, &kept)?;
+    let profiles = if !args.profiles.is_empty() {
+        if loadout.is_none() {
+            println!(
+                "profiles not saved: the loadout is invalid, so they can't be checked; fix it, then run `loadout profile set PROFILE...`"
+            );
+            kept
+        } else {
+            args.profiles.clone()
+        }
+    } else if interactive && !available.is_empty() {
+        profile::ask(
+            &available,
+            &kept,
+            &declared,
+            &mut io::stdin().lock(),
+            &mut io::stdout(),
+        )?
+    } else {
+        kept
+    };
+    let unknown = loadout
+        .as_ref()
+        .map(|loadout| loadout.unknown_profiles(&profiles))
+        .unwrap_or_default();
+    if !unknown.is_empty() {
+        for profile in unknown {
+            println!("no profile {profile} in this loadout (no tags/{profile}.toml)");
+        }
+        println!("{}", profile::offered(&available));
+        println!(
+            "nothing applied: run `loadout profile set PROFILE...`, then `loadout sync` and `loadout service install`"
+        );
+        return Ok(Exit::Invalid);
+    }
+    machine::save(context, &name, &args.url, &profiles)?;
     println!("this machine is {name}");
+    if !profiles.is_empty() {
+        println!("profiles: {}", profiles.join(", "));
+    } else if !available.is_empty() {
+        let gets = if declared.is_empty() {
+            "the global and OS layers only".to_owned()
+        } else {
+            format!("its [machines] tags ({})", declared.join(", "))
+        };
+        println!(
+            "no profiles chosen, so this machine gets {gets}; `loadout profile set PROFILE...` or `loadout profile choose` adds some later ({})",
+            profile::offered(&available)
+        );
+    }
 
     let options = Options {
         force: false,
@@ -114,26 +172,32 @@ pub fn run(args: &Args, context: &Context) -> anyhow::Result<Exit> {
 }
 
 /// The name for a machine with no saved name: the hostname's, or in a terminal the one the user
-/// picks, preferably among the machines the loadout lists.
-fn choose(context: &Context, checkout: &Path) -> anyhow::Result<String> {
+/// picks among the loadout's declared machines.
+fn choose(
+    context: &Context,
+    loadout: Option<&Loadout>,
+    interactive: bool,
+) -> anyhow::Result<String> {
     let default = machine::name(context)?.name;
-    let listed: Vec<String> = Loadout::load_guarded(checkout, context)
-        .map(|(loadout, _)| loadout.machines.into_keys().collect())
+    let declared_machines: Vec<String> = loadout
+        .map(|loadout| loadout.machines.keys().cloned().collect())
         .unwrap_or_default();
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if declared_machines.is_empty() {
+        return Ok(default);
+    }
     let name = if interactive {
         prompt(
             &default,
-            &listed,
+            &declared_machines,
             &mut io::stdin().lock(),
             &mut io::stdout(),
         )?
     } else {
         default
     };
-    if !listed.is_empty() && !listed.contains(&name) {
+    if !declared_machines.contains(&name) {
         println!(
-            "note: the loadout's [machines] doesn't list {name}, so it gets the global and OS layers only"
+            "note: the loadout's [machines] doesn't list {name}, so it gets the global and OS layers and its chosen profiles"
         );
     }
     Ok(name)
@@ -159,7 +223,7 @@ fn prompt(
         if answer.is_empty() {
             return Ok(default.to_owned());
         }
-        match machine_name(answer) {
+        match crate::id::parse(answer) {
             Ok(name) => return Ok(name),
             Err(problem) => writeln!(output, "{answer:?} {problem}")?,
         }
@@ -240,9 +304,9 @@ mod tests {
 
     #[test]
     fn name_flag_uses_the_id_rule() {
-        assert!(machine_name("work-laptop").is_ok());
+        assert!(crate::id::parse("work-laptop").is_ok());
         for bad in ["", "Work", "-x", "a b", "../x"] {
-            assert!(machine_name(bad).is_err(), "{bad}");
+            assert!(crate::id::parse(bad).is_err(), "{bad}");
         }
     }
 }

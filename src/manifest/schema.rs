@@ -597,6 +597,7 @@ mod tests {
             distro: distro.map(str::to_owned),
             arch: Arch::X86_64,
             home: "/h".into(),
+            profiles: Vec::new(),
         }
     }
 

@@ -110,7 +110,7 @@ fn dropping_the_windows_override_fails_every_machine_on_windows_only() {
     assert_eq!(output.status.code(), Some(3), "{text}");
     assert!(
         text.contains(
-            "loadout.toml: error: files.notes.target: \"notes:today\" contains ':', which Windows paths cannot hold (drive, stream, or reserved character), so ~/notes:today has no valid Windows path for files.notes; remove or override it in os/windows.toml, or add a when condition (on mini: windows; studio: windows; tower: windows; any other unlisted machine: windows)"
+            "loadout.toml: error: files.notes.target: \"notes:today\" contains ':', which Windows paths cannot hold (drive, stream, or reserved character), so ~/notes:today has no valid Windows path for files.notes; remove or override it in os/windows.toml, or add a when condition (on mini: windows; studio: windows; tower: windows; a machine with only profile laptop: windows; a machine with only profile work: windows; any other unlisted machine: windows)"
         ),
         "{text}"
     );
@@ -140,9 +140,9 @@ fn a_machine_whose_tag_order_puts_a_colliding_target_last_is_the_only_one_that_f
     assert_eq!(output.status.code(), Some(3), "{text}");
     assert!(
         text.contains(
-            "tags/work.toml: error: files.notes.target: files.notes (~/.shellrc) and files.shell (~/.shellrc) both write ~/.shellrc (on tower: macos, linux)"
+            "tags/work.toml: error: files.notes.target: files.notes (~/.shellrc) and files.shell (~/.shellrc) both write ~/.shellrc (on tower: macos, linux; a machine with only profile work: macos, linux)"
         ),
-        "tower lists work last, so work's target wins there: {text}"
+        "tower lists work last, and a machine with only work has nothing after it, so work's target wins there: {text}"
     );
     assert!(
         !text
@@ -151,7 +151,7 @@ fn a_machine_whose_tag_order_puts_a_colliding_target_last_is_the_only_one_that_f
         "studio lists laptop last: {text}"
     );
     assert!(
-        text.contains("files.notes: adds this item here because no broader layer declares it for this machine, but it is incomplete: missing source (on studio: windows; tower: windows)"),
+        text.contains("files.notes: adds this item here because no broader layer declares it for this machine, but it is incomplete: missing source (on studio: windows; tower: windows; a machine with only profile work: windows)"),
         "os/windows.toml removed notes, so a tag edit on Windows is an incomplete add: {text}"
     );
 }
@@ -163,13 +163,13 @@ fn each_conflict_is_reported_once_with_the_machines_and_oses_it_hits() {
     let text = stdout(&output);
     assert_eq!(output.status.code(), Some(3), "{text}");
     for expected in [
-        "tags/work.toml: error: mcp.tools: has both command (stdio) and url (remote) after merging loadout.toml, tags/work.toml; to switch transports, write replace = true with the complete server in the narrower layer (on studio: macos, linux, windows)",
-        "tags/work.toml: error: instructions.work: instructions.main, instructions.work all reach claude; an agent takes one instructions file, so narrow them with agents = [...] (on studio: macos, linux, windows)",
-        "tags/work.toml: error: files.cfg-native.target: files.cfg-native ({config}/app/settings) and files.cfg (~/.config/app/settings) both write ~/.config/app/settings (on studio: linux)",
-        "tags/gaming.toml: error: skills.half: adds this item here because no broader layer declares it for this machine, but it is incomplete: missing source (on tower: macos, linux, windows)",
-        "tags/gaming.toml: warning: mcp.extra.agents: names \"cursor\", which is not enabled for this machine, so it gets nothing (on tower: macos, linux, windows)",
-        "tags/gaming.toml: error: files.profile-upper.target: files.profile-upper (~/.Profile) and files.profile (~/.profile) both write ~/.Profile (on tower: macos, windows)",
-        "tags/gaming.toml: error: files.colon.target: \"scores:high\" contains ':', which Windows paths cannot hold (drive, stream, or reserved character), so ~/scores:high has no valid Windows path for files.colon; remove or override it in os/windows.toml, or add a when condition (on tower: windows)",
+        "tags/work.toml: error: mcp.tools: has both command (stdio) and url (remote) after merging loadout.toml, tags/work.toml; to switch transports, write replace = true with the complete server in the narrower layer (on studio: macos, linux, windows; a machine with only profile work: macos, linux, windows)",
+        "tags/work.toml: error: instructions.work: instructions.main, instructions.work all reach claude; an agent takes one instructions file, so narrow them with agents = [...] (on studio: macos, linux, windows; a machine with only profile work: macos, linux, windows)",
+        "tags/work.toml: error: files.cfg-native.target: files.cfg-native ({config}/app/settings) and files.cfg (~/.config/app/settings) both write ~/.config/app/settings (on studio: linux; a machine with only profile work: linux)",
+        "tags/gaming.toml: error: skills.half: adds this item here because no broader layer declares it for this machine, but it is incomplete: missing source (on tower: macos, linux, windows; a machine with only profile gaming: macos, linux, windows)",
+        "tags/gaming.toml: warning: mcp.extra.agents: names \"cursor\", which is not enabled for this machine, so it gets nothing (on tower: macos, linux, windows; a machine with only profile gaming: macos, linux, windows)",
+        "tags/gaming.toml: error: files.profile-upper.target: files.profile-upper (~/.Profile) and files.profile (~/.profile) both write ~/.Profile (on tower: macos, windows; a machine with only profile gaming: macos, windows)",
+        "tags/gaming.toml: error: files.colon.target: \"scores:high\" contains ':', which Windows paths cannot hold (drive, stream, or reserved character), so ~/scores:high has no valid Windows path for files.colon; remove or override it in os/windows.toml, or add a when condition (on tower: windows; a machine with only profile gaming: windows)",
         "invalid: ",
     ] {
         assert!(
@@ -206,7 +206,7 @@ fn resolution_diagnostics_in_json_carry_their_layer_file_and_key() {
         collision["message"]
             .as_str()
             .unwrap()
-            .ends_with("(on studio: linux)")
+            .ends_with("(on studio: linux; a machine with only profile work: linux)")
     );
     assert_eq!(
         diagnostics

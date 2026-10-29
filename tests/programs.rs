@@ -46,6 +46,7 @@ fn probe() {
         distro: None,
         arch: Arch::current().unwrap(),
         home: context.home.clone(),
+        profiles: Vec::new(),
     };
     let programs: BTreeMap<String, Program> = request
         .programs

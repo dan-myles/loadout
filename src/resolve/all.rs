@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::resolve;
-use crate::diagnostic::{Diagnostic, Diagnostics};
+use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::machine::Facts;
-use crate::manifest::{Condition, Layer, Loadout, OneOrMany};
+use crate::manifest::{Condition, Layer, Loadout, OneOrMany, Scope};
 use crate::platform::{Arch, Os};
 
 const ARCHES: [Arch; 2] = [Arch::X86_64, Arch::Aarch64];
@@ -13,6 +13,10 @@ const UNLISTED: &str = "unlisted";
 struct Machine {
     name: String,
     label: String,
+    profiles: Vec<String>,
+    /// A profile alone whose tag a declared machine lists: it may be written only to go with
+    /// that machine's other tags, so a problem seen nowhere else stays a warning.
+    composed: bool,
 }
 
 struct Variant {
@@ -59,6 +63,7 @@ pub(super) fn check_all(loadout: &Loadout) -> Diagnostics {
             distro: variant.distro.clone(),
             arch: variant.arch,
             home: PathBuf::from("~"),
+            profiles: machines[variant.machine].profiles.clone(),
         };
         let diagnostics = match resolve(loadout, &facts) {
             Ok((_, warnings)) => warnings,
@@ -74,6 +79,17 @@ pub(super) fn check_all(loadout: &Loadout) -> Diagnostics {
 
     let mut out = Diagnostics::default();
     for (mut diagnostic, hits) in groups {
+        if diagnostic.severity == Severity::Error
+            && hits
+                .iter()
+                .all(|index| machines[variants[*index].machine].composed)
+        {
+            diagnostic.severity = Severity::Warning;
+            diagnostic.message = format!(
+                "{}; [machines] lists this tag with others, so only a machine that chooses it alone as a profile would fail",
+                diagnostic.message
+            );
+        }
         diagnostic.message = format!(
             "{} (on {})",
             diagnostic.message,
@@ -91,6 +107,8 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
         .map(|name| Machine {
             name: name.clone(),
             label: name.clone(),
+            profiles: Vec::new(),
+            composed: false,
         })
         .collect();
     let named: BTreeSet<&String> = conditions(loadout)
@@ -101,6 +119,8 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
             machines.push(Machine {
                 name: (*name).clone(),
                 label: format!("unlisted machine {name}"),
+                profiles: Vec::new(),
+                composed: false,
             });
         }
     }
@@ -113,9 +133,24 @@ fn machines(loadout: &Loadout) -> Vec<Machine> {
         })
         .find(|name| !taken(name))
         .expect("more candidates than taken names");
+    for file in &loadout.layers {
+        if let Scope::Tag(tag) = &file.scope {
+            machines.push(Machine {
+                name: name.clone(),
+                label: format!("a machine with only profile {tag}"),
+                profiles: vec![tag.clone()],
+                composed: loadout
+                    .machines
+                    .values()
+                    .any(|entry| entry.tags.contains(tag)),
+            });
+        }
+    }
     machines.push(Machine {
         name,
         label: "any other unlisted machine".to_owned(),
+        profiles: Vec::new(),
+        composed: false,
     });
     machines
 }

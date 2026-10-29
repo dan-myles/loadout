@@ -1,4 +1,0 @@
-[programs.jq]
-brew = "jq"
-apt = "jq"
-winget = "jqlang.jq"

@@ -92,7 +92,7 @@ src/
   id.rs                   the id rule for items, tags, machines, agents     [foundation]
   progress.rs             Spinner, note: what a foreground run waits on, on a terminal's stderr
   reserved.rs             reserved destinations: auth, shared configs, state [foundation]
-  machine.rs              Facts, machine name                               [foundation]
+  machine.rs              Facts, machine name, chosen profiles (machine.toml) [foundation]
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
   resolve/                mod.rs (API, Resolved), merge.rs (layer folding), finish.rs (agents,
                           transports, reach), paths.rs (Windows, collisions, reserved), all.rs [built, U1]
@@ -222,17 +222,23 @@ validate catches.
 [loadout]
 version = 1                        # required; v1 accepts only 1
 
-[machines.work-laptop]             # machine name -> its tags, in order; a later tag wins
+[machines.work-laptop]             # optional: machine name -> its tags, in order; a later tag wins
 tags = ["work", "laptop"]
 ```
 
-A machine name the loadout doesn't list gets the global and OS layers only. These are errors: a
+`[machines]` is optional compatibility, not registration: a machine normally chooses its
+**profiles** (tag layers) itself, and they are saved in `<state>/machine.toml` (section 4). A
+machine's tags are its `[machines.<name>]` tags in listed order, then its chosen profiles in chosen
+order, skipping any already listed; its `machines/<name>.toml` layer comes after all of them. A
+machine the loadout doesn't list gets the global and OS layers plus its chosen profiles. A chosen
+profile with no `tags/<profile>.toml` is a resolution error on key `profiles` with no file (the
+choice isn't in the loadout; the message names the state dir's `machine.toml`), so plan, apply, and sync exit 3 and write nothing. These are errors: a
 `machines/<name>.toml` with no `[machines.<name>]` entry, a listed tag that isn't an id, a tag
 listed twice, and a listed tag with no valid `tags/<tag>.toml` layer. The match is exact and
 case-sensitive against the tag layers the confined loader actually loaded. It is never a path probe
 or a second directory read, so `../x`, `Work`, or a tag file reached only through a rejected
 outside `tags/` link can't satisfy it. A tag whose file failed to parse gets both errors: the
-parse error and "no valid layer file". A tag file that no machine lists is a warning.
+parse error and "no valid layer file". A tag file that no machine lists is normal: it is a profile.
 
 ### Layer tables (allowed in every layer file)
 
@@ -426,7 +432,10 @@ into an unsupported or blocked action. None of this replaces the per-read, per-b
 per-write checks in section 6.
 
 `check_all` resolves every listed machine, every unlisted machine name that a `when.machine`
-uses, and one other unlisted machine. Each runs on macOS, Linux, and Windows, on both
+uses, one unlisted machine per tag layer with only that profile chosen (labelled `a machine with
+only profile <tag>`), and one other unlisted machine with none. Combinations of profiles aren't
+enumerated. An error seen only on single-profile machines whose tag some `[machines]` entry lists is
+reported as a warning, so a loadout with tags written to compose stays valid. Each runs on macOS, Linux, and Windows, on both
 architectures, and on Linux both with no distro and with each distro a `when.distro` names.
 Facts are synthetic. Each diagnostic is reported once, with its machines and OSes appended, for
 example `(on studio: linux; tower: macos, windows)`.
@@ -738,7 +747,7 @@ absolute when set; an empty value counts as unset.
   behind `{config}`.
 
 ```
-<state>/machine.toml       name = "<machine name>", remote = "<loadout url>"   written by init (U9)
+<state>/machine.toml       name, remote, profiles = ["<tag>", ...]             init, `loadout profile`
 <state>/loadout/           the CLI's own clone of the loadout                  sync (U8)
 <state>/state.json         ownership records                                   state (U3)
 <state>/runs/<run-id>/     journal.json and backups/ for one apply             state (U3)
@@ -751,6 +760,14 @@ outside it, such as one to `~/.codex/auth.json`, is an invalid identity and is n
 exits 4, and never blocks. When the file is absent, the machine name
 defaults to the hostname, cut at the first `.`, lowercased, with other characters mapped to `-`.
 Once the file is written, renaming the computer doesn't change the name.
+
+`profiles` is optional and written only when non-empty, so a machine with none keeps a file older
+versions read. Each entry must be an id; a bad one makes the whole identity invalid (plan and
+apply block, exit 4). `machine::detect` puts it in `Facts.profiles`, which every resolution on the
+host (plan, apply, sync, background sync, `sync::settings`) reads. Only `init` and
+`loadout profile set|choose` write it: `machine::save` (init) and `machine::save_profiles`, which
+keeps the saved `name` and `remote` and refuses a machine with no file yet (`Error::NotSetUp`, so
+a name is never pinned to the hostname outside init), under the state lock, deduplicated in chosen order. Neither ever chooses a profile the user didn't.
 
 **State files (built, U3, `src/state/`).** Loadout creates the state dir and `runs/` as `0700` on
 Unix, and writes `state.json` and every journal as `0600`, through a temp file, `fsync`, and rename.
@@ -835,8 +852,8 @@ Settles the [Apply lifecycle](./wayfinder/loadout-v1/tickets/04-apply-lifecycle.
 delegated defaults.
 
 - **One way.** The CLI reads the loadout and writes to the machine. It never writes, commits, or
-  pushes to the loadout. The user adds a new machine name by editing `loadout.toml`; `init` prints
-  the snippet to paste.
+  pushes to the loadout. A new machine needs no edit to the loadout: it chooses its profiles on the
+  machine.
 - **Copy, never link.** Files, skills, and instructions are copied, or rendered for templates, on
   every OS. Links would need admin rights or Developer Mode on Windows, and would tie the machine to
   the clone.
@@ -1782,11 +1799,19 @@ Automatic updates are required, so they are on by default.
     from a saved name (a saved name never changes).
   - It holds the state lock from `sync::clone(url, context, &lock)` through
     `apply::run_under_lock(context, &sync::checkout(context), lock, …)`.
-  - The machine name is `--name`, else the saved name, else in a terminal the user's pick (it lists
-    the loadout's `[machines]`, defaulting to the hostname's name), else the hostname's. A name the
-    loadout doesn't list is noted: it gets the global and OS layers only.
-  - `machine::save` writes `name` and `remote` atomically (0600 on Unix), and refuses a remote with a
-    password.
+  - The machine name is `--name`, else the saved name, else, only when the loadout declares
+    `[machines]` and stdin and stdout are a terminal, the user's pick (it lists the loadout's
+    `[machines]`, defaulting to the hostname's name), else the hostname's.
+  - The profiles are `--profile` (repeatable, comma-separated), else in a terminal the user's pick
+    from the loadout's tag layers (names first, then menu numbers; empty or end of input keeps the
+    saved choice, `-` is none), else the saved choice, which is none on a new machine. The name,
+    URL, and saved choice are written before the prompt, so Ctrl-C leaves them and the clone, and
+    `loadout profile set`, `loadout sync`, and `loadout service install` finish the setup. A
+    `--profile` the loadout lacks is not saved; init applies nothing and exits 3. With a loadout
+    that doesn't load, init keeps the saved choice (it can't check new ones) and its apply reports
+    the loadout invalid.
+  - `machine::save` writes `name`, `remote`, and `profiles` atomically (0600 on Unix), and refuses a
+    remote with a password.
   - A URL carrying a password is refused before anything is shown or written, and the URL is only
     ever shown through `sync::redact`, with its userinfo as `***`. The install scripts show it the
     same way and never echo the init arguments.
@@ -1945,7 +1970,7 @@ Automatic updates are required, so they are on by default.
 | Command | Status | Owner |
 | --- | --- | --- |
 | `loadout --help`, `--version` | foundation | |
-| `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
+| `loadout doctor [--json]`: version, platform, home, config/state dirs, machine name, chosen profiles, git, managers on PATH; exit 4 on a failed check; never writes | foundation | U5, U6, U7, U8, U9 add checks |
 | `loadout validate [DIR] [--json]`: strict schema and static checks, then resolution of every machine on all three OSes (U1, built) and the syntax of every `.tmpl` user file (U2, built); exit 3 when invalid. Loads with `Loadout::load_guarded` and the active `Context`, and reads each template source through the same source guard (`template::check_all_guarded`) | foundation; resolution built (U1); template syntax built (U2); guarded load (U5) | |
 | `loadout plan [--loadout DIR] [--json]`: what apply would change; never writes, locks, or creates the state dir; exit 3 invalid, 4 blocked or drifted | source, unexecuted | U4 |
 | `loadout apply [--loadout DIR] [--force] [--elevated]`: read-only preflight, then the lock and a rebuilt plan; exit 1 on a failed action, 3 invalid, 4 when anything is left undone | source, unexecuted | U4 |
@@ -1954,7 +1979,8 @@ Automatic updates are required, so they are on by default.
 | `loadout sync [--loadout DIR] [--background [--service FILE]]`: lock, unfinished-run gate, fetch and fast-forward the clone (not with `--loadout`), then apply under the same lock; exit 4 when blocked; `--background` supervises a bounded worker and records it; never updates the CLI | source | U8 |
 | `loadout update [--prerelease]`, alias `loadout upgrade`: on-demand self-update of the installer-managed CLI, stable releases only unless `--prerelease`; never syncs; exit 0 updated/up to date/none published, 4 can't update this binary, 1 failure. The hidden legacy `update --background` form still runs `sync --background` | source | U9 |
 | `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
-| `loadout init <URL> [--name NAME] [--no-service]`: clone, name the machine, apply, install the service; exit 3 invalid, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
+| `loadout init <URL> [--profile PROFILE]... [--name NAME] [--no-service]`: clone, save the machine's name and profiles, apply, install the service; exit 3 invalid or unknown profile, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
+| `loadout profile [list [--json] \| choose \| set PROFILE... \| set --none] [--loadout DIR]`: list the checkout's tag layers with this machine's chosen and declared ones; `set` (and `choose`, after asking) takes the state lock, reloads the checkout, and replaces the choice (exit 3 and nothing saved for an unknown profile or an invalid loadout); `choose` asks, and exits 1 without a terminal; never applies | built | I005 |
 
 `plan`, `apply`, and `sync` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
 at another checkout.
@@ -1969,9 +1995,10 @@ pub enum Os { Macos, Linux, Windows }
 pub enum Arch { X86_64, Aarch64 }
 
 // machine (foundation)
-pub struct Facts { pub name: String, pub os: Os, pub distro: Option<String>, pub arch: Arch, pub home: PathBuf }
-pub fn detect(context: &Context) -> Result<Facts, machine::Error>;
+pub struct Facts { pub name: String, pub os: Os, pub distro: Option<String>, pub arch: Arch, pub home: PathBuf, pub profiles: Vec<String> }
+pub fn detect(context: &Context) -> Result<Facts, machine::Error>;   // profiles from machine.toml, none when absent
 pub fn name(context: &Context) -> Result<Name, machine::Error>;
+pub fn profiles(context: &Context) -> Result<Vec<String>, machine::Error>;
 
 // context (foundation)
 pub struct Context {
@@ -2160,7 +2187,10 @@ pub fn checks(context: &Context) -> Vec<Check>;                              // 
 pub enum Error { Isolated, Unmanaged { reason }, NoRelease, Download { detail }, Verify { detail }, Changed { detail }, Io { .. }, Publish { detail, restored } }
 impl Error { pub fn skipped(&self) -> bool; }                                // Isolated | Unmanaged | NoRelease | Busy: report, don't fail
 // machine (U9 addition)
-pub fn save(context: &Context, name: &str, remote: &str) -> Result<(), machine::Error>; // atomic, 0600 on Unix; refuses links, invalid names, password remotes
+pub fn save(context: &Context, name: &str, remote: &str, profiles: &[String]) -> Result<(), machine::Error>; // atomic, 0600 on Unix; refuses links, invalid names or profiles, password remotes
+pub fn save_profiles(context: &Context, profiles: &[String]) -> Result<(), machine::Error>; // keeps the saved name and remote; NotSetUp before init; same checks
+// manifest (I005 addition)
+impl Loadout { pub fn profiles(&self) -> Vec<String>; }                    // the tag layers, by name
 ```
 
 A unit that must change a foundation type or a frozen signature changes it in its own PR, updates

@@ -6,7 +6,7 @@ the commands that act on a loadout, see the [agent guide](agent-guide.md). For t
 with every edge case, see [architecture.md](architecture.md#3-the-loadout-on-disk-foundation).
 
 **On this page:** [Layout](#layout) · [Root tables](#root-tables) · [Items](#items) ·
-[Layers and overrides](#layers-and-overrides) · [Conditions](#conditions) ·
+[Profiles](#profiles) · [Layers and overrides](#layers-and-overrides) · [Conditions](#conditions) ·
 [Templates](#templates) · [Paths](#paths) · [Secrets](#secrets) · [Agents](#agents) ·
 [Programs](#programs) · [Validation](#validation)
 
@@ -14,10 +14,10 @@ with every edge case, see [architecture.md](architecture.md#3-the-loadout-on-dis
 
 ```text
 my-loadout/
-├── loadout.toml          required: the global layer, plus [loadout] and [machines]
+├── loadout.toml          required: the global layer, plus [loadout] and the optional [machines]
 ├── os/                   optional: macos.toml, linux.toml, windows.toml (only these names)
-├── tags/<tag>.toml       optional: one layer per tag, such as work or laptop
-├── machines/<name>.toml  optional: one layer per machine name
+├── tags/<profile>.toml   optional: one layer per profile, such as work or laptop
+├── machines/<name>.toml  optional: one layer per declared machine
 └── files/ skills/ ...    sources, in any layout you like, referenced by relative path
 ```
 
@@ -35,16 +35,53 @@ These appear only in `loadout.toml`.
 ```toml
 [loadout]
 version = 1                       # required; v1 accepts only 1
-
-[machines.work-laptop]            # a machine name and its tags, in order; a later tag wins
-tags = ["work", "laptop"]
 ```
 
-A machine the loadout doesn't list gets the global and OS layers only. A machine name is chosen
-on its first `loadout init` and saved on the machine. It defaults to the hostname, cut at the first
-`.`, lowercased, and it doesn't change when the computer is renamed.
+Ids (profiles, machine names, item ids, agent ids) are lowercase: `[a-z0-9][a-z0-9_-]*`.
 
-Ids (machine names, tags, item ids, agent ids) are lowercase: `[a-z0-9][a-z0-9_-]*`.
+### Machines
+
+`[machines]` is optional, and most loadouts leave it out: a machine chooses its
+[profiles](#profiles) itself. Declare a machine only when it needs a layer of its own in
+`machines/<name>.toml`, or tags it should always get whatever it chooses.
+
+```toml
+[machines.grokbot]                # a machine name and its tags, in order; a later tag wins
+tags = ["server"]
+```
+
+A machine name is chosen on its first `loadout init` and saved on the machine. It defaults to the
+hostname, cut at the first `.`, lowercased, and it doesn't change when the computer is renamed.
+`init` asks for it only when the loadout declares machines; `--name` sets it.
+
+## Profiles
+
+A profile is a tag layer, `tags/<profile>.toml`, that a machine chooses for itself. The choice is
+saved on the machine, in the state dir's `machine.toml`, never in the loadout, so a new machine
+needs no change to the loadout. A machine with no profiles gets the global and OS layers only;
+nothing chooses a profile for it.
+
+| To | Run |
+| --- | --- |
+| choose on setup | `loadout init <URL>` asks in a terminal; `--profile work` (repeat it, or `work,laptop`) chooses without asking |
+| see them | `loadout profile` (or `loadout profile list --json`) |
+| change them | `loadout profile choose` in a terminal, or `loadout profile set work laptop`; `loadout profile set --none` clears them; a machine `init` hasn't set up is refused |
+
+`plan`, `apply`, `sync`, and the background sync all read the saved profiles and never ask.
+Changing them takes effect on the next `apply` or sync.
+
+Which tags a machine gets, in order:
+
+1. the tags its `[machines.<name>]` entry lists, if the loadout declares it;
+2. then each profile it chose, in the order chosen, skipping one already listed.
+
+A later tag wins a clash, and a declared machine's `machines/<name>.toml` still comes after all of
+them. Clearing a machine's profiles never removes a tag its `[machines]` entry lists.
+
+A profile that isn't in the loadout is refused when it is chosen: `profile set` exits 3 and changes
+nothing, and `init` exits 3 after the clone and applies nothing. If the loadout later drops a profile a machine uses, its `plan`, `apply`, and
+`sync` stop with exit 3 and write nothing, rather than removing what that profile placed, until
+`loadout profile set` changes the machine's profiles.
 
 ## Items
 
@@ -107,11 +144,11 @@ warns about it. The CLI updates itself only when you run `loadout update`.
 ## Layers and overrides
 
 Layers apply broadest first: **global** (`loadout.toml`), then the machine's **OS**, then each
-**tag** in the order the machine lists them, then the **machine** itself.
+**tag** (its declared tags, then its [profiles](#profiles)), then a declared **machine**'s own layer.
 
 ```mermaid
 flowchart LR
-  G["loadout.toml<br/>global"] --> O["os/linux.toml<br/>OS"] --> T["tags/work.toml<br/>each tag, in order"] --> M["machines/work-laptop.toml<br/>machine"] --> R(["what this machine gets"])
+  G["loadout.toml<br/>global"] --> O["os/linux.toml<br/>OS"] --> T["tags/work.toml<br/>each tag or profile, in order"] --> M["machines/grokbot.toml<br/>declared machine only"] --> R(["what this machine gets"])
 ```
 
 A narrower layer that names an item id from a broader layer edits that item:
@@ -133,7 +170,7 @@ global-layer item must be complete, and may not use `remove`, `replace`, or list
 ```toml
 # tags/work.toml
 [variables]
-email = "ada@work.example"          # wins over the global value on work machines
+email = "ada@work.example"          # wins over the global value on machines with the work profile
 
 [agents]
 enabled = { add = ["cursor"] }      # edit the inherited list
@@ -361,8 +398,8 @@ The language managers come in the order `cargo`, `uv`, `pipx`, `npm`, `pnpm`, `b
 ## Validation
 
 `loadout validate [DIR]` checks a loadout without touching the machine. Beyond the schema, it
-resolves every listed machine (and an unlisted one) on macOS, Linux, and Windows, on both
-architectures, and checks:
+resolves every listed machine, a machine with each profile on its own, and a machine with none,
+on macOS, Linux, and Windows, on both architectures, and checks:
 
 - sources exist inside the loadout, and skill folders hold `SKILL.md`
 - targets are clean, don't collide (after `~/` and `{config}/` are expanded), and avoid reserved
@@ -372,6 +409,10 @@ architectures, and checks:
   each agent
 - every template parses
 
-Each problem is reported once, with the machines and OSes it affects. Warnings (such as a tag file
-no machine lists, or a plaintext credential) don't fail validation.
+Each problem is reported once, with the machines and OSes it affects, such as `(on a machine with
+only profile work: windows)`. A problem that appears only on a profile alone, for a tag `[machines]` lists together with others,
+is a warning rather than an error, since that tag may only patch its siblings. Validate doesn't try
+every combination of profiles, so two profiles
+that clash only together show up in that machine's `plan`. Warnings (such as a plaintext
+credential) don't fail validation.
 [`tests/foundation/invalid/`](../tests/foundation/invalid) collects the mistakes validate catches.

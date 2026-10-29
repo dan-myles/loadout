@@ -77,6 +77,7 @@ fn foundation(context: &Context) -> Vec<Check> {
         ),
         state(context),
         machine_name(context),
+        profiles(context),
         git(),
         managers(context.os),
     ]
@@ -155,6 +156,18 @@ fn machine_name(context: &Context) -> Check {
             Check::new("machine name", CheckStatus::Info, detail)
         }
         Err(error) => Check::new("machine name", CheckStatus::Fail, error.to_string()),
+    }
+}
+
+fn profiles(context: &Context) -> Check {
+    match machine::profiles(context) {
+        Ok(profiles) if profiles.is_empty() => Check::new(
+            "profiles",
+            CheckStatus::Info,
+            "none chosen; `loadout profile` lists the loadout's".to_owned(),
+        ),
+        Ok(profiles) => Check::new("profiles", CheckStatus::Info, profiles.join(", ")),
+        Err(error) => Check::new("profiles", CheckStatus::Fail, error.to_string()),
     }
 }
 
