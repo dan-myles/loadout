@@ -39,6 +39,10 @@ case $1 in
   -m) echo "${FAKE_ARCH:-x86_64}" ;;
 esac
 """
+# The effective UID install.sh sees, so the Homebrew tests run the same whether the host runs them as root.
+FAKE_ID = """#!/bin/sh
+[ "$1" = -u ] && echo "${FAKE_UID:-1000}"
+"""
 
 
 def fake_loadout(version="1.2.3"):
@@ -112,6 +116,7 @@ class InstallShTest(unittest.TestCase):
         self.fakebin = self.tmp / "fakebin"
         self.fakebin.mkdir()
         self.write_exe(self.fakebin / "uname", FAKE_UNAME)
+        self.write_exe(self.fakebin / "id", FAKE_ID)
         self.init_args = self.tmp / "init-args"
         self.cwd = self.tmp / "cwd"
         self.cwd.mkdir()
@@ -157,6 +162,7 @@ class InstallShTest(unittest.TestCase):
             if name not in missing and found:
                 (tools / name).symlink_to(found)
         self.write_exe(tools / "uname", FAKE_UNAME)
+        self.write_exe(tools / "id", FAKE_ID)
         return str(tools)
 
     def write_exe(self, path, text):
@@ -709,6 +715,33 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertTrue((self.tmp / "homebrew-ran").exists())
         self.assertIn(str(self.brew_prefix / "bin"), Path(f"{self.init_args}.path").read_text().split(":"))
+
+    def test_root_or_sudo_never_runs_homebrews_installer(self):
+        self.skip_if_host_has_homebrew()
+        self.serve_homebrew_installer()
+        path = self.path_without()
+        for os_name in ("Linux", "Darwin"):
+            for env, guidance in (
+                ({}, "Run this installer again as your own user, or pass --no-homebrew"),
+                ({"SUDO_USER": "someone"}, "Run it again as someone, without sudo, or pass --no-homebrew"),
+            ):
+                with self.subTest(os=os_name, env=env):
+                    result = self.install(path=path, homebrew=True, FAKE_OS=os_name, FAKE_UID="0", **env)
+                    self.assert_refused(result, "Homebrew must not be installed as root", None)
+                    self.assertIn(guidance, result.stderr)
+                    self.assertNotIn("running its installer", result.stderr)
+                    self.assertFalse((self.tmp / "homebrew-ran").exists())
+
+    def test_root_installs_with_no_homebrew_or_an_existing_brew(self):
+        with_brew = self.path_without()
+        self.write_exe(Path(with_brew) / "brew", "#!/bin/sh\nexit 0\n")
+        for args, path in (((), with_brew), (("--no-homebrew",), self.path_without("curl-kept"))):
+            with self.subTest(args=args):
+                shutil.rmtree(self.home / ".local", ignore_errors=True)
+                result = self.install(*args, path=path, homebrew=True, FAKE_UID="0", SUDO_USER="someone")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("running its installer", result.stderr)
+                self.assertTrue(self.dest.exists())
 
     def test_the_profile_gets_each_path_line_once(self):
         for shell, os_name, name in (
