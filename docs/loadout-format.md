@@ -309,7 +309,9 @@ The language managers come in the order `cargo`, `uv`, `pipx`, `npm`, `pnpm`, `b
   `choco`, machine-scoped winget installers) are `blocked` unless `loadout apply --elevated` is
   passed. The background sync never elevates.
 - A program with no available manager is `unsupported` on that machine.
-- Loadout never installs a package manager, and never runs a download or an install script.
+- `apply` and the background sync never install a package manager, and never run a download or an
+  install script. The install scripts set up Homebrew on macOS, and winget, Scoop, and Chocolatey
+  (as an administrator) on Windows, before the first init.
 
 ## Validation
 

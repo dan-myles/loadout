@@ -1510,8 +1510,8 @@ Comparison is ASCII case-insensitive, so `~/.Claude/.credentials.json` is blocke
 - **Isolation.** Under `LOADOUT_HOME` (`Context.isolated`), every program step is
   `blocked("programs are not installed under LOADOUT_HOME isolation")` and no manager is run.
   Real installs are tested only in a disposable VM guest's actual `HOME` (section 4).
-- No direct downloads and no install scripts in v1. Loadout never installs a package manager itself;
-  doctor names what is missing.
+- No direct downloads and no install scripts in v1. The CLI never installs a package manager itself;
+  doctor names what is missing. The install scripts (section 9) set them up before the first init.
 
 ### How U7 runs each manager (built)
 
@@ -1909,6 +1909,13 @@ Automatic updates are required, so they are on by default.
   `%LOCALAPPDATA%\Programs\loadout`. Given a loadout URL, they then run `loadout init <url>`.
 - The one prerequisite is `git`. The CLI never installs it; `doctor` names the per-OS install
   command.
+- The install scripts set up package managers before anything else, so the first init can install
+  programs: `install.sh` runs Homebrew's installer on macOS when brew is missing (which brings git
+  through the Command Line Tools), then puts brew on `PATH` for init and the service PATH it
+  records; `install.ps1` registers winget, installs Scoop per user, installs Chocolatey only when
+  elevated, and installs git through Scoop. `--no-homebrew` and `-NoPackageManagers` skip this.
+  Linux is unchanged. With `--base-url`/`-BaseUrl`, the managers' installers come from that URL
+  too, as `homebrew-install.sh`, `scoop-install.ps1`, and `chocolatey-install.ps1`.
 
 ## 10. Commands
 

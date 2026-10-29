@@ -583,6 +583,7 @@ WRAPPER = r"""
 $ErrorActionPreference = 'Stop'
 $params = @{
     BaseUrl = $env:LT_BASE
+    NoPackageManagers = $true
     LoadoutUrl = $env:LT_URL
     InitArgs = [string[]]@(Get-Content -LiteralPath $env:LT_ARGS -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
@@ -855,7 +856,7 @@ class InstallPs1WrapperTest(unittest.TestCase):
                     self.assertFalse(received.exists())
 
     def install_only(self, shell, base, local_app_data):
-        command = ["-File", str(SCRIPT), "-BaseUrl", base]
+        command = ["-File", str(SCRIPT), "-BaseUrl", base, "-NoPackageManagers"]
         return subprocess.run(
             [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"] + command,
             cwd=str(local_app_data.parent),

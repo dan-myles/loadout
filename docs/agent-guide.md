@@ -425,7 +425,8 @@ It never writes.
 `git`, the package managers on `PATH`, every agent's paths, elevation, loadout's clone, the
 service, the last background run, and how the CLI was installed. Each check has a `status` of
 `pass`, `info`, `warn`, or `fail`. Doctor exits 4 when any check fails, and never writes. `git` is
-the one prerequisite. Loadout never installs it, and doctor names the install command for the OS.
+the one prerequisite. The CLI never installs it, and doctor names the install command for the OS;
+the install scripts set it up on macOS and Windows along with the package managers.
 
 ## 11. Exit codes
 

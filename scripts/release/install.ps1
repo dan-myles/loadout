@@ -6,8 +6,13 @@ Install the loadout CLI on Windows from a GitHub release, then optionally run `l
   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v1.2.3
 
 -Version vX.Y.Z  install that release instead of the latest one
--BaseUrl URL     fetch the assets from URL instead of GitHub: https, or http on localhost
+-BaseUrl URL     fetch the assets, and the package managers' installers, from URL instead of
+                 their usual hosts: https, or http on localhost
 -LoadoutUrl URL  afterwards, run `loadout init URL` with each -InitArgs element as one argument
+-NoPackageManagers  never install winget, Scoop, or Chocolatey
+Before installing, it sets up the package managers a loadout's programs install with: winget when
+App Installer is present but unregistered, Scoop for this user, and Chocolatey when run as an
+administrator. git comes from Scoop when it is missing.
 An existing loadout.exe is replaced only if this installer put it there. docs/releasing.md has details.
 #>
 [CmdletBinding()]
@@ -15,7 +20,8 @@ param(
     [string]$Version = 'latest',
     [string]$BaseUrl = '',
     [string]$LoadoutUrl = '',
-    [string[]]$InitArgs = @()
+    [string[]]$InitArgs = @(),
+    [switch]$NoPackageManagers
 )
 
 $ErrorActionPreference = 'Stop'
@@ -405,6 +411,75 @@ function Invoke-Native([string]$FilePath, [string[]]$Arguments) {
     }
 }
 
+function Test-Command([string]$Name) {
+    [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+# Picks up what the package managers' installers added to the machine and user Path, for the init
+# below and the background service it records PATH for.
+function Update-SessionPath {
+    $env:Path = @(
+        [Environment]::GetEnvironmentVariable('Path', 'Machine'),
+        [Environment]::GetEnvironmentVariable('Path', 'User')
+    ) -join ';'
+}
+
+function Invoke-Installer($Client, [string]$Name, [string]$Url, [string]$Tmp, [bool]$LoopbackHttp, [hashtable]$Arguments) {
+    $file = Join-Path $Tmp "$Name-install.ps1"
+    Say "$Name is not installed, so running its installer from $Url (pass -NoPackageManagers to skip)"
+    Save-Url $Client $Url $file $LoopbackHttp
+    # A script block, not the file, so the execution policy's rule for downloaded files doesn't apply.
+    & ([scriptblock]::Create([IO.File]::ReadAllText($file))) @Arguments
+}
+
+# winget, then Scoop, then Chocolatey: the order loadout picks managers in on Windows. Only winget
+# failing to register is a warning; any other installer failing stops the install.
+function Install-PackageManagers($Client, [string]$Tmp, [bool]$LoopbackHttp) {
+    $base = if ($BaseUrl) { $BaseUrl.TrimEnd('/') } else { '' }
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if (-not (Test-Command winget)) {
+        Say 'winget is not on PATH, so registering App Installer, which provides it'
+        try {
+            Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe
+        } catch {
+            Say "warning: could not register App Installer ($($_.Exception.Message)). Install App Installer from the Microsoft Store to get winget"
+        }
+    }
+
+    if (-not (Test-Command scoop)) {
+        # Scoop's installer checks the effective policy; Bypass for this process alone satisfies it.
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        $url = if ($base) { "$base/scoop-install.ps1" } else { 'https://get.scoop.sh' }
+        $arguments = if ($admin) { @{ RunAsAdmin = $true } } else { @{} }
+        Invoke-Installer $Client 'Scoop' $url $Tmp $LoopbackHttp $arguments
+        Update-SessionPath
+        if (-not (Test-Command scoop)) { throw "Scoop's installer finished, but scoop is not on PATH" }
+    }
+
+    if (-not (Test-Command choco)) {
+        if ($admin) {
+            $url = if ($base) { "$base/chocolatey-install.ps1" } else { 'https://community.chocolatey.org/install.ps1' }
+            Invoke-Installer $Client 'Chocolatey' $url $Tmp $LoopbackHttp @{}
+            Update-SessionPath
+            if (-not (Test-Command choco)) { throw "Chocolatey's installer finished, but choco is not on PATH" }
+        } else {
+            Say 'Chocolatey needs an administrator to install, so it was skipped. Run this installer as an administrator to add it'
+        }
+    }
+
+    if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+        Say 'git is not on PATH, so installing it with scoop'
+        $ErrorActionPreference = 'Continue'
+        & scoop install git
+        $scoopExit = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($scoopExit -ne 0) { throw "scoop install git failed with exit code $scoopExit" }
+        Update-SessionPath
+    }
+}
+
 function Install-Loadout {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw 'install.ps1 is for Windows; use install.sh on macOS and Linux'
@@ -425,9 +500,6 @@ function Install-Loadout {
     $arch = Get-NativeArch
     $target = "$arch-pc-windows-msvc"
 
-    if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
-        throw 'git is required but is not on PATH. Install it with winget install --id Git.Git -e --source winget, then open a new terminal and run this installer again'
-    }
     if (-not $env:LOCALAPPDATA -or -not [IO.Path]::IsPathRooted($env:LOCALAPPDATA)) {
         throw 'LOCALAPPDATA is not set to an absolute path'
     }
@@ -459,6 +531,10 @@ function Install-Loadout {
         [void](New-Item -ItemType Directory -Path $tmp)
         $tmpOwned = $true
         $client = New-HttpClient
+        if (-not $NoPackageManagers) { Install-PackageManagers $client $tmp $loopbackHttp }
+        if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+            throw 'git is required but is not on PATH. Install it with winget install --id Git.Git -e --source winget, then open a new terminal and run this installer again'
+        }
         $zip = Join-Path $tmp $asset
         Say "downloading $url"
         Save-Url $client $url $zip $loopbackHttp

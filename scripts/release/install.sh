@@ -10,6 +10,7 @@ set -eu
 REPO=dan-myles/loadout
 RECORD_KEYS='installer repository source target version archive_sha256 binary binary_sha256'
 version=latest
+homebrew=1
 base_url=
 tmp=
 staged=
@@ -19,11 +20,15 @@ say() { printf 'loadout-install: %s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 usage() {
   cat <<'EOF'
-usage: install.sh [--version vX.Y.Z] [--base-url URL] [LOADOUT_URL [INIT_ARGS...]]
+usage: install.sh [--version vX.Y.Z] [--base-url URL] [--no-homebrew] [LOADOUT_URL [INIT_ARGS...]]
 
 Installs loadout to ~/.local/bin after verifying the release archive's sha256. Needs curl and git.
+On macOS without Homebrew, it first runs Homebrew's installer, which also brings git through the
+Command Line Tools, so a loadout's brew and cask programs can install.
   --version vX.Y.Z   install that release instead of the latest one
-  --base-url URL     fetch the assets from URL instead of GitHub: https, or http on localhost
+  --base-url URL     fetch the assets, and Homebrew's installer, from URL instead of GitHub:
+                     https, or http on localhost
+  --no-homebrew      never install Homebrew
 Given LOADOUT_URL, runs `loadout init LOADOUT_URL INIT_ARGS...` afterwards.
 An existing ~/.local/bin/loadout is replaced only if this installer put it there.
 EOF
@@ -49,6 +54,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || usage_error "--base-url needs a value"
       base_url=$2
       shift 2
+      ;;
+    --no-homebrew)
+      homebrew=0
+      shift
       ;;
     -h | --help)
       usage
@@ -133,12 +142,36 @@ if [ "$os" = Darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n sysctl.proc_tran
 fi
 target=$arch-$os_part
 
-if ! command -v git >/dev/null 2>&1; then
-  case $os in
-    Darwin) hint="xcode-select --install (or brew install git)" ;;
-    *) hint="your distribution's package manager, for example sudo apt install git, sudo dnf install git, or sudo pacman -S git" ;;
-  esac
-  die "git is required but is not on PATH. Install it with $hint, then run this installer again"
+# macOS ships /usr/bin/git as a stub that fails until the Command Line Tools are installed, so git
+# counts only when it runs.
+require_git() {
+  if ! git --version >/dev/null 2>&1; then
+    case $os in
+      Darwin) hint="xcode-select --install (or brew install git)" ;;
+      *) hint="your distribution's package manager, for example sudo apt install git, sudo dnf install git, or sudo pacman -S git" ;;
+    esac
+    die "git is required but is not on PATH. Install it with $hint, then run this installer again"
+  fi
+}
+
+# Prints the brew on PATH, in $HOMEBREW_PREFIX, or in Homebrew's default prefixes, or returns 1.
+find_brew() {
+  if command -v brew 2>/dev/null; then return 0; fi
+  for brew_path in ${HOMEBREW_PREFIX:+"$HOMEBREW_PREFIX/bin/brew"} /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$brew_path" ]; then
+      printf '%s\n' "$brew_path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Homebrew's installer brings git along, so on macOS a missing git waits until it has run.
+bootstrap_homebrew=0
+if [ "$os" = Darwin ] && [ "$homebrew" = 1 ] && ! find_brew >/dev/null; then
+  bootstrap_homebrew=1
+else
+  require_git
 fi
 # wget can't be restricted to https redirects, so it is not a fallback.
 command -v curl >/dev/null 2>&1 || die "curl is required to download loadout over https only. Install curl, then run this installer again"
@@ -325,6 +358,35 @@ if [ -d "$bin_dir" ]; then
   seen=$(install_state) || exit 1
 fi
 
+# Homebrew's own installer asks for confirmation and an admin password on the terminal, which stays
+# reachable through /dev/tty even when this script arrives on a pipe. With no terminal it runs
+# unattended, which works only where sudo needs no password.
+if [ "$bootstrap_homebrew" = 1 ]; then
+  if [ -n "$base_url" ]; then
+    brew_url=$base_url/homebrew-install.sh
+  else
+    brew_url=https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+  fi
+  tmp=$(mktemp -d) || die "could not create a temporary directory"
+  say "Homebrew is not installed, so running its installer from $brew_url (pass --no-homebrew to skip)"
+  download "$brew_url" "$tmp/homebrew-install.sh"
+  if (exec </dev/tty) 2>/dev/null; then
+    /bin/bash "$tmp/homebrew-install.sh" </dev/tty || die "Homebrew's installer failed"
+  else
+    NONINTERACTIVE=1 /bin/bash "$tmp/homebrew-install.sh" </dev/null || die "Homebrew's installer failed"
+  fi
+  find_brew >/dev/null || die "Homebrew's installer finished, but brew is not on PATH or in /opt/homebrew or /usr/local"
+fi
+
+# The init below, and the background service it records PATH for, find brew only on PATH, which a
+# fresh install or a shell without Homebrew's profile line doesn't have yet.
+if [ "$os" = Darwin ] && ! command -v brew >/dev/null 2>&1 && brew=$(find_brew); then
+  brew_env=$("$brew" shellenv) || die "$brew shellenv failed"
+  eval "$brew_env"
+  say "put Homebrew on PATH for this install. To keep it there in new shells, add this to your shell profile: eval \"\$($brew shellenv)\""
+fi
+if [ "$bootstrap_homebrew" = 1 ]; then require_git; fi
+
 asset=loadout-$target.tar.gz
 if [ -n "$base_url" ]; then
   url=$base_url/$asset
@@ -335,7 +397,7 @@ else
 fi
 check_text "$url" "the download URL"
 
-tmp=$(mktemp -d) || die "could not create a temporary directory"
+[ -n "$tmp" ] || tmp=$(mktemp -d) || die "could not create a temporary directory"
 say "downloading $url"
 download "$url" "$tmp/$asset"
 download "$url.sha256" "$tmp/$asset.sha256"

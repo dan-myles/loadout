@@ -52,7 +52,16 @@ own changes from yours.
 ## Install
 
 Each release has a prebuilt binary for six platforms. The install script picks the one for your OS
-and CPU, checks its SHA-256, and installs it for your user. It needs no admin rights.
+and CPU, checks its SHA-256, and installs it for your user. Loadout itself needs no admin rights.
+
+The install scripts also set up the package managers your loadout's programs install with, so one
+command takes a fresh machine to an applied loadout:
+
+- **macOS:** Homebrew, through its own installer, which asks for your password once and brings `git`
+  with the Command Line Tools. Pass `--no-homebrew` to skip it.
+- **Windows:** winget (registering App Installer if needed), Scoop for your user, Chocolatey when
+  run as an administrator, and `git` through Scoop. Pass `-NoPackageManagers` to skip them.
+- **Linux:** nothing; the distribution's own manager is already there.
 
 | OS | CPU | Script |
 | --- | --- | --- |
@@ -60,7 +69,7 @@ and CPU, checks its SHA-256, and installs it for your user. It needs no admin ri
 | Linux, any distribution (static musl build) | x86_64 and aarch64 | `install.sh` |
 | Windows | x64 and ARM64 | `install.ps1` |
 
-**macOS and Linux**, from any POSIX shell. Needs `curl` and `git`.
+**macOS and Linux**, from any POSIX shell. Needs `curl`, and `git` on Linux.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.sh | sh
@@ -69,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/rele
 This installs `loadout` to `~/.local/bin`. If that folder isn't on your `PATH`, the script prints the
 line to add to your shell profile.
 
-**Windows**, in PowerShell 5.1 or 7. Needs `git`.
+**Windows**, in PowerShell 5.1 or 7.
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/dan-myles/loadout/main/scripts/release/install.ps1)))
