@@ -1804,7 +1804,7 @@ Automatic updates are required, so they are on by default.
   - The profiles are `--profile` (repeatable, comma-separated), else in a terminal the user's pick
     from the loadout's tag layers (numbers or names; empty or end of input keeps none, `-` is none),
     else none. A `--profile` the loadout lacks saves the name with no profiles, applies nothing,
-    and exits 3. Ctrl-C at a prompt leaves the clone and saves nothing; `loadout profile set` then
+    and exits 3. With a loadout that doesn't load, init saves no profiles (it can't check them) and its apply reports the loadout invalid. Ctrl-C at a prompt leaves the clone and saves nothing; `loadout profile set` then
     `loadout sync` finish the setup.
   - `machine::save` writes `name`, `remote`, and `profiles` atomically (0600 on Unix), and refuses a
     remote with a password.
@@ -1976,7 +1976,7 @@ Automatic updates are required, so they are on by default.
 | `loadout update [--prerelease]`, alias `loadout upgrade`: on-demand self-update of the installer-managed CLI, stable releases only unless `--prerelease`; never syncs; exit 0 updated/up to date/none published, 4 can't update this binary, 1 failure. The hidden legacy `update --background` form still runs `sync --background` | source | U9 |
 | `loadout service install\|uninstall\|status [--json]`: per-user scheduled job; refused under isolation; status reads files and asks the scheduler; exit 4 when unhealthy | source, unexecuted | U8 |
 | `loadout init <URL> [--profile PROFILE]... [--name NAME] [--no-service]`: clone, save the machine's name and profiles, apply, install the service; exit 3 invalid or unknown profile, 4 unhealthy (apply or service) | source, unexecuted; builds with U8's `sync` | U9 |
-| `loadout profile [list [--json] \| choose \| set [PROFILE]...] [--loadout DIR]`: list the checkout's tag layers with this machine's chosen and declared ones; `set` replaces the choice under the state lock (exit 3 and nothing saved for an unknown profile); `choose` asks, and exits 1 without a terminal; never applies | built | I005 |
+| `loadout profile [list [--json] \| choose \| set [PROFILE]...] [--loadout DIR]`: list the checkout's tag layers with this machine's chosen and declared ones; `set` (and `choose`, after asking) takes the state lock, reloads the checkout, and replaces the choice (exit 3 and nothing saved for an unknown profile or an invalid loadout); `choose` asks, and exits 1 without a terminal; never applies | built | I005 |
 
 `plan`, `apply`, and `sync` read the loadout from `<state>/loadout`; `--loadout <DIR>` points them
 at another checkout.
