@@ -2,7 +2,7 @@
 
 This guide is for an agent (or a careful human) driving the `loadout` CLI for a user: setting up
 their machine, writing their loadout, applying it, and recovering when something goes wrong. Every
-command, flag, exit code, and message here was checked against `loadout 0.1.2` and its source.
+command, flag, exit code, and message here was checked against `loadout 0.1.3` and its source.
 
 If you are changing Loadout's own code, read [CONTRIBUTING.md](../CONTRIBUTING.md) instead.
 
@@ -79,7 +79,7 @@ record, and a lock file), applies nothing, and installs no service. If the folde
 call loadout by its full path.
 
 ```sh
-loadout --version          # loadout 0.1.2
+loadout --version          # loadout 0.1.3
 loadout --help             # every command
 loadout <command> --help   # its flags; `loadout service <sub> --help` for service
 loadout doctor             # what this machine has, and where every agent's files go
