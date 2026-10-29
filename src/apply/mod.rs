@@ -4,6 +4,7 @@ use crate::context::Context;
 use crate::diagnostic::Diagnostics;
 use crate::plan::{self, Action, Change, Content, Plan, Target};
 use crate::programs::{self, Installed};
+use crate::progress::{self, Spinner};
 use crate::state::{self, Lock, Removal, Run, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,10 @@ impl Options {
 
     fn elevated(self) -> bool {
         self.elevated && self.mode == Mode::Interactive
+    }
+
+    fn foreground(self) -> bool {
+        self.mode == Mode::Interactive
     }
 
     fn plan(self) -> plan::Options {
@@ -74,6 +79,8 @@ pub struct Report {
     pub cancelled: bool,
 }
 
+const PLANNING: &str = "checking this machine against the loadout";
+
 /// Why an action or install a cancelled run didn't start is skipped.
 pub(crate) const CANCELLED: &str =
     "the background run was cancelled, so loadout started no further work";
@@ -115,7 +122,10 @@ pub enum Error {
 /// the lock taken and the plan rebuilt under it.
 pub fn run(context: &Context, checkout: &Path, options: Options) -> Result<Report, Error> {
     let state = State::load(context)?;
-    let preflight = plan::build(context, checkout, &state, None, options.plan())?;
+    let preflight = {
+        let _spinner = Spinner::start(options.foreground(), PLANNING);
+        plan::build(context, checkout, &state, None, options.plan())?
+    };
     let lock = state::lock(context)?;
     under_lock(context, checkout, lock, options, Some(preflight.steps))
 }
@@ -143,7 +153,10 @@ fn under_lock(
 ) -> Result<Report, Error> {
     lock.check(context)?;
     let mut state = State::load(context)?;
-    let built = plan::build(context, checkout, &state, steps, options.plan())?;
+    let built = {
+        let _spinner = Spinner::start(options.foreground(), PLANNING);
+        plan::build(context, checkout, &state, steps, options.plan())?
+    };
     built
         .plan
         .check()
@@ -212,7 +225,7 @@ fn under_lock(
         )
     };
 
-    for index in &installs {
+    for (count, index) in installs.iter().enumerate() {
         outcomes[*index] = Some(match &finish_error {
             Some(error) => Outcome::Skipped(format!(
                 "loadout couldn't save its ownership records ({error}), so it installed no program"
@@ -221,7 +234,13 @@ fn under_lock(
             None => {
                 #[cfg(test)]
                 observe::at(observe::Boundary::Install, context);
-                install(&built.steps, &actions[*index], options)
+                let label = format!(
+                    "installing {} ({}/{})",
+                    state::label(&actions[*index].target),
+                    count + 1,
+                    installs.len()
+                );
+                install(&built.steps, &actions[*index], options, &label)
             }
         });
     }
@@ -347,13 +366,20 @@ fn failure(error: &state::Error) -> Outcome {
     }
 }
 
-fn install(steps: &plan::Steps, action: &Action, options: Options) -> Outcome {
+fn install(steps: &plan::Steps, action: &Action, options: Options, label: &str) -> Outcome {
     let Some(step) = steps.get(&action.item.id) else {
         return Outcome::Failed(format!(
             "internal error: no program step for programs.{}",
             action.item.id
         ));
     };
+    // `sudo` asks for a password on the terminal, which a spinner would draw over.
+    let elevates = step.needs_elevation() && options.elevated();
+    progress::note(
+        options.foreground() && elevates,
+        &format!("{label}, elevated: it may ask for a password"),
+    );
+    let _spinner = Spinner::start(options.foreground() && !elevates, label);
     match programs::install(step, options.elevated()) {
         Ok(Installed::Now) => Outcome::Installed,
         Ok(Installed::Already) => Outcome::AlreadyInstalled,

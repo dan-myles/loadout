@@ -79,7 +79,7 @@ an `anyhow::Error` carrying `.context(...)`.
 This is FERN applied to a CLI; see [FERN.md](../FERN.md) for the rules and their source.
 `src/commands/<command>.rs` holds clap `Args` and `run`, and nothing else. Each subject is a
 top-level module whose `mod.rs` is its public API. Imports point down:
-`cli -> commands -> subjects -> machine -> context -> platform`, with `diagnostic` beside them.
+`cli -> commands -> subjects -> machine -> context -> platform`, with `diagnostic` and `progress` beside them.
 
 ```
 src/
@@ -90,6 +90,7 @@ src/
   context.rs              Context: os, home, config, state; overrides; which [foundation]
   diagnostic.rs           Diagnostic, Diagnostics, Check                    [foundation]
   id.rs                   the id rule for items, tags, machines, agents     [foundation]
+  progress.rs             Spinner, note: what a foreground run waits on, on a terminal's stderr
   reserved.rs             reserved destinations: auth, shared configs, state [foundation]
   machine.rs              Facts, machine name                               [foundation]
   manifest/               schema.rs (types), check.rs (static checks), mod.rs (load) [foundation]
@@ -133,6 +134,7 @@ Which subject may import which:
 
 ```
 platform, diagnostic, id       -> (none)
+progress                       -> (none)
 reserved                       -> context, platform
 context                        -> platform, process
 process                        -> (none)
@@ -146,7 +148,7 @@ agents                         -> manifest, resolve, mcp, reserved, source, plan
 programs                       -> manifest, resolve, machine, context, process, diagnostic
 state                          -> context, plan (types), reserved, mcp
 plan                           -> manifest, machine, resolve, template, agents, programs, source, state, reserved, context, diagnostic, platform
-apply                          -> plan, state, programs, context, diagnostic
+apply                          -> plan, state, programs, context, diagnostic, progress
 sync                           -> context, manifest, machine, resolve, state, process, diagnostic, platform
 release                        -> context, diagnostic, process (bounded --version checks)
 ```
