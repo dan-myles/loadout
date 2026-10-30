@@ -85,3 +85,11 @@ kk have $cooper take care of:
 - Verification: reread installed dispatch/references/project-state.md, Save and share through Git, plus dispatch-setup and dispatch-digest. All explicitly authorize automatic state commits and pushes. Reported upstream skills revision: 09e2f39.
 - Scope: existing owned store only, established origin/main. No new product work, merges or deployments. [skip ci] is not universal CI suppression.
 - Supersedes: the current save/share approval wording in store.md; historical setup observations remain intact.
+
+## D012 | 2026-10-30T18:14:49.810Z
+
+- Source: relayed explicit Dan request, owner thread position 295, message message:mcp:62a5d91e-5930-4e9e-8bd6-691d03885d7c:thread-send:dispatch-loadout-skills-sync-20261030, sender 7faaba56-0bdb-4f86-9c44-19d4c9b19a38. This is an agent relay, not a direct human message.
+- Exact policy excerpt: "always commit owned .dispatch state with [skip ci] and push directly to main, per Dan's explicit request."
+- Verified publication: dan-myles/skills main 80ff1c4cc79157ec33aa46f0921e4606c4997960, read from Git origin and published project-state contract.
+- Scope: owned state directly to main, no state PR or per-save approval. Preserve unrelated changes and outgoing commits; no force pushes or protection configuration changes. No product work.
+- Supersedes: D011's established-state-branch choice with main as required destination. This store already uses main.

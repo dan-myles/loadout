@@ -158,3 +158,11 @@
 - Evidence: D011; source message:mcp:988894ba-85e2-4325-a959-13e43a2dc5f9:thread-send:loadout-09e2f39-state-push-notify-loadout; verified T3 project a164c39a-b7c1-4a98-a1ec-941e1f22d48c and Git origin match dan-myles/loadout.
 - Result: fetched origin, found no incoming store and no outgoing commits; fast-forwarded local main from 393afd3 to b3002cf1e3c4fd15c72cab2aa8ad613405ca65c5. Only this untracked store was present. Owner and generation unchanged. No secret or machine-specific absolute path found in reviewed documents.
 - Save/share: preparing first coherent snapshot to origin/main with [skip ci]; actual commit and push outcome will be reported in the owning thread. Existing product evidence was preserved, not reverified in this state-only pass.
+
+## 2026-10-30T18:16:10.630082+00:00 | direct-main-policy-80ff1c4
+
+- Store: t-0096df81139729cf701a0b358edcc923e50610f61b4c5adf15f23cafcf5853cb; generation 1; actor 32c7d5bd-3cfa-4aef-ac95-07b34326ae2f; item/attempt: none.
+- Action: verify skills publication and existing integration, update owned state under D012.
+- Evidence: remote skills main is 80ff1c4cc79157ec33aa46f0921e4606c4997960; Paperclip local machine state selects dan-myles/skills with development profile. That repository declares local skills/<name> sources. The Loadout CLI repo has no skills pin, submodule or lock to update; no duplicate reference or empty product commit is needed.
+- Coordination: skills owner 6dfe19f6-f80a-4ebf-bf07-00d13d57d822 owns the Paperclip installed-skills sync. No concurrent sync run by this owner. Report destination 7faaba56-0bdb-4f86-9c44-19d4c9b19a38.
+- Result: policy and provenance updated only in this owned store; existing product evidence preserved. Main was clean and equal to origin/main at 388a3f2 before this update. Publish outcome belongs in the owner-thread handoff.

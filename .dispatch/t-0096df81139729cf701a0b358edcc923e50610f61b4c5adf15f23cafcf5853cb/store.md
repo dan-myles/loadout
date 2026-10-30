@@ -36,8 +36,8 @@
 
 - Initialized on main at 393afd3, clean and equal to origin/main after fetch.
 - Established state destination: origin/main in https://github.com/dan-myles/loadout.
-- Automatically commit and push meaningful updates to this owned store, batched as a coherent snapshot with [skip ci]. No per-save approval is required under the installed Dispatch project-state contract verified on 2026-10-30.
-- Fetch and reconcile ownership before writing; review privacy and staged paths; check every outgoing commit. Leave unrelated changes and outgoing commits untouched. Never force-push or bypass branch protection.
+- Always commit meaningful updates to this owned store with [skip ci] and push directly to main, without a state PR. Batch related updates as one coherent snapshot. No per-save approval is required under the installed Dispatch project-state contract verified on 2026-10-30.
+- Fetch and reconcile ownership before writing; review privacy and staged paths; check every outgoing commit. Leave unrelated changes and outgoing commits untouched. Never force-push, change repository protection settings or request extra bypass privileges. A normal server-accepted push counts as published even if it reports an existing rule bypass.
 - This authorization covers coordination documents only. It grants no new product work, merges or deployments. [skip ci] suppresses supported CI triggers, not every integration.
-- See D011 and the journal for policy provenance. Uncommitted or unpushed state cannot be pulled elsewhere.
+- See D011/D012 and the journal for policy provenance. Uncommitted or unpushed state cannot be pulled elsewhere.
 - A recipient must pull the shared state, stop the previous writer, and explicitly request `dispatch takeover t-0096df81139729cf701a0b358edcc923e50610f61b4c5adf15f23cafcf5853cb`. Pulling files alone does not transfer ownership. Preserve the stable ID and increment the ownership generation during takeover.

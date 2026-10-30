@@ -1,6 +1,6 @@
 # Dispatch board
 
-Status at 2026-10-29T23:21:02.153676+00:00. Store t-0096df81139729cf701a0b358edcc923e50610f61b4c5adf15f23cafcf5853cb, ownership generation 1.
+State policy updated at 2026-10-30T18:16:10.630082+00:00. Product evidence last reconciled at 2026-10-29T23:21:02.153676+00:00. Store t-0096df81139729cf701a0b358edcc923e50610f61b4c5adf15f23cafcf5853cb, ownership generation 1.
 
 ## Now
 
@@ -112,4 +112,4 @@ No workers executing. Approved implementation and release work is complete.
 - I001 and I002 merged. I003/I004 are optional proposals only; no follow-up implementation authorized.
 - [Store](store.md), [journal](journal.md), [decisions](decisions.md).
 - Tracker and validator unconfigured; these items have explicit user approval.
-- State destination: origin/main; meaningful owned-store updates are automatically committed and pushed with [skip ci]. See D011. Product status above retains its recorded verification timestamps.
+- State destination: origin/main; meaningful owned-store updates are always committed with [skip ci] and pushed directly to main without a state PR. See D012. Product status above retains its recorded verification timestamps.
